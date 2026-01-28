@@ -8,11 +8,17 @@ This project provides MCP tools for programmatic Max/MSP patch manipulation.
 
 ### Quick Reminders (details in skill)
 
-- **CONSIDER SUBPATCHERS** for new functionality! 
+- **CONSIDER SUBPATCHERS** for new functionality!
 - **NO OVERLAP**: Always call `get_avoid_rect_position()` before placing objects
-- **Use `groove~` not `play~`** for seekable playback
 - **Message boxes**: Use numbers `[200, 0, 50]` not strings `["200", "0", "50"]`
 - **Auto-sizing**: Objects & comments auto-size; messages fixed 70px; UI objects keep defaults
+
+### Required Flags
+
+- **Math/pack/unpack**: JSON strips `.0` from numbers. Use STRING args to preserve floats: `["0", "127", "0", "25."]`. Use `["f", "f", "f"]` for unpack. Set `int_mode=True` to explicitly allow integers. Exception: `scale` with output range ≤ 2 auto-detects float intent.
+- **dial**: Use `dial` with `@size` attribute instead of `live.dial` (set `use_live_dial=True` to bypass)
+- **trigger/t**: Set `trigger_rtl=True` - fires right-to-left (`[t b f]` sends `f` first)
+- **coll**: Always include `@embed 1` to persist data on save
 
 ## MCP Tools
 

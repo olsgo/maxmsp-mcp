@@ -15,10 +15,9 @@ var obj_count = 0;
 var boxes = [];
 var lines = [];
 
-// Preflight check: track get_avoid_rect_position calls
+// Preflight check: require get_avoid_rect_position before placing objects
+// Resets when entering/exiting subpatchers (new context = new layout)
 var avoid_rect_called = false;
-var objects_since_avoid_check = 0;
-var MAX_OBJECTS_WITHOUT_CHECK = 20;  // Require re-check after this many objects
 
 // Large patch warning
 var objects_added_counter = 0;
@@ -251,7 +250,7 @@ function anything() {
 
 function add_object(x, y, type, args, var_name, request_id) {
     // Preflight check: require get_avoid_rect_position to be called first
-    if (!avoid_rect_called || objects_since_avoid_check >= MAX_OBJECTS_WITHOUT_CHECK) {
+    if (!avoid_rect_called) {
         var result = {"request_id": request_id, "results": {
             "success": false,
             "error": "PREFLIGHT REQUIRED: Call get_avoid_rect_position() before placing objects."
@@ -259,7 +258,6 @@ function add_object(x, y, type, args, var_name, request_id) {
         outlet(1, "response", JSON.stringify(result));
         return;
     }
-    objects_since_avoid_check++;
 
     var new_obj = current_patcher.newdefault(x, y, type, args);
 
@@ -281,19 +279,10 @@ function add_object(x, y, type, args, var_name, request_id) {
     // Auto-fit width based on text content
     autofit_object(new_obj, type, args);
 
-    // Check for math objects with integer args (type truncation warning)
-    var math_objects = ["+", "-", "*", "/", "%", "pow", "scale"];
+    // Note: Integer type checking for math/pack/unpack objects is now handled
+    // in server.py with proper errors before requests reach this code.
+
     var warnings = [];
-    if (math_objects.indexOf(type) !== -1 && args && args.length > 0) {
-        for (var i = 0; i < args.length; i++) {
-            var arg = args[i];
-            // Check if it's an integer (number without decimal)
-            if (typeof arg === "number" && arg === Math.floor(arg)) {
-                warnings.push("WARNING: " + type + " has integer args - will truncate floats! Use " + arg + ". instead of " + arg);
-                break;
-            }
-        }
-    }
 
     // Check for large patch (every N objects)
     var large_patch_warning = check_large_patch_warning();
@@ -632,6 +621,10 @@ function enter_subpatcher(var_name) {
 
     // Navigate into subpatcher
     current_patcher = subpatch;
+
+    // Reset preflight check - new context requires new avoid rect check
+    avoid_rect_called = false;
+
     post("Entered subpatcher: " + var_name + " (depth: " + patcher_stack.length + ")\n");
 }
 
@@ -643,6 +636,10 @@ function exit_subpatcher() {
 
     var context = patcher_stack.pop();
     current_patcher = context.patcher;
+
+    // Reset preflight check - returning to parent context requires new avoid rect check
+    avoid_rect_called = false;
+
     post("Exited to parent patcher (depth: " + patcher_stack.length + ")\n");
 }
 
@@ -816,7 +813,6 @@ function get_avoid_rect_position(request_id) {
 
     // Mark preflight check as done
     avoid_rect_called = true;
-    objects_since_avoid_check = 0;
 
     // use this if has v8:
     var results = {"request_id": request_id, "results": avoid_rect}

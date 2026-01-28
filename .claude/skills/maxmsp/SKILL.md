@@ -16,10 +16,28 @@ disable-model-invocation: false
 ```
 **NEVER skip this step. NEVER guess positions.**
 
-## Object tips:
-- Use `groove~` not `play~` for seekable playback (play~ can't seek)
-- Use `inlet`/`outlet` (no tilde versions exist)
-- Invalid objects return errors automatically - check the error message for guidance
+## Required acknowledgment flags:
+
+**Math objects** (`+`, `-`, `*`, `/`, `%`, `pow`, `scale`) and **pack/pak/unpack**:
+- JSON strips `.0` from numbers! Use STRING args: `["0", "127", "0", "25."]`
+- Strings with `.` are converted to floats, without `.` to ints
+- For unpack, use `["f", "f", "f"]` (type specifier)
+- Set `int_mode=True` if integer truncation is intentional
+- Exception: `scale` with output range ≤ 2 auto-detects float intent
+
+**dial** - use instead of live.dial, requires `@size`:
+- Float 0-1: `['@size', 1, '@floatoutput', 1]`
+- Bipolar -1 to 1: `['@min', -1, '@size', 2, '@floatoutput', 1, '@mode', 6]`
+- Int 0-127: `['@size', 127]`
+- **Max @size 255** - larger creates unusable UI; use `flonum`/`number` instead (bypass with `extend=True`)
+- `live.dial` rejected (bypass with `use_live_dial=True`)
+
+**trigger/t** - fires RIGHT-TO-LEFT:
+- Set `trigger_rtl=True` to acknowledge
+- `[t b f]` sends `f` FIRST, then `b`
+
+**coll** - data doesn't persist unless embedded:
+- Always include `@embed 1` in args: `['mycoll', '@embed', 1]`
 
 ---
 
@@ -66,6 +84,10 @@ connect from parent
 | `get_object_connections(var)` | Get all connections |
 | `create_subpatcher(pos, var, name)` | Create p object |
 | `enter_subpatcher(var)` / `exit_subpatcher()` | Navigate subpatchers |
+
+**line~ messages** - must have EVEN number of values (pairs):
+- `[0, 0, 1, 500, 0, 500]` for instant→0, ramp→1 in 500ms, →0 in 500ms
+- Odd count rejected (set `not_line_msg=True` to bypass)
 
 ---
 

@@ -121,11 +121,12 @@ mcp = FastMCP(
 
 # Math objects that require float arguments (or explicit int_mode)
 # These objects default to integer mode which truncates floats - a common source of bugs
-FLOAT_REQUIRED_OBJECTS = {"+", "-", "*", "/", "!+", "!-", "!*", "!/", "%", "scale"}
+FLOAT_REQUIRED_OBJECTS = {"+", "-", "*", "/", "!+", "!-", "!*", "!/", "%", "pow", "scale"}
 
-# Pack objects - require float arguments (or explicit int_mode) like math objects
+# Pack/unpack objects - require float arguments (or explicit int_mode) like math objects
 # This prevents the common bug of [pack 0 100] outputting ints when used with line~
-PACK_OBJECTS = {"pack", "pak"}
+# and [unpack 0 0 0] truncating incoming floats to ints
+PACK_OBJECTS = {"pack", "pak", "unpack"}
 
 # Objects that should be rejected with a suggestion for the correct alternative
 REJECTED_OBJECTS = {
@@ -158,10 +159,22 @@ PARAM_RANGE_CHECKS = {
 
 
 def _has_float_arg(args: list) -> bool:
-    """Check if any argument is a float (not an integer)."""
+    """Check if any argument is a float (not an integer).
+
+    Also checks string args - if a string contains '.', it indicates float intent.
+    This allows the model to pass ["0", "127", "0", "25."] to preserve float notation
+    that would otherwise be lost during JSON serialization.
+    """
     for arg in args:
         if isinstance(arg, float):
             return True
+        # String with '.' indicates float intent (survives JSON)
+        if isinstance(arg, str) and '.' in arg:
+            try:
+                float(arg)  # Verify it's a valid number
+                return True
+            except ValueError:
+                pass
     return False
 
 
@@ -172,7 +185,45 @@ def _pack_has_float_arg(args: list) -> bool:
             return True
         if isinstance(arg, str) and arg.lower() == "f":
             return True
+        # String with '.' indicates float intent
+        if isinstance(arg, str) and '.' in arg:
+            try:
+                float(arg)
+                return True
+            except ValueError:
+                pass
     return False
+
+
+def _convert_string_args(args: list) -> list:
+    """Convert string numeric args to proper types for Max.
+
+    - Strings with '.' -> float (e.g., "25." -> 25.0)
+    - Strings without '.' -> int (e.g., "127" -> 127)
+    - Non-numeric strings pass through unchanged (e.g., "f", "@embed")
+    - Already numeric types pass through unchanged
+    """
+    result = []
+    for arg in args:
+        if isinstance(arg, str):
+            # Check if it's a numeric string
+            if '.' in arg:
+                try:
+                    result.append(float(arg))
+                    continue
+                except ValueError:
+                    pass
+            else:
+                try:
+                    result.append(int(arg))
+                    continue
+                except ValueError:
+                    pass
+            # Not a number, keep as string
+            result.append(arg)
+        else:
+            result.append(arg)
+    return result
 
 
 @mcp.tool()
@@ -184,6 +235,8 @@ async def add_max_object(
     args: list,
     int_mode: bool = False,
     extend: bool = False,
+    use_live_dial: bool = False,
+    trigger_rtl: bool = False,
 ):
     """Add a new Max object.
 
@@ -201,6 +254,10 @@ async def add_max_object(
                          to prevent unintended integer truncation.
         extend (bool): Bypass parameter range checks. Use when you intentionally want
                        unusual values like svf~ Q >= 1 or onepole~ frequency < 10 Hz.
+        use_live_dial (bool): Bypass the live.dial rejection. By default, use `dial` instead
+                              which supports inline range attributes (@size, @min, @floatoutput, @mode).
+        trigger_rtl (bool): Acknowledge that trigger/t objects fire outlets RIGHT-TO-LEFT.
+                            The rightmost outlet fires first. Order your arguments accordingly.
 
     Returns:
         dict: Result with success/error status.
@@ -225,22 +282,32 @@ async def add_max_object(
 
     # Validate float requirement for math objects
     if obj_type in FLOAT_REQUIRED_OBJECTS:
-        if not _has_float_arg(args) and not int_mode:
-            example = f"[{obj_type} 0.]" if not args else f"[{obj_type} {args[0]}.]"
+        # Special case for scale: if output range is 0-1 or small, assume float intent
+        scale_float_intent = False
+        if obj_type == "scale" and len(args) >= 4:
+            out_min, out_max = args[2], args[3]
+            if isinstance(out_min, (int, float)) and isinstance(out_max, (int, float)):
+                out_range = abs(out_max - out_min)
+                # If output range is <= 2 (like 0-1, -1 to 1, 0-2), assume float intent
+                if out_range <= 2:
+                    scale_float_intent = True
+
+        if not _has_float_arg(args) and not int_mode and not scale_float_intent:
             return {
                 "success": False,
                 "error": f"FLOAT REQUIRED: '{obj_type}' defaults to integer mode which truncates floats. "
-                         f"Use a float argument (e.g., {example}) or set int_mode=True if integer truncation is intended.",
+                         f"Use STRING args with '.' to preserve float type (JSON strips .0 from numbers). "
+                         f"Example: args: [\"0\", \"127\", \"0\", \"25.\"] instead of [0, 127, 0, 25.0]. "
+                         f"Or set int_mode=True if integer truncation is intended.",
             }
 
-    # Validate float requirement for pack/pak objects
+    # Validate float requirement for pack/pak/unpack objects
     if obj_type in PACK_OBJECTS:
         if not _pack_has_float_arg(args) and not int_mode:
-            example = f"[{obj_type} 0. 100]" if len(args) >= 2 else f"[{obj_type} f]"
             return {
                 "success": False,
                 "error": f"FLOAT REQUIRED: '{obj_type}' with integer arguments outputs integers. "
-                         f"Use float arguments (e.g., {example}) or 'f' type specifier, "
+                         f"Use 'f' type specifier: ['f', 'f', 'f'], or STRING args with '.': [\"0.\", \"0.\"], "
                          f"or set int_mode=True if integer output is intended.",
             }
 
@@ -256,13 +323,83 @@ async def add_max_object(
                     "error": f"PARAM RANGE: {check['error'].format(value=value)}",
                 }
 
+    # Reject live.dial by default - suggest dial instead
+    if obj_type == "live.dial" and not use_live_dial:
+        return {
+            "success": False,
+            "error": "USE DIAL INSTEAD: live.dial outputs 0-127 with no inline range control. "
+                     "Use [dial] with attributes instead:\n"
+                     "  - Float 0-1: [dial @size 1 @floatoutput 1]\n"
+                     "  - Float -1 to 1 (pan): [dial @min -1 @size 2 @floatoutput 1 @mode 6]\n"
+                     "  - Int 0-127: [dial @size 127]\n"
+                     "Set use_live_dial=True only if you specifically need Live integration.",
+        }
+
+    # Validate dial has explicit range attributes
+    if obj_type == "dial":
+        has_size = "@size" in args
+        if not has_size:
+            return {
+                "success": False,
+                "error": "RANGE REQUIRED: dial needs explicit @size attribute. Examples:\n"
+                         "  - Float 0-1: ['@size', 1, '@floatoutput', 1]\n"
+                         "  - Float -1 to 1 (pan): ['@min', -1, '@size', 2, '@floatoutput', 1, '@mode', 6]\n"
+                         "  - Int 0-127: ['@size', 127]",
+            }
+
+        # Check for excessively large dial sizes (makes UI unusable)
+        if not extend:
+            try:
+                size_idx = args.index("@size")
+                if size_idx + 1 < len(args):
+                    size_val = args[size_idx + 1]
+                    if isinstance(size_val, (int, float)) and size_val > 255:
+                        return {
+                            "success": False,
+                            "error": f"DIAL SIZE TOO LARGE: @size {int(size_val)} creates unusable UI "
+                                     f"(must drag through {int(size_val)} positions). "
+                                     "For large ranges, use:\n"
+                                     "  - [flonum] or [number] for direct value entry\n"
+                                     "  - A scaled dial (e.g., 0-100 dial with multiplier)\n"
+                                     "Set extend=True to bypass this check.",
+                        }
+            except (ValueError, IndexError):
+                pass  # @size not found or malformed - other validation handles this
+
+    # Validate trigger/t right-to-left acknowledgment
+    if obj_type in {"trigger", "t"} and not trigger_rtl:
+        return {
+            "success": False,
+            "error": "ORDER ACKNOWLEDGMENT REQUIRED: trigger/t fires outlets RIGHT-TO-LEFT. "
+                     "The rightmost argument fires FIRST. For example, [t b f] sends 'f' first, then 'b'. "
+                     "Set trigger_rtl=True to acknowledge you understand this.",
+        }
+
+    # Validate coll has @embed 1 for data persistence
+    if obj_type == "coll":
+        has_embed = False
+        for i, arg in enumerate(args):
+            if arg == "@embed" and i + 1 < len(args) and args[i + 1] == 1:
+                has_embed = True
+                break
+        if not has_embed:
+            return {
+                "success": False,
+                "error": "EMBED REQUIRED: coll data does not persist on save unless @embed 1 is set. "
+                         "Use args like: ['mycoll', '@embed', 1] to ensure data is saved with the patch.",
+            }
+
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
     assert len(position) == 2, "Position must be a list of two integers."
+
+    # Convert string args to proper types (preserves float intent from "25." strings)
+    converted_args = _convert_string_args(args)
+
     payload = {
         "action": "add_object",
         "position": position,
         "obj_type": obj_type,
-        "args": args,
+        "args": converted_args,
         "varname": varname,
     }
     response = await maxmsp.send_request(payload, timeout=5.0)
@@ -368,13 +505,30 @@ async def set_message_text(
     ctx: Context,
     varname: str,
     text_list: list,
+    not_line_msg: bool = False,
 ):
     """Set the text of a message object in MaxMSP.
 
     Args:
         varname (str): Variable name of the message object.
         text_list (list): A list of arguments to be set to the message object.
+        not_line_msg (bool): Set True if this message is NOT for line~/line.
+                             By default, messages with 3+ numbers and an odd count
+                             are rejected (likely malformed line~ target-time pairs).
     """
+    # Check for likely malformed line~ messages (odd number of numeric values >= 3)
+    if not not_line_msg:
+        numeric_count = sum(1 for item in text_list if isinstance(item, (int, float)))
+        if numeric_count >= 3 and numeric_count % 2 == 1:
+            return {
+                "success": False,
+                "error": f"LIKELY MALFORMED LINE~ MESSAGE: Got {numeric_count} numeric values (odd count). "
+                         "line~/line expects target-time PAIRS. Examples:\n"
+                         "  - Instant to 0, ramp to 1 in 500ms, back to 0 in 500ms: [0, 0, 1, 500, 0, 500]\n"
+                         "  - Same with comma syntax: ['0,', 1, 500, 0, 500] (comma makes '0' instant)\n"
+                         "Set not_line_msg=True if this message is not for line~/line.",
+            }
+
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
     cmd = {"action": "set_message_text"}
     kwargs = {"varname": varname, "new_text": text_list}

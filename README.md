@@ -26,9 +26,14 @@ This fork significantly extends the original with new tools, safety features, an
 
 ### Safety & Validation Features
 
-- **Float enforcement**: Math objects (`+`, `-`, `*`, `/`, `%`, `scale`, etc.) require float arguments at server level to prevent integer truncation bugs
+- **Float enforcement**: Math objects (`+`, `-`, `*`, `/`, `%`, `pow`, `scale`) and pack/unpack objects require float arguments. Use STRING args to preserve floats (JSON strips `.0`): `["0", "127", "0", "25."]`. Use `int_mode=True` to explicitly allow integers. Exception: `scale` with output range ≤ 2 auto-detects float intent.
+- **dial range enforcement**: Rejects `live.dial` (suggests `dial` with inline attributes); requires `@size` on `dial` objects; rejects `@size > 255` (unusable UI - use `extend=True` to bypass)
+- **trigger/t acknowledgment**: Requires `trigger_rtl=True` flag to confirm understanding that outlets fire right-to-left
+- **coll embed enforcement**: Requires `@embed 1` in args to ensure data persists on save
+- **line~ message validation**: Rejects messages with odd numeric count (likely malformed target-time pairs)
 - **Object validation**: Rejects invalid objects (e.g., `times~` → suggests `*~`)
 - **Argument validation**: Enforces minimum arguments for complex objects (e.g., `comb~` requires 5 args)
+- **Parameter range checks**: Catches common mistakes like svf~ Q >= 1 or onepole~ frequency < 10 Hz
 - **Large patch warnings**: Alerts when root patcher exceeds 80 objects
 - **Signal safety analysis**: Detects feedback loops, high gain, unsafe comb~ feedback, and missing limiters before `dac~`
 
