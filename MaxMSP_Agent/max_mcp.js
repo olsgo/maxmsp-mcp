@@ -248,6 +248,30 @@ function anything() {
 // 	//outlet(1, request_id)
 // }
 
+// Objects that need float formatting to avoid integer truncation
+var FLOAT_SENSITIVE_OBJECTS = {
+    "+": true, "-": true, "*": true, "/": true, "%": true,
+    "pow": true, "scale": true,
+    "pack": true, "pak": true, "unpack": true
+};
+
+// Format a number with decimal point to ensure Max interprets as float
+function format_float_arg(arg) {
+    if (typeof arg === "number") {
+        var s = arg.toString();
+        // Add decimal point if it's a whole number
+        if (s.indexOf(".") === -1 && s.indexOf("e") === -1) {
+            return s + ".";
+        }
+        return s;
+    }
+    // If it's a string that looks like a float indicator (e.g., "1500."), preserve it
+    if (typeof arg === "string") {
+        return arg;
+    }
+    return String(arg);
+}
+
 function add_object(x, y, type, args, var_name, request_id) {
     // Preflight check: require get_avoid_rect_position to be called first
     if (!avoid_rect_called) {
@@ -259,7 +283,21 @@ function add_object(x, y, type, args, var_name, request_id) {
         return;
     }
 
-    var new_obj = current_patcher.newdefault(x, y, type, args);
+    var new_obj;
+
+    // For float-sensitive objects, construct boxtext manually to preserve decimal points
+    if (FLOAT_SENSITIVE_OBJECTS[type] && args.length > 0) {
+        // Build boxtext with proper float formatting
+        var formatted_args = [];
+        for (var i = 0; i < args.length; i++) {
+            formatted_args.push(format_float_arg(args[i]));
+        }
+        // Pass entire boxtext as classname - Max parses the whole string
+        var boxtext = type + " " + formatted_args.join(" ");
+        new_obj = current_patcher.newdefault(x, y, boxtext);
+    } else {
+        new_obj = current_patcher.newdefault(x, y, type, args);
+    }
 
     // Check for jbogus - object doesn't exist
     if (new_obj.maxclass === "jbogus") {
@@ -910,8 +948,18 @@ function recreate_with_args(request_id, var_name, new_args) {
     // Remove the old object
     current_patcher.remove(obj);
 
-    // Create new object with new args
-    var new_obj = current_patcher.newdefault(x, y, obj_type, new_args);
+    // Create new object with new args (use float formatting for sensitive objects)
+    var new_obj;
+    if (FLOAT_SENSITIVE_OBJECTS[obj_type] && new_args.length > 0) {
+        var formatted_args = [];
+        for (var i = 0; i < new_args.length; i++) {
+            formatted_args.push(format_float_arg(new_args[i]));
+        }
+        var boxtext = obj_type + " " + formatted_args.join(" ");
+        new_obj = current_patcher.newdefault(x, y, boxtext);
+    } else {
+        new_obj = current_patcher.newdefault(x, y, obj_type, new_args);
+    }
     new_obj.varname = var_name;
 
     // Handle special object types

@@ -209,6 +209,28 @@ var internal_to_user_class = {
     "lessthaneq~": "<=~"
 };
 
+// Objects that need float formatting to avoid integer truncation
+var FLOAT_SENSITIVE_OBJECTS = {
+    "+": true, "-": true, "*": true, "/": true, "%": true,
+    "pow": true, "scale": true,
+    "pack": true, "pak": true, "unpack": true
+};
+
+// Format a number with decimal point to ensure Max interprets as float
+function format_float_arg(arg) {
+    if (typeof arg === "number") {
+        var s = arg.toString();
+        if (s.indexOf(".") === -1 && s.indexOf("e") === -1) {
+            return s + ".";
+        }
+        return s;
+    }
+    if (typeof arg === "string") {
+        return arg;
+    }
+    return String(arg);
+}
+
 function complete_encapsulate(data_str) {
     var data = safe_parse_json(data_str);
     if (!data) return;
@@ -316,8 +338,18 @@ function complete_encapsulate(data_str) {
             }
         }
 
-        // Create object in subpatcher
-        var new_obj = subpatch.newdefault(o.new_x, o.new_y, obj_type, obj_args);
+        // Create object in subpatcher (use float formatting for sensitive objects)
+        var new_obj;
+        if (FLOAT_SENSITIVE_OBJECTS[obj_type] && obj_args.length > 0) {
+            var formatted_args = [];
+            for (var j = 0; j < obj_args.length; j++) {
+                formatted_args.push(format_float_arg(obj_args[j]));
+            }
+            var boxtext_str = obj_type + " " + formatted_args.join(" ");
+            new_obj = subpatch.newdefault(o.new_x, o.new_y, boxtext_str);
+        } else {
+            new_obj = subpatch.newdefault(o.new_x, o.new_y, obj_type, obj_args);
+        }
         new_obj.varname = new_vn;
         new_varname_map[o.varname] = new_vn;
 
