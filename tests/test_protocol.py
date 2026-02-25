@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import server as server_module
 from server import (
     ERROR_BRIDGE_TIMEOUT,
     ERROR_INTERNAL,
@@ -16,8 +17,12 @@ from server import (
     MaxMCPError,
     MaxMSPConnection,
     MaxRuntimeManager,
+    _normalize_add_object_spec,
+    _normalize_avoid_rect_payload,
     _build_transaction_bridge_request,
     _resolve_auth_token_from_sources,
+    add_max_object,
+    get_avoid_rect_position,
     maxpy_catalog,
     dry_run_plan,
     run_patch_transaction,
@@ -476,6 +481,90 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(warn.get("code") == ERROR_UNKNOWN_ACTION for warn in result["warnings"]))
 
 
+class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
+    def test_normalize_add_object_spec_newobj_rewrite(self):
+        obj_type, args, rewrite, err = _normalize_add_object_spec("newobj", ["prepend", "set"])
+        self.assertIsNone(err)
+        self.assertEqual(obj_type, "prepend")
+        self.assertEqual(args, ["set"])
+        self.assertTrue(rewrite["applied"])
+
+    def test_normalize_add_object_spec_newobj_invalid_without_args(self):
+        _obj_type, _args, _rewrite, err = _normalize_add_object_spec("newobj", [])
+        self.assertIsNotNone(err)
+        self.assertFalse(err["success"])
+        self.assertEqual(err["error"]["code"], "VALIDATION_ERROR")
+
+    def test_normalize_avoid_rect_payload_falls_back_for_invalid(self):
+        rect, valid = _normalize_avoid_rect_payload({"bad": "shape"})
+        self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
+        self.assertFalse(valid)
+
+    async def test_add_max_object_auto_preflight_and_newobj_shim(self):
+        actions = []
+
+        class FakeBridge:
+            def __init__(self):
+                self.preflight_auto_calls = 0
+                self.preflight_cache_hits = 0
+                self.preflight_invalid_rects = 0
+                self.newobj_compat_rewrites = 0
+                self._preflight_last_at = 0.0
+
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                actions.append((payload.get("action"), json.loads(json.dumps(payload))))
+                if payload.get("action") == "get_avoid_rect_position":
+                    return [0, 0, 0, 0]
+                if payload.get("action") == "add_object":
+                    return {"success": True}
+                return {"success": True}
+
+        bridge = FakeBridge()
+        ctx = SimpleNamespace(
+            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
+        )
+        original_mode = server_module.MAXMCP_PREFLIGHT_MODE
+        try:
+            server_module.MAXMCP_PREFLIGHT_MODE = "auto"
+            result = await add_max_object(
+                ctx,
+                position=[10, 20],
+                obj_type="newobj",
+                varname="compat_obj",
+                args=["prepend", "set_folderPath"],
+            )
+        finally:
+            server_module.MAXMCP_PREFLIGHT_MODE = original_mode
+
+        self.assertTrue(result["success"])
+        self.assertEqual(actions[0][0], "get_avoid_rect_position")
+        self.assertEqual(actions[1][0], "add_object")
+        self.assertEqual(actions[1][1]["obj_type"], "prepend")
+        self.assertEqual(actions[1][1]["args"], ["set_folderPath"])
+        self.assertIn("meta", result)
+        self.assertEqual(result["meta"]["newobj_compat"]["resolved_obj_type"], "prepend")
+        self.assertTrue(result["meta"]["preflight"]["performed"])
+
+    async def test_get_avoid_rect_position_sanitizes_bridge_payload(self):
+        class FakeBridge:
+            def __init__(self):
+                self._preflight_last_at = 0.0
+                self.preflight_invalid_rects = 0
+
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                if payload.get("action") == "get_avoid_rect_position":
+                    return [None, "x", {}, []]
+                return {}
+
+        bridge = FakeBridge()
+        ctx = SimpleNamespace(
+            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
+        )
+        rect = await get_avoid_rect_position(ctx)
+        self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(bridge.preflight_invalid_rects, 1)
+
+
 class MaxPyCatalogTests(unittest.TestCase):
     def test_maxpy_catalog_has_core_objects(self):
         self.assertTrue(maxpy_catalog.available)
@@ -720,6 +809,51 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(checkpoints), 1)
             self.assertEqual(checkpoints[0]["checkpoint_id"], created["checkpoint_id"])
 
+    async def test_persist_workspace_target_retries_after_timeout(self):
+        class FlakyBridge:
+            def __init__(self):
+                self.sio = SimpleNamespace(connected=True)
+                self.calls = 0
+                self.workspace_capture_timeouts = 0
+                self.workspace_capture_retries = 0
+
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None, include_envelope=False):
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    self.calls += 1
+                    if self.calls < 3:
+                        raise MaxMCPError(
+                            ERROR_BRIDGE_TIMEOUT,
+                            "No response received in 8.0 seconds.",
+                            recoverable=True,
+                            details={},
+                        )
+                    return {"boxes": [], "lines": []}
+                if action == "get_patcher_context":
+                    return {"depth": 0, "path": [], "is_root": True}
+                return {"success": True}
+
+        bridge = FlakyBridge()
+        runtime = MaxRuntimeManager(bridge)
+        runtime.workspace_capture_timeout_seconds = 0.01
+        runtime.workspace_capture_retries = 2
+        runtime.workspace_capture_backoff_seconds = 0.0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime.session_dir = tmp_path
+            runtime.session_active_patch = tmp_path / "active.maxpat"
+            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
+            runtime.checkpoints_file = tmp_path / "checkpoints.json"
+            runtime._ensure_session_patches_sync()
+
+            result = await runtime.persist_workspace_target(target="active", reason="retry-test")
+            self.assertTrue(result["persisted"])
+            self.assertEqual(result["capture"]["attempts"], 3)
+            self.assertEqual(result["capture"]["retry_attempts"], 2)
+            self.assertEqual(bridge.workspace_capture_timeouts, 2)
+            self.assertEqual(bridge.workspace_capture_retries, 2)
+
 
 class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
     class FakeBridge:
@@ -843,6 +977,52 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(loaded["success"])
             self.assertEqual(bridge.topologies["active"]["boxes"][0]["box"]["varname"], "osc1")
+
+    async def test_load_patch_from_path_remaps_line_refs_from_box_ids(self):
+        bridge = self.FakeBridge()
+        runtime = MaxRuntimeManager(bridge)
+        runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime.session_dir = tmp_path
+            runtime.session_active_patch = tmp_path / "active.maxpat"
+            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
+            runtime.checkpoints_file = tmp_path / "checkpoints.json"
+            runtime._ensure_session_patches_sync()
+
+            source_path = tmp_path / "id_refs.maxpat"
+            source_payload = {
+                "patcher": {
+                    "boxes": [
+                        {"box": {"id": "obj-1", "maxclass": "newobj", "boxtext": "cycle~ 220"}},
+                        {"box": {"id": "obj-2", "maxclass": "newobj", "boxtext": "dac~"}},
+                    ],
+                    "lines": [
+                        {"patchline": {"source": ["obj-1", 0], "destination": ["obj-2", 0]}},
+                    ],
+                }
+            }
+            source_path.write_text(json.dumps(source_payload))
+
+            loaded = await runtime.load_patch_from_path(
+                str(source_path),
+                target="active",
+                mode="replace",
+                create_checkpoint_before_load=False,
+            )
+            self.assertTrue(loaded["success"])
+            self.assertEqual(loaded["import_summary"]["generated_varnames"], 2)
+            self.assertGreaterEqual(loaded["import_summary"]["line_ref_id_mappings"], 2)
+            self.assertEqual(len(bridge.topologies["active"]["lines"]), 1)
+            line = bridge.topologies["active"]["lines"][0]["patchline"]
+            valid_vars = {
+                row["box"]["varname"]
+                for row in bridge.topologies["active"]["boxes"]
+                if isinstance(row, dict) and isinstance(row.get("box"), dict)
+            }
+            self.assertIn(line["source"][0], valid_vars)
+            self.assertIn(line["destination"][0], valid_vars)
 
     async def test_load_patch_from_path_merge_and_fail_if_not_empty(self):
         bridge = self.FakeBridge()
@@ -1105,6 +1285,20 @@ class TransactionBuilderTests(unittest.TestCase):
         self.assertEqual(payload["action"], "add_object")
         self.assertEqual(payload["obj_type"], "scale")
         self.assertEqual(timeout, 8.0)
+
+    def test_transaction_builder_maps_newobj_shorthand(self):
+        payload, _timeout = _build_transaction_bridge_request(
+            1,
+            "add_max_object",
+            {
+                "position": [10, 10],
+                "obj_type": "newobj",
+                "varname": "v1",
+                "args": ["prepend", "set"],
+            },
+        )
+        self.assertEqual(payload["obj_type"], "prepend")
+        self.assertEqual(payload["args"], ["set"])
 
     def test_transaction_builder_rejects_unknown_action(self):
         with self.assertRaises(MaxMCPError):

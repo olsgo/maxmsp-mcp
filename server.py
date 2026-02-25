@@ -21,6 +21,7 @@ import uuid
 import os
 import json
 import hashlib
+import math
 
 SOCKETIO_SERVER_URL = os.environ.get("SOCKETIO_SERVER_URL", "http://127.0.0.1")
 SOCKETIO_SERVER_PORT = os.environ.get("SOCKETIO_SERVER_PORT", "5002")
@@ -111,6 +112,25 @@ MAXMCP_ALERT_QUEUE_DEPTH = float(os.environ.get("MAXMCP_ALERT_QUEUE_DEPTH", "0.8
 MAXMCP_ALERT_WINDOW_SECONDS = float(os.environ.get("MAXMCP_ALERT_WINDOW_SECONDS", "300"))
 MAXMCP_ENFORCE_PATCH_ROOTS = _env_bool("MAXMCP_ENFORCE_PATCH_ROOTS", False)
 MAXMCP_ALLOWED_PATCH_ROOTS_RAW = os.environ.get("MAXMCP_ALLOWED_PATCH_ROOTS", "").strip()
+MAXMCP_PREFLIGHT_MODE = os.environ.get("MAXMCP_PREFLIGHT_MODE", "auto").strip().lower()
+MAXMCP_PREFLIGHT_CACHE_SECONDS = float(
+    os.environ.get("MAXMCP_PREFLIGHT_CACHE_SECONDS", "30")
+)
+MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS = float(
+    os.environ.get("MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS", "8")
+)
+MAXMCP_WORKSPACE_CAPTURE_RETRIES = int(
+    os.environ.get("MAXMCP_WORKSPACE_CAPTURE_RETRIES", "2")
+)
+MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS = float(
+    os.environ.get("MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS", "0.5")
+)
+if MAXMCP_PREFLIGHT_MODE not in {"auto", "manual", "session"}:
+    logging.warning(
+        "Invalid MAXMCP_PREFLIGHT_MODE '%s'; falling back to 'auto'.",
+        MAXMCP_PREFLIGHT_MODE,
+    )
+    MAXMCP_PREFLIGHT_MODE = "auto"
 MAXMCP_HYGIENE_AUTO_CLEANUP = _env_bool("MAXMCP_HYGIENE_AUTO_CLEANUP", True)
 MAXMCP_HYGIENE_SCOPE = os.environ.get("MAXMCP_HYGIENE_SCOPE", "all_max_instances").strip()
 MAXMCP_HYGIENE_MODE = os.environ.get("MAXMCP_HYGIENE_MODE", "aggressive").strip()
@@ -519,6 +539,15 @@ class MaxMSPConnection:
 
         self._latency_samples = deque(maxlen=max(8, MAXMCP_METRICS_SAMPLE_SIZE))
         self._event_log = deque(maxlen=max(8, MAXMCP_EVENT_LOG_SIZE))
+        self._preflight_last_at: float = 0.0
+        self._preflight_epoch = 0
+        self._preflight_epoch_at_last_run = -1
+        self.preflight_auto_calls = 0
+        self.preflight_cache_hits = 0
+        self.preflight_invalid_rects = 0
+        self.newobj_compat_rewrites = 0
+        self.workspace_capture_timeouts = 0
+        self.workspace_capture_retries = 0
 
         @self.sio.on("response", namespace=self.namespace)
         async def _on_response(data):
@@ -1136,6 +1165,13 @@ class MaxMSPConnection:
                 }
             )
             results = response_envelope.get("results")
+            if isinstance(action, str) and action in {
+                "set_workspace_target",
+                "enter_subpatcher",
+                "exit_subpatcher",
+                "apply_topology_snapshot",
+            }:
+                self._preflight_epoch += 1
             if idempotency_key:
                 self._cache_idempotent_result(idempotency_key, results)
             if self.runtime_manager and isinstance(action, str):
@@ -1308,6 +1344,13 @@ class MaxMSPConnection:
             "mutation_queue_rejections": self.mutation_queue_rejections,
             "mutation_queue_timeouts": self.mutation_queue_timeouts,
             "max_queue_depth_seen": self.max_queue_depth_seen,
+            "preflight_mode": MAXMCP_PREFLIGHT_MODE,
+            "preflight_auto_calls": self.preflight_auto_calls,
+            "preflight_cache_hits": self.preflight_cache_hits,
+            "preflight_invalid_rects": self.preflight_invalid_rects,
+            "newobj_compat_rewrites": self.newobj_compat_rewrites,
+            "workspace_capture_timeouts": self.workspace_capture_timeouts,
+            "workspace_capture_retries": self.workspace_capture_retries,
             "auth": {
                 "required": self.require_handshake_auth,
                 "configured": bool(self.auth_token),
@@ -1377,6 +1420,26 @@ class MaxMSPConnection:
                 "rejections": self.mutation_queue_rejections,
                 "timeouts": self.mutation_queue_timeouts,
             },
+            "preflight": {
+                "mode": MAXMCP_PREFLIGHT_MODE,
+                "cache_seconds": MAXMCP_PREFLIGHT_CACHE_SECONDS,
+                "auto_calls": self.preflight_auto_calls,
+                "cache_hits": self.preflight_cache_hits,
+                "invalid_rects": self.preflight_invalid_rects,
+                "last_at_monotonic": self._preflight_last_at,
+                "epoch": self._preflight_epoch,
+                "last_preflight_epoch": self._preflight_epoch_at_last_run,
+            },
+            "compat": {
+                "newobj_rewrites": self.newobj_compat_rewrites,
+            },
+            "workspace_capture": {
+                "timeout_seconds": MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS,
+                "retries": MAXMCP_WORKSPACE_CAPTURE_RETRIES,
+                "backoff_seconds": MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS,
+                "timeouts": self.workspace_capture_timeouts,
+                "retry_attempts": self.workspace_capture_retries,
+            },
             "actions": action_stats,
             "last_log_emit_at": self.last_metrics_log_emit_at,
         }
@@ -1439,6 +1502,15 @@ class MaxRuntimeManager:
         self._lock = asyncio.Lock()
         self._last_launch_at = 0.0
         self._launch_cooldown_seconds = 1.5
+        self.workspace_capture_timeout_seconds = max(
+            0.25,
+            float(MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS),
+        )
+        self.workspace_capture_retries = max(0, int(MAXMCP_WORKSPACE_CAPTURE_RETRIES))
+        self.workspace_capture_backoff_seconds = max(
+            0.0,
+            float(MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS),
+        )
 
     @staticmethod
     def _canonical_topology(topology: dict) -> dict:
@@ -1515,19 +1587,76 @@ class MaxRuntimeManager:
             "auto_sync_enabled": self.twin_auto_sync,
         }
 
-    async def _capture_live_topology(self) -> dict:
-        topology = await self.maxmsp.send_request(
-            {"action": "get_objects_in_patch"},
-            timeout=8.0,
-        )
-        if not isinstance(topology, dict):
+    async def _capture_live_topology(self, *, include_meta: bool = False) -> dict | tuple[dict, dict]:
+        timeout_seconds = self.workspace_capture_timeout_seconds
+        max_attempts = 1 + self.workspace_capture_retries
+        backoff = self.workspace_capture_backoff_seconds
+        last_error: Exception | None = None
+        capture_meta = {
+            "timeout_seconds": timeout_seconds,
+            "max_attempts": max_attempts,
+            "backoff_seconds": backoff,
+            "attempts": 0,
+            "retry_attempts": 0,
+        }
+
+        for attempt in range(1, max_attempts + 1):
+            capture_meta["attempts"] = attempt
+            try:
+                topology = await self.maxmsp.send_request(
+                    {"action": "get_objects_in_patch"},
+                    timeout=timeout_seconds,
+                )
+                if not isinstance(topology, dict):
+                    raise MaxMCPError(
+                        ERROR_INTERNAL,
+                        "Bridge returned unexpected topology payload.",
+                        recoverable=True,
+                        details={"payload_type": str(type(topology))},
+                    )
+                if include_meta:
+                    capture_meta["captured"] = True
+                    return topology, capture_meta
+                return topology
+            except Exception as e:
+                last_error = e
+                is_timeout = isinstance(e, MaxMCPError) and e.code == ERROR_BRIDGE_TIMEOUT
+                if is_timeout:
+                    current_timeouts = getattr(self.maxmsp, "workspace_capture_timeouts", 0)
+                    try:
+                        self.maxmsp.workspace_capture_timeouts = int(current_timeouts) + 1
+                    except Exception:
+                        pass
+                if attempt >= max_attempts:
+                    break
+                if not is_timeout:
+                    break
+                capture_meta["retry_attempts"] = capture_meta.get("retry_attempts", 0) + 1
+                current_retries = getattr(self.maxmsp, "workspace_capture_retries", 0)
+                try:
+                    self.maxmsp.workspace_capture_retries = int(current_retries) + 1
+                except Exception:
+                    pass
+                if backoff > 0.0:
+                    await asyncio.sleep(backoff * attempt)
+
+        if isinstance(last_error, MaxMCPError):
+            merged = dict(last_error.details or {})
+            merged["capture"] = capture_meta
             raise MaxMCPError(
-                ERROR_INTERNAL,
-                "Bridge returned unexpected topology payload.",
-                recoverable=True,
-                details={"payload_type": str(type(topology))},
+                last_error.code,
+                last_error.message,
+                hint=last_error.hint,
+                recoverable=last_error.recoverable,
+                details=merged,
             )
-        return topology
+
+        raise MaxMCPError(
+            ERROR_INTERNAL,
+            "Failed to capture live topology.",
+            recoverable=True,
+            details={"capture": capture_meta, "error": str(last_error) if last_error else "unknown"},
+        )
 
     async def sync_patch_twin(self, reason: str = "manual") -> dict:
         if not self.maxmsp.sio.connected:
@@ -2208,8 +2337,10 @@ class MaxRuntimeManager:
         used = set(reserved)
         seen_source: set[str] = set()
         remap: dict[str, str] = {}
+        source_ref_map: dict[str, str] = {}
         collisions = 0
         generated_varnames = 0
+        id_ref_remaps = 0
         normalized_boxes: list[dict] = []
 
         for idx, row in enumerate(topology.get("boxes", [])):
@@ -2256,6 +2387,17 @@ class MaxRuntimeManager:
                 generated_varnames += 1
                 used.add(generated)
 
+            final_varname = normalized_box.get("varname")
+            if isinstance(final_varname, str) and final_varname:
+                if source_varname:
+                    source_ref_map[source_varname] = final_varname
+                source_id = normalized_box.get("id")
+                if isinstance(source_id, str) and source_id:
+                    if source_ref_map.get(source_id) != final_varname:
+                        source_ref_map[source_id] = final_varname
+                        if source_id != final_varname:
+                            id_ref_remaps += 1
+
             normalized_boxes.append({"box": normalized_box})
 
         valid_varnames = {
@@ -2286,10 +2428,10 @@ class MaxRuntimeManager:
             src_var, src_idx = source[0], source[1]
             dst_var, dst_idx = destination[0], destination[1]
 
-            if isinstance(src_var, str) and src_var in remap:
-                src_var = remap[src_var]
-            if isinstance(dst_var, str) and dst_var in remap:
-                dst_var = remap[dst_var]
+            if isinstance(src_var, str):
+                src_var = source_ref_map.get(src_var, remap.get(src_var, src_var))
+            if isinstance(dst_var, str):
+                dst_var = source_ref_map.get(dst_var, remap.get(dst_var, dst_var))
 
             if not isinstance(src_var, str) or not isinstance(dst_var, str):
                 skipped_lines += 1
@@ -2322,6 +2464,8 @@ class MaxRuntimeManager:
             "collisions_count": collisions,
             "generated_varnames": generated_varnames,
             "skipped_lines": skipped_lines,
+            "line_ref_map_size": len(source_ref_map),
+            "line_ref_id_mappings": id_ref_remaps,
         }
 
     @staticmethod
@@ -2418,13 +2562,17 @@ class MaxRuntimeManager:
             return {"persisted": False, "reason": "host_target", "target": target_id}
         if not self.maxmsp.sio.connected:
             return {"persisted": False, "reason": "bridge_disconnected", "target": target_id}
+        capture_meta: dict = {}
         try:
-            topology = await self._capture_live_topology()
+            topology, capture_meta = await self._capture_live_topology(include_meta=True)
         except Exception as e:
+            details = e.details if isinstance(e, MaxMCPError) and isinstance(e.details, dict) else {}
             return {
                 "persisted": False,
                 "reason": "capture_failed",
                 "target": target_id,
+                "capture": details.get("capture", capture_meta),
+                "error_code": e.code if isinstance(e, MaxMCPError) else ERROR_INTERNAL,
                 "error": str(e),
             }
         try:
@@ -2434,6 +2582,7 @@ class MaxRuntimeManager:
                 topology,
             )
             result["reason"] = reason
+            result["capture"] = capture_meta
             return result
         except Exception as e:
             return {
@@ -2799,6 +2948,9 @@ class MaxRuntimeManager:
                 ),
                 "collisions_count": normalized_source.get("collisions_count", 0),
                 "varname_remap": normalized_source.get("varname_remap", {}),
+                "generated_varnames": normalized_source.get("generated_varnames", 0),
+                "line_ref_map_size": normalized_source.get("line_ref_map_size", 0),
+                "line_ref_id_mappings": normalized_source.get("line_ref_id_mappings", 0),
             },
         }
 
@@ -4765,9 +4917,33 @@ async def dry_run_plan(
                     }
                 )
             else:
+                normalized_obj_type, normalized_args, compat_rewrite, compat_error = _normalize_add_object_spec(
+                    obj_type=params.get("obj_type"),
+                    args=params.get("args"),
+                )
+                if compat_error:
+                    errors.append({"step": step_idx, **compat_error["error"]})
+                    normalized_steps.append({"step": step_idx, "action": action, "params": params})
+                    continue
+                if compat_rewrite:
+                    warnings.append(
+                        {
+                            "step": step_idx,
+                            "code": ERROR_VALIDATION,
+                            "message": (
+                                f"Compatibility shim rewrote obj_type='newobj' to "
+                                f"'{normalized_obj_type}' for dry-run validation."
+                            ),
+                            "details": compat_rewrite,
+                        }
+                    )
+                params = dict(params)
+                params["obj_type"] = normalized_obj_type
+                params["args"] = normalized_args
+
                 validation_error = _validate_add_max_object_payload(
-                    obj_type=params["obj_type"],
-                    args=params["args"],
+                    obj_type=normalized_obj_type,
+                    args=normalized_args,
                     int_mode=bool(params.get("int_mode", False)),
                     extend=bool(params.get("extend", False)),
                     use_live_dial=bool(params.get("use_live_dial", False)),
@@ -4777,7 +4953,7 @@ async def dry_run_plan(
                     errors.append({"step": step_idx, **validation_error["error"]})
 
                 if engine_mode == "maxpy":
-                    obj_type = str(params["obj_type"])
+                    obj_type = str(normalized_obj_type)
                     canonical_name, via_alias = maxpy_catalog.resolve_name(obj_type)
                     varname = str(params["varname"])
                     if varname in virtual_objects:
@@ -4806,13 +4982,13 @@ async def dry_run_plan(
                     if schema:
                         args_info = schema.get("schema", {}).get("args", {})
                         required_args = args_info.get("required", []) if isinstance(args_info, dict) else []
-                        if isinstance(required_args, list) and len(params["args"]) < len(required_args):
+                        if isinstance(required_args, list) and len(normalized_args) < len(required_args):
                             errors.append(
                                 {
                                     "step": step_idx,
                                     "code": ERROR_VALIDATION,
                                     "message": (
-                                        f"Too few arguments for '{canonical_name}': got {len(params['args'])}, "
+                                        f"Too few arguments for '{canonical_name}': got {len(normalized_args)}, "
                                         f"requires at least {len(required_args)}."
                                     ),
                                 }
@@ -5006,9 +5182,22 @@ def _build_transaction_bridge_request(step_idx: int, action: str, params: dict) 
                 f"Step {step_idx}: protected varname '{params['varname']}' cannot be mutated.",
                 recoverable=False,
             )
+        normalized_obj_type, normalized_args, _compat_rewrite, compat_error = _normalize_add_object_spec(
+            obj_type=params.get("obj_type"),
+            args=params.get("args"),
+        )
+        if compat_error:
+            err = compat_error.get("error", {})
+            raise MaxMCPError(
+                err.get("code", ERROR_VALIDATION),
+                f"Step {step_idx}: {err.get('message', 'Validation failed')}",
+                hint=err.get("hint"),
+                recoverable=bool(err.get("recoverable", False)),
+                details=err.get("details") if isinstance(err.get("details"), dict) else {},
+            )
         validation_error = _validate_add_max_object_payload(
-            obj_type=str(params["obj_type"]),
-            args=list(params["args"]),
+            obj_type=normalized_obj_type,
+            args=normalized_args,
             int_mode=bool(params.get("int_mode", False)),
             extend=bool(params.get("extend", False)),
             use_live_dial=bool(params.get("use_live_dial", False)),
@@ -5027,8 +5216,8 @@ def _build_transaction_bridge_request(step_idx: int, action: str, params: dict) 
             {
                 "action": "add_object",
                 "position": params["position"],
-                "obj_type": params["obj_type"],
-                "args": _convert_string_args(list(params["args"])),
+                "obj_type": normalized_obj_type,
+                "args": _convert_string_args(normalized_args),
                 "varname": params["varname"],
             },
             8.0,
@@ -5537,6 +5726,133 @@ def _convert_string_args(args: list) -> list:
     return result
 
 
+def _normalize_add_object_spec(obj_type: Any, args: Any) -> tuple[str, list, dict | None, dict | None]:
+    normalized_obj_type = obj_type.strip() if isinstance(obj_type, str) else str(obj_type or "").strip()
+    normalized_args = list(args) if isinstance(args, list) else []
+
+    if normalized_obj_type.lower() != "newobj":
+        return normalized_obj_type, normalized_args, None, None
+
+    if not normalized_args:
+        return (
+            normalized_obj_type,
+            normalized_args,
+            None,
+            _error_result(
+                ERROR_VALIDATION,
+                "COMPATIBILITY SHIM FAILED: obj_type='newobj' requires at least one arg containing the actual object type.",
+                hint="Use obj_type='<max-object>' directly or pass args like ['prepend', 'set'].",
+                recoverable=True,
+            ),
+        )
+
+    resolved = normalized_args[0]
+    if not isinstance(resolved, str) or not resolved.strip():
+        return (
+            normalized_obj_type,
+            normalized_args,
+            None,
+            _error_result(
+                ERROR_VALIDATION,
+                "COMPATIBILITY SHIM FAILED: obj_type='newobj' first arg must be a non-empty object name string.",
+                hint="Example: obj_type='newobj', args=['dict', 'my_dict']",
+                recoverable=True,
+            ),
+        )
+
+    final_obj_type = resolved.strip()
+    final_args = normalized_args[1:]
+    rewrite = {
+        "applied": True,
+        "from_obj_type": "newobj",
+        "resolved_obj_type": final_obj_type,
+        "dropped_args": 1,
+    }
+    return final_obj_type, final_args, rewrite, None
+
+
+def _normalize_avoid_rect_payload(payload: Any) -> tuple[list[float], bool]:
+    candidate = payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("avoid_rect"), (list, tuple)):
+            candidate = payload.get("avoid_rect")
+        elif all(key in payload for key in ("left", "top", "right", "bottom")):
+            candidate = [
+                payload.get("left"),
+                payload.get("top"),
+                payload.get("right"),
+                payload.get("bottom"),
+            ]
+        elif isinstance(payload.get("results"), (list, tuple)):
+            candidate = payload.get("results")
+
+    if not isinstance(candidate, (list, tuple)) or len(candidate) != 4:
+        return [0.0, 0.0, 0.0, 0.0], False
+
+    normalized: list[float] = []
+    for value in candidate:
+        try:
+            parsed = float(value)
+        except Exception:
+            return [0.0, 0.0, 0.0, 0.0], False
+        if not math.isfinite(parsed):
+            return [0.0, 0.0, 0.0, 0.0], False
+        normalized.append(parsed)
+    return normalized, True
+
+
+async def _ensure_preflight_for_add(maxmsp: Any) -> dict:
+    mode = MAXMCP_PREFLIGHT_MODE
+    if mode == "manual":
+        return {
+            "mode": mode,
+            "performed": False,
+            "cache_hit": False,
+            "reason": "manual_mode",
+        }
+
+    now = time.monotonic()
+    last_preflight = float(getattr(maxmsp, "_preflight_last_at", 0.0) or 0.0)
+    current_epoch = int(getattr(maxmsp, "_preflight_epoch", 0) or 0)
+    last_epoch = int(getattr(maxmsp, "_preflight_epoch_at_last_run", -1) or -1)
+    if mode == "session" and last_preflight > 0.0:
+        age = now - last_preflight
+        if age <= max(0.0, MAXMCP_PREFLIGHT_CACHE_SECONDS) and last_epoch == current_epoch:
+            try:
+                maxmsp.preflight_cache_hits = int(getattr(maxmsp, "preflight_cache_hits", 0)) + 1
+            except Exception:
+                pass
+            return {
+                "mode": mode,
+                "performed": False,
+                "cache_hit": True,
+                "reason": "cache_hit",
+                "age_seconds": round(age, 3),
+            }
+
+    raw_rect = await maxmsp.send_request({"action": "get_avoid_rect_position"}, timeout=2.0)
+    avoid_rect, valid = _normalize_avoid_rect_payload(raw_rect)
+    if not valid:
+        try:
+            maxmsp.preflight_invalid_rects = int(getattr(maxmsp, "preflight_invalid_rects", 0)) + 1
+        except Exception:
+            pass
+    try:
+        maxmsp.preflight_auto_calls = int(getattr(maxmsp, "preflight_auto_calls", 0)) + 1
+        maxmsp._preflight_last_at = now
+        maxmsp._preflight_epoch_at_last_run = current_epoch
+    except Exception:
+        pass
+    return {
+        "mode": mode,
+        "performed": True,
+        "cache_hit": False,
+        "reason": "auto",
+        "avoid_rect": avoid_rect,
+        "valid": valid,
+    }
+
+
 def _validate_add_max_object_payload(
     *,
     obj_type: str,
@@ -5546,6 +5862,17 @@ def _validate_add_max_object_payload(
     use_live_dial: bool,
     trigger_rtl: bool,
 ) -> dict | None:
+    if not isinstance(obj_type, str) or not obj_type.strip():
+        return _error_result(
+            ERROR_VALIDATION,
+            "Object type must be a non-empty string.",
+        )
+    if not isinstance(args, list):
+        return _error_result(
+            ERROR_VALIDATION,
+            "Object args must be a list.",
+        )
+
     # Reject objects with known alternatives
     if obj_type in REJECTED_OBJECTS:
         correct = REJECTED_OBJECTS[obj_type]
@@ -5715,9 +6042,16 @@ async def add_max_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    validation_error = _validate_add_max_object_payload(
+    normalized_obj_type, normalized_args, compat_rewrite, compat_error = _normalize_add_object_spec(
         obj_type=obj_type,
         args=args,
+    )
+    if compat_error:
+        return compat_error
+
+    validation_error = _validate_add_max_object_payload(
+        obj_type=normalized_obj_type,
+        args=normalized_args,
         int_mode=int_mode,
         extend=extend,
         use_live_dial=use_live_dial,
@@ -5733,13 +6067,33 @@ async def add_max_object(
             "Position must be a list of two integers.",
         )
 
+    preflight_meta = None
+    try:
+        preflight_meta = await _ensure_preflight_for_add(maxmsp)
+    except MaxMCPError as e:
+        return _error_result(
+            e.code,
+            e.message,
+            hint=e.hint,
+            recoverable=e.recoverable,
+            details=e.details,
+        )
+    except Exception as e:
+        return _error_result(
+            ERROR_INTERNAL,
+            "Automatic placement preflight failed before add_object.",
+            hint="Retry the request or set MAXMCP_PREFLIGHT_MODE=manual to disable auto preflight.",
+            recoverable=True,
+            details={"error": str(e)},
+        )
+
     # Convert string args to proper types (preserves float intent from "25." strings)
-    converted_args = _convert_string_args(args)
+    converted_args = _convert_string_args(normalized_args)
 
     payload = {
         "action": "add_object",
         "position": position,
-        "obj_type": obj_type,
+        "obj_type": normalized_obj_type,
         "args": converted_args,
         "varname": varname,
     }
@@ -5748,6 +6102,22 @@ async def add_max_object(
         timeout=5.0,
         idempotency_key=idempotency_key or None,
     )
+    if compat_rewrite:
+        try:
+            maxmsp.newobj_compat_rewrites = int(getattr(maxmsp, "newobj_compat_rewrites", 0)) + 1
+        except Exception:
+            pass
+    if isinstance(response, dict):
+        meta = response.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        if compat_rewrite:
+            meta["newobj_compat"] = compat_rewrite
+        if isinstance(preflight_meta, dict):
+            meta["preflight"] = preflight_meta
+        if meta:
+            response = dict(response)
+            response["meta"] = meta
     return response
 
 
@@ -6164,8 +6534,14 @@ async def get_avoid_rect_position(ctx: Context):
     maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
     payload = {"action": "get_avoid_rect_position"}
     response = await maxmsp.send_request(payload)
-
-    return response
+    avoid_rect, valid = _normalize_avoid_rect_payload(response)
+    try:
+        maxmsp._preflight_last_at = time.monotonic()
+        if not valid:
+            maxmsp.preflight_invalid_rects = int(getattr(maxmsp, "preflight_invalid_rects", 0)) + 1
+    except Exception:
+        pass
+    return avoid_rect
 
 
 @mcp.tool()

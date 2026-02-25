@@ -1522,11 +1522,13 @@ function get_window_rect() {
 
 function get_avoid_rect_position(request_id) {
     var l, t, r, b;
+    var has_rect = false;
     current_patcher.apply(function (obj) {
         // Skip objects without valid rects (like patchlines)
         if (!obj.rect || obj.rect[2] <= obj.rect[0]) {
             return;
         }
+        has_rect = true;
         if (obj.rect[0] < l || l == undefined) {
             l = obj.rect[0];
         }
@@ -1540,7 +1542,7 @@ function get_avoid_rect_position(request_id) {
             b = obj.rect[3];
         }
     });
-    var avoid_rect = [l, t, r, b];
+    var avoid_rect = has_rect ? [l, t, r, b] : [0, 0, 0, 0];
 
     // Mark preflight check as done
     avoid_rect_called = true;
