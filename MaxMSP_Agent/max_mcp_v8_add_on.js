@@ -21,6 +21,83 @@ function split_long_string(inString, maxLength) {
     return result;
 }
 
+function emit_response_envelope(request_id, state, results, error, meta) {
+    var envelope = {
+        protocol_version: "2.0",
+        request_id: request_id || null,
+        state: state,
+        timestamp_ms: Date.now()
+    };
+    if (state === "failed") {
+        envelope.error = error || {
+            code: "INTERNAL_ERROR",
+            message: "Unknown bridge error",
+            recoverable: false,
+            details: {}
+        };
+    } else {
+        envelope.results = results;
+    }
+    if (meta) {
+        envelope.meta = meta;
+    }
+    outlet(1, "response", split_long_string(JSON.stringify(envelope, null, 0), 2500));
+}
+
+function respond_success(request_id, results, meta) {
+    if (!request_id) return;
+    emit_response_envelope(request_id, "succeeded", results, null, meta);
+}
+
+function respond_error(request_id, code, message, hint, recoverable, details) {
+    if (!request_id) {
+        post("v8 bridge error: " + (message || "Unknown bridge error") + "\n");
+        return;
+    }
+    var err = {
+        code: code || "INTERNAL_ERROR",
+        message: message || "Unknown bridge error",
+        recoverable: (recoverable === undefined) ? true : !!recoverable,
+        details: details || {}
+    };
+    if (hint) {
+        err.hint = hint;
+    }
+    emit_response_envelope(request_id, "failed", null, err, null);
+}
+
+function passthrough_or_normalize_response(raw) {
+    if (raw === undefined || raw === null) {
+        return;
+    }
+    if (typeof raw === "string") {
+        var parsed = safe_parse_json(raw);
+        if (parsed && typeof parsed === "object") {
+            if (parsed.protocol_version && parsed.state) {
+                outlet(1, "response", raw);
+                return;
+            }
+            if (parsed.request_id) {
+                respond_success(
+                    parsed.request_id,
+                    (parsed.results !== undefined) ? parsed.results : parsed
+                );
+                return;
+            }
+        }
+        post("Ignored non-envelope V8 passthrough payload (missing request_id)\n");
+        return;
+    }
+    if (typeof raw === "object" && raw.request_id) {
+        respond_success(
+            raw.request_id,
+            (raw.results !== undefined) ? raw.results : raw
+        );
+        return;
+    }
+    post("Ignored non-envelope V8 passthrough object (missing request_id)\n");
+}
+
 
 function anything() {
     var a = arrayfromargs(messagename, arguments);
@@ -55,7 +132,7 @@ function anything() {
             break;
         default:
             // outlet(1, messagename, ...arguments);
-            outlet(1, "response", arguments[1]);
+            passthrough_or_normalize_response(arguments[1]);
     }
 }
 
@@ -71,8 +148,7 @@ function add_boxtext(request_id, data){
         }
     });
 
-    var results = {"request_id": request_id, "results": patcher_dict}
-    outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
+    respond_success(request_id, patcher_dict);
 }
 
 // Character width lookup for Arial 12pt (slightly wider to prevent wrapping)
@@ -172,20 +248,15 @@ function complete_signal_safety(data_str) {
         }
 
         var response_str = all_warnings.length > 0 ? "ok - " + all_warnings.join(" | ") : "ok";
-        var result = { "request_id": request_id, "results": response_str };
-        outlet(1, "response", JSON.stringify(result));
+        respond_success(request_id, response_str);
     } else {
         // Manual check_signal_safety call - send full response
-        var result = {
-            "request_id": request_id,
-            "results": {
-                "safe": warnings.length === 0,
-                "warnings": warnings,
-                "signal_objects_count": data.signal_objects_count,
-                "signal_connections_count": data.signal_connections_count
-            }
-        };
-        outlet(1, "response", JSON.stringify(result));
+        respond_success(request_id, {
+            "safe": warnings.length === 0,
+            "warnings": warnings,
+            "signal_objects_count": data.signal_objects_count,
+            "signal_connections_count": data.signal_connections_count
+        });
     }
 }
 
@@ -249,11 +320,14 @@ function complete_encapsulate(data_str) {
     // Get subpatcher
     var sub_obj = p.getnamed(subpatcher_varname);
     if (!sub_obj) {
-        var result = {"request_id": request_id, "results": {
-            "success": false,
-            "error": "Subpatcher not found: " + subpatcher_varname
-        }};
-        outlet(1, "response", JSON.stringify(result));
+        respond_error(
+            request_id,
+            "OBJECT_NOT_FOUND",
+            "Subpatcher not found: " + subpatcher_varname,
+            null,
+            true,
+            { subpatcher_varname: subpatcher_varname }
+        );
         return;
     }
     var subpatch = sub_obj.subpatcher();
@@ -426,15 +500,14 @@ function complete_encapsulate(data_str) {
     }
 
     // Return success
-    var result = {"request_id": request_id, "results": {
+    respond_success(request_id, {
         "success": true,
         "subpatcher_varname": subpatcher_varname,
         "objects_encapsulated": objects_info.length,
         "inlets_created": inlet_list.length,
         "outlets_created": outlet_list.length,
         "internal_connections": internal_connections.length
-    }};
-    outlet(1, "response", JSON.stringify(result));
+    });
     post("Encapsulated " + objects_info.length + " objects into " + subpatcher_varname + "\n");
 }
 
@@ -496,5 +569,3 @@ function autofit_v8(var_name) {
         post("autofit_v8 " + var_name + ": " + current_width + "px -> " + calculated_width + "px (" + text + ")\n");
     }
 }
-
-

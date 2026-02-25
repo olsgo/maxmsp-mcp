@@ -7,6 +7,9 @@ outlets = 3; // For status, responses, etc.
 var root_patcher = this.patcher;
 var current_patcher = this.patcher;
 var patcher_stack = [];  // Stack of {patcher, name} for navigation history
+var base_context_depth = 0; // hidden baseline depth when a managed workspace is active
+var active_workspace_target = "host";
+var active_workspace_varname = "";
 
 // Legacy alias - some functions still use 'p'
 var p = this.patcher;
@@ -27,6 +30,19 @@ var LARGE_PATCH_THRESHOLD = 80;
 // Signal safety auto-check (triggers every N MSP objects created)
 var msp_objects_counter = 0;
 var MSP_SAFETY_CHECK_INTERVAL = 10;
+
+function effective_depth() {
+    var depth = patcher_stack.length - base_context_depth;
+    return depth < 0 ? 0 : depth;
+}
+
+function effective_path() {
+    var path = [];
+    for (var i = base_context_depth; i < patcher_stack.length; i++) {
+        path.push(patcher_stack[i].name);
+    }
+    return path;
+}
 
 function safe_parse_json(str) {
     try {
@@ -70,39 +86,93 @@ function check_large_patch_warning() {
     return null;
 }
 
+function emit_response_envelope(request_id, state, results, error, meta) {
+    var envelope = {
+        protocol_version: "2.0",
+        request_id: request_id || null,
+        state: state,
+        timestamp_ms: Date.now()
+    };
+    if (state === "failed") {
+        envelope.error = error || {
+            code: "INTERNAL_ERROR",
+            message: "Unknown failure in Max bridge",
+            recoverable: false,
+            details: {}
+        };
+    } else {
+        envelope.results = results;
+    }
+    if (meta) {
+        envelope.meta = meta;
+    }
+    outlet(1, "response", JSON.stringify(envelope));
+}
+
+function respond_success(request_id, results, meta) {
+    if (!request_id) return;
+    emit_response_envelope(request_id, "succeeded", results, null, meta);
+}
+
+function respond_error(request_id, code, message, hint, recoverable, details) {
+    if (!request_id) {
+        outlet(0, "error", message);
+        return;
+    }
+    var err = {
+        code: code || "INTERNAL_ERROR",
+        message: message || "Unknown bridge error",
+        recoverable: (recoverable === undefined) ? true : !!recoverable,
+        details: details || {}
+    };
+    if (hint) {
+        err.hint = hint;
+    }
+    emit_response_envelope(request_id, "failed", null, err, null);
+}
+
 // Called when a message arrives at inlet 0 (from [udpreceive] or similar)
 function anything() {
     var msg = arrayfromargs(messagename, arguments).join(" ");
     var data = safe_parse_json(msg);
     if (!data) return;
 
+    // Support protocol envelopes while preserving legacy flat payload behavior.
+    if (data.payload && typeof data.payload === "object") {
+        for (var key in data.payload) {
+            if (!(key in data)) {
+                data[key] = data.payload[key];
+            }
+        }
+    }
+
     switch (data.action) {
         case "fetch_test":
             if (data.request_id) {
                 get_objects_in_patch(data.request_id);
             } else {
-                outlet(0, "error", "Missing request_id for fetch_test");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for fetch_test");
             }
             break;
         case "get_objects_in_patch":
             if (data.request_id) {
                 get_objects_in_patch(data.request_id);
             } else {
-                outlet(0, "error", "Missing request_id for get_objects_in_patch");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_patch");
             }
             break;
         case "get_objects_in_selected":
             if (data.request_id) {
                 get_objects_in_selected(data.request_id);
             } else {
-                outlet(0, "error", "Missing request_id for get_objects_in_selected");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_selected");
             }
             break;
         case "get_object_attributes":
             if (data.request_id && data.varname) {
                 get_object_attributes(data.request_id, data.varname);
             } else {
-                outlet(0, "error", "Missing request_id or varname for get_object_attributes");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_attributes");
             }
             break;
         case "get_avoid_rect_position":
@@ -114,132 +184,272 @@ function anything() {
             if (data.obj_type && data.position && data.varname && data.request_id) {
                 add_object(data.position[0], data.position[1], data.obj_type, data.args, data.varname, data.request_id);
             } else {
-                outlet(0, "error", "Missing obj_type, position, varname, or request_id for add_object");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing obj_type, position, varname, or request_id for add_object");
             }
             break;
         case "remove_object":
-            if (data.varname) {
-                remove_object(data.varname);
+            if (data.varname && data.request_id) {
+                var rm = remove_object(data.varname);
+                if (rm.success) {
+                    respond_success(data.request_id, rm);
+                } else {
+                    respond_error(data.request_id, rm.error.code, rm.error.message, rm.error.hint, rm.error.recoverable, rm.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing varname for remove_object");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for remove_object");
             }
             break;
         case "connect_objects":
-            if (data.src_varname && data.dst_varname) {
-                connect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+            if (data.src_varname && data.dst_varname && data.request_id) {
+                var con = connect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+                if (con.success) {
+                    respond_success(data.request_id, con);
+                } else {
+                    respond_error(data.request_id, con.error.code, con.error.message, con.error.hint, con.error.recoverable, con.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing src_varname or dst_varname for connect_objects");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for connect_objects");
             }
             break;
         case "disconnect_objects":
-            if (data.src_varname && data.dst_varname) {
-                disconnect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+            if (data.src_varname && data.dst_varname && data.request_id) {
+                var dis = disconnect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+                if (dis.success) {
+                    respond_success(data.request_id, dis);
+                } else {
+                    respond_error(data.request_id, dis.error.code, dis.error.message, dis.error.hint, dis.error.recoverable, dis.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing src_varname or dst_varname for disconnect_objects");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for disconnect_objects");
             }
             break;
         case "set_object_attribute":
-            if (data.varname && data.attr_name && data.attr_value) {
-                set_object_attribute(data.varname, data.attr_name, data.attr_value);
+            if (data.varname && data.attr_name && data.attr_value && data.request_id) {
+                var attr = set_object_attribute(data.varname, data.attr_name, data.attr_value);
+                if (attr.success) {
+                    respond_success(data.request_id, attr);
+                } else {
+                    respond_error(data.request_id, attr.error.code, attr.error.message, attr.error.hint, attr.error.recoverable, attr.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing varname or attr_name for attr_value");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, attr_name, attr_value, or request_id");
             }
             break;
         case "set_message_text":
-            if (data.varname && data.new_text) {
-                set_message_text(data.varname, data.new_text);
+            if (data.varname && data.new_text && data.request_id) {
+                var msg = set_message_text(data.varname, data.new_text);
+                if (msg.success) {
+                    respond_success(data.request_id, msg);
+                } else {
+                    respond_error(data.request_id, msg.error.code, msg.error.message, msg.error.hint, msg.error.recoverable, msg.error.details);
+                }
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, new_text, or request_id for set_message_text");
             }
             break;
         case "send_message_to_object":
-            if (data.varname && data.message) {
-                send_message_to_object(data.varname, data.message);
+            if (data.varname && data.message && data.request_id) {
+                var sendmsg = send_message_to_object(data.varname, data.message);
+                if (sendmsg.success) {
+                    respond_success(data.request_id, sendmsg);
+                } else {
+                    respond_error(data.request_id, sendmsg.error.code, sendmsg.error.message, sendmsg.error.hint, sendmsg.error.recoverable, sendmsg.error.details);
+                }
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, message, or request_id for send_message_to_object");
             }
             break;
         case "send_bang_to_object":
-            if (data.varname) {
-                send_bang_to_object(data.varname);
+            if (data.varname && data.request_id) {
+                var bang = send_bang_to_object(data.varname);
+                if (bang.success) {
+                    respond_success(data.request_id, bang);
+                } else {
+                    respond_error(data.request_id, bang.error.code, bang.error.message, bang.error.hint, bang.error.recoverable, bang.error.details);
+                }
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for send_bang_to_object");
             }
             break;
         case "set_number":
-            if (data.varname && data.num) {
-                set_number(data.varname, data.num);
+            if (data.varname && data.num !== undefined && data.request_id) {
+                var num = set_number(data.varname, data.num);
+                if (num.success) {
+                    respond_success(data.request_id, num);
+                } else {
+                    respond_error(data.request_id, num.error.code, num.error.message, num.error.hint, num.error.recoverable, num.error.details);
+                }
+            }
+            else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, num, or request_id for set_number");
             }
             break;
         case "create_subpatcher":
-            if (data.position && data.varname) {
-                create_subpatcher(data.position[0], data.position[1], data.name || "subpatch", data.varname);
+            if (data.position && data.varname && data.request_id) {
+                var created = create_subpatcher(data.position[0], data.position[1], data.name || "subpatch", data.varname);
+                if (created.success) {
+                    respond_success(data.request_id, created);
+                } else {
+                    respond_error(data.request_id, created.error.code, created.error.message, created.error.hint, created.error.recoverable, created.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing position or varname for create_subpatcher");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing position, varname, or request_id for create_subpatcher");
             }
             break;
         case "enter_subpatcher":
-            if (data.varname) {
-                enter_subpatcher(data.varname);
+            if (data.varname && data.request_id) {
+                var entered = enter_subpatcher(data.varname);
+                if (entered.success) {
+                    respond_success(data.request_id, entered);
+                } else {
+                    respond_error(data.request_id, entered.error.code, entered.error.message, entered.error.hint, entered.error.recoverable, entered.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing varname for enter_subpatcher");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for enter_subpatcher");
             }
             break;
         case "exit_subpatcher":
-            exit_subpatcher();
+            if (data.request_id) {
+                var exited = exit_subpatcher();
+                respond_success(data.request_id, exited);
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for exit_subpatcher");
+            }
             break;
         case "get_patcher_context":
             if (data.request_id) {
                 get_patcher_context(data.request_id);
             } else {
-                outlet(0, "error", "Missing request_id for get_patcher_context");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_patcher_context");
             }
             break;
         case "add_subpatcher_io":
-            if (data.io_type && data.position && data.varname) {
-                add_subpatcher_io(data.position[0], data.position[1], data.io_type, data.varname, data.comment || "");
+            if (data.io_type && data.position && data.varname && data.request_id) {
+                var io = add_subpatcher_io(data.position[0], data.position[1], data.io_type, data.varname, data.comment || "");
+                if (io.success) {
+                    respond_success(data.request_id, io);
+                } else {
+                    respond_error(data.request_id, io.error.code, io.error.message, io.error.hint, io.error.recoverable, io.error.details);
+                }
             } else {
-                outlet(0, "error", "Missing io_type, position, or varname for add_subpatcher_io");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing io_type, position, varname, or request_id for add_subpatcher_io");
             }
             break;
         case "get_object_connections":
             if (data.request_id && data.varname) {
                 get_object_connections(data.request_id, data.varname);
             } else {
-                outlet(0, "error", "Missing request_id or varname for get_object_connections");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_connections");
             }
             break;
         case "recreate_with_args":
             if (data.request_id && data.varname && data.new_args !== undefined) {
                 recreate_with_args(data.request_id, data.varname, data.new_args);
             } else {
-                outlet(0, "error", "Missing request_id, varname, or new_args for recreate_with_args");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, or new_args for recreate_with_args");
             }
             break;
         case "move_object":
             if (data.request_id && data.varname && data.x !== undefined && data.y !== undefined) {
                 move_object(data.request_id, data.varname, data.x, data.y);
             } else {
-                outlet(0, "error", "Missing request_id, varname, x, or y for move_object");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, x, or y for move_object");
             }
             break;
         case "autofit_existing":
-            if (data.varname) {
-                autofit_existing(data.varname);
+            if (data.varname && data.request_id) {
+                var fit = autofit_existing(data.varname);
+                respond_success(data.request_id, fit);
             } else {
-                outlet(0, "error", "Missing varname for autofit_existing");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for autofit_existing");
             }
             break;
         case "encapsulate":
             if (data.request_id && data.varnames && data.subpatcher_name && data.subpatcher_varname) {
                 encapsulate(data.request_id, data.varnames, data.subpatcher_name, data.subpatcher_varname);
             } else {
-                outlet(0, "error", "Missing request_id, varnames, subpatcher_name, or subpatcher_varname for encapsulate");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varnames, subpatcher_name, or subpatcher_varname for encapsulate");
             }
             break;
         case "check_signal_safety":
             if (data.request_id) {
                 check_signal_safety(data.request_id);
             } else {
-                outlet(0, "error", "Missing request_id for check_signal_safety");
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for check_signal_safety");
+            }
+            break;
+        case "bridge_ping":
+            if (data.request_id) {
+                bridge_ping(data.request_id);
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for bridge_ping");
+            }
+            break;
+        case "health_ping":
+            if (data.request_id) {
+                bridge_ping(data.request_id);
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for health_ping");
+            }
+            break;
+        case "capabilities":
+            if (data.request_id) {
+                send_capabilities(data.request_id);
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for capabilities");
+            }
+            break;
+        case "set_workspace_target":
+            if (data.request_id && data.target_id) {
+                var ws = set_workspace_target(
+                    data.target_id,
+                    data.workspace_varname || "",
+                    data.workspace_name || ""
+                );
+                if (ws.success) {
+                    respond_success(data.request_id, ws);
+                } else {
+                    respond_error(
+                        data.request_id,
+                        ws.error.code,
+                        ws.error.message,
+                        ws.error.hint,
+                        ws.error.recoverable,
+                        ws.error.details
+                    );
+                }
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or target_id for set_workspace_target");
+            }
+            break;
+        case "workspace_status":
+            if (data.request_id) {
+                respond_success(data.request_id, get_workspace_status());
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for workspace_status");
+            }
+            break;
+        case "apply_topology_snapshot":
+            if (data.request_id && data.snapshot) {
+                var applied = apply_topology_snapshot(data.snapshot);
+                if (applied.success) {
+                    respond_success(data.request_id, applied);
+                } else {
+                    respond_error(
+                        data.request_id,
+                        applied.error.code,
+                        applied.error.message,
+                        applied.error.hint,
+                        applied.error.recoverable,
+                        applied.error.details
+                    );
+                }
+            } else {
+                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or snapshot for apply_topology_snapshot");
             }
             break;
         default:
-            outlet(0, "error", "Unknown action: " + data.action);
+            respond_error(data.request_id, "UNKNOWN_ACTION", "Unknown action: " + data.action);
     }
 }
 
@@ -247,6 +457,377 @@ function anything() {
 // 	var str = get_patcher_objects(request_id)
 // 	//outlet(1, request_id)
 // }
+
+function bridge_ping(request_id) {
+    var context = {
+        depth: effective_depth(),
+        path: effective_path(),
+        is_root: effective_depth() === 0
+    };
+    respond_success(request_id, {
+        ok: true,
+        timestamp_ms: Date.now(),
+        context: context
+    });
+}
+
+function _ensure_workspace_patcher(workspace_varname, workspace_name) {
+    var obj = root_patcher.getnamed(workspace_varname);
+    if (obj) {
+        var existing_subpatch = obj.subpatcher();
+        if (!existing_subpatch) {
+            return {
+                success: false,
+                error: {
+                    code: "PRECONDITION_FAILED",
+                    message: "Workspace varname exists but is not a subpatcher: " + workspace_varname,
+                    recoverable: false,
+                    details: { workspace_varname: workspace_varname }
+                }
+            };
+        }
+        return { success: true, patcher: existing_subpatch, created: false };
+    }
+
+    var name = workspace_name || workspace_varname || "mcp_workspace";
+    var new_obj = root_patcher.newdefault(80, 80, "patcher", name);
+    new_obj.varname = workspace_varname;
+    var subpatch = new_obj.subpatcher();
+    if (!subpatch) {
+        return {
+            success: false,
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to create workspace subpatcher for: " + workspace_varname,
+                recoverable: false,
+                details: { workspace_varname: workspace_varname }
+            }
+        };
+    }
+    return { success: true, patcher: subpatch, created: true };
+}
+
+function set_workspace_target(target_id, workspace_varname, workspace_name) {
+    if (target_id === "host") {
+        current_patcher = root_patcher;
+        patcher_stack = [];
+        base_context_depth = 0;
+        active_workspace_target = "host";
+        active_workspace_varname = "";
+        avoid_rect_called = false;
+        return get_workspace_status();
+    }
+
+    if (target_id !== "active" && target_id !== "scratch") {
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Unsupported target_id: " + target_id,
+                recoverable: true,
+                details: { target_id: target_id }
+            }
+        };
+    }
+
+    if (!workspace_varname) {
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "workspace_varname is required for target: " + target_id,
+                recoverable: true,
+                details: { target_id: target_id }
+            }
+        };
+    }
+
+    var ensured = _ensure_workspace_patcher(workspace_varname, workspace_name);
+    if (!ensured.success) {
+        return ensured;
+    }
+
+    patcher_stack = [{ patcher: root_patcher, name: workspace_varname }];
+    current_patcher = ensured.patcher;
+    base_context_depth = 1;
+    active_workspace_target = target_id;
+    active_workspace_varname = workspace_varname;
+    avoid_rect_called = false;
+
+    var status = get_workspace_status();
+    status.created_workspace = !!ensured.created;
+    return status;
+}
+
+function get_workspace_status() {
+    return {
+        success: true,
+        target_id: active_workspace_target,
+        workspace_varname: active_workspace_varname,
+        depth: effective_depth(),
+        path: effective_path(),
+        is_root: effective_depth() === 0,
+        base_context_depth: base_context_depth
+    };
+}
+
+function sanitize_snapshot_value(value, depth) {
+    if (depth > 4) {
+        return null;
+    }
+    if (value === null || value === undefined) {
+        return null;
+    }
+    var t = typeof value;
+    if (t === "number" || t === "string" || t === "boolean") {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        var arr = [];
+        for (var i = 0; i < value.length; i++) {
+            arr.push(sanitize_snapshot_value(value[i], depth + 1));
+        }
+        return arr;
+    }
+    if (t === "object") {
+        var out = {};
+        var keys = [];
+        try {
+            keys = Object.keys(value);
+        } catch (e) {
+            keys = [];
+        }
+        for (var k = 0; k < keys.length; k++) {
+            var key = keys[k];
+            try {
+                out[key] = sanitize_snapshot_value(value[key], depth + 1);
+            } catch (e) {
+                // Skip non-readable members.
+            }
+        }
+        if (Object.keys(out).length > 0) {
+            return out;
+        }
+        try {
+            return String(value);
+        } catch (e) {
+            return null;
+        }
+    }
+    try {
+        return String(value);
+    } catch (e) {
+        return null;
+    }
+}
+
+function collect_serializable_attributes(obj) {
+    var attributes = {};
+    var attrnames = [];
+    try {
+        attrnames = obj.getattrnames();
+    } catch (e) {
+        attrnames = [];
+    }
+
+    if (!attrnames || !attrnames.length) {
+        return attributes;
+    }
+    for (var i = 0; i < attrnames.length; i++) {
+        var name = attrnames[i];
+        try {
+            attributes[name] = sanitize_snapshot_value(obj.getattr(name), 0);
+        } catch (e) {
+            // Skip attributes that cannot be serialized in this runtime context.
+        }
+    }
+    return attributes;
+}
+
+function apply_snapshot_attributes(obj, attributes) {
+    if (!attributes || typeof attributes !== "object") {
+        return { applied: 0, skipped: 0 };
+    }
+    var blocked = {
+        "varname": true,
+        "maxclass": true,
+        "boxtext": true,
+        "text": true,
+        "patching_rect": true,
+        "rect": true,
+        "numinlets": true,
+        "numoutlets": true
+    };
+    var applied = 0;
+    var skipped = 0;
+    var names = Object.keys(attributes);
+    for (var i = 0; i < names.length; i++) {
+        var name = names[i];
+        if (blocked[name]) {
+            skipped++;
+            continue;
+        }
+        try {
+            obj.setattr(name, attributes[name]);
+            applied++;
+        } catch (e) {
+            skipped++;
+        }
+    }
+    return { applied: applied, skipped: skipped };
+}
+
+function apply_topology_snapshot(snapshot) {
+    if (!snapshot || !snapshot.boxes || !snapshot.lines) {
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Snapshot must include boxes and lines arrays.",
+                recoverable: true,
+                details: {}
+            }
+        };
+    }
+
+    var existing = [];
+    current_patcher.apply(function(obj) {
+        if (obj.maxclass && obj.maxclass !== "patchline") {
+            existing.push(obj);
+        }
+    });
+    for (var i = 0; i < existing.length; i++) {
+        current_patcher.remove(existing[i]);
+    }
+
+    var created = {};
+    var created_count = 0;
+    var skipped_boxes = 0;
+    var restored_rects = 0;
+    var attributes_applied = 0;
+    var attributes_skipped = 0;
+
+    for (var b = 0; b < snapshot.boxes.length; b++) {
+        var row = snapshot.boxes[b];
+        var box = row && row.box ? row.box : row;
+        if (!box || typeof box !== "object") {
+            skipped_boxes++;
+            continue;
+        }
+
+        var rect = box.patching_rect || [100, 100, 160, 122];
+        var x = rect[0];
+        var y = rect[1];
+        var boxtext = box.boxtext || box.text;
+        var maxclass = box.maxclass;
+        var varname = box.varname;
+
+        var new_obj = null;
+        try {
+            if (boxtext && typeof boxtext === "string") {
+                new_obj = current_patcher.newdefault(x, y, boxtext);
+            } else if (maxclass && typeof maxclass === "string") {
+                new_obj = current_patcher.newdefault(x, y, maxclass);
+            } else {
+                skipped_boxes++;
+                continue;
+            }
+            if (varname && typeof varname === "string") {
+                new_obj.varname = varname;
+                created[varname] = new_obj;
+            } else {
+                var generated = "restored_" + b + "_" + Math.floor(Math.random() * 100000);
+                new_obj.varname = generated;
+                created[generated] = new_obj;
+            }
+            if (rect && rect.length >= 4) {
+                try {
+                    new_obj.rect = [rect[0], rect[1], rect[2], rect[3]];
+                    restored_rects++;
+                } catch (e) {
+                    // Keep object even if rect assignment fails.
+                }
+            }
+            var attr_result = apply_snapshot_attributes(new_obj, box.attributes);
+            attributes_applied += attr_result.applied;
+            attributes_skipped += attr_result.skipped;
+            created_count++;
+        } catch (e) {
+            skipped_boxes++;
+        }
+    }
+
+    var connected = 0;
+    var skipped_lines = 0;
+    for (var l = 0; l < snapshot.lines.length; l++) {
+        var lineRow = snapshot.lines[l];
+        var patchline = lineRow && lineRow.patchline ? lineRow.patchline : lineRow;
+        if (!patchline || typeof patchline !== "object") {
+            skipped_lines++;
+            continue;
+        }
+        var source = patchline.source || [];
+        var destination = patchline.destination || [];
+        if (source.length < 2 || destination.length < 2) {
+            skipped_lines++;
+            continue;
+        }
+        var srcVar = source[0];
+        var srcOutlet = source[1];
+        var dstVar = destination[0];
+        var dstInlet = destination[1];
+        var srcObj = created[srcVar];
+        var dstObj = created[dstVar];
+        if (!srcObj || !dstObj) {
+            skipped_lines++;
+            continue;
+        }
+        try {
+            current_patcher.connect(srcObj, srcOutlet, dstObj, dstInlet);
+            connected++;
+        } catch (e) {
+            skipped_lines++;
+        }
+    }
+
+    avoid_rect_called = false;
+    return {
+        success: true,
+        restored_boxes: created_count,
+        restored_lines: connected,
+        skipped_boxes: skipped_boxes,
+        skipped_lines: skipped_lines,
+        restored_rects: restored_rects,
+        attributes_applied: attributes_applied,
+        attributes_skipped: attributes_skipped
+    };
+}
+
+function send_capabilities(request_id) {
+    respond_success(request_id, {
+        protocol_version: "2.0",
+        health_ping: true,
+        bridge_ping: true,
+        capabilities: true,
+        set_workspace_target: true,
+        workspace_status: true,
+        apply_topology_snapshot: true,
+        supported_actions: [
+            "get_objects_in_patch", "get_objects_in_selected", "get_object_attributes",
+            "get_avoid_rect_position", "add_object", "remove_object",
+            "connect_objects", "disconnect_objects", "set_object_attribute",
+            "set_message_text", "send_message_to_object", "send_bang_to_object",
+            "set_number", "create_subpatcher", "enter_subpatcher", "exit_subpatcher",
+            "get_patcher_context", "add_subpatcher_io", "get_object_connections",
+            "recreate_with_args", "move_object", "autofit_existing", "encapsulate",
+            "check_signal_safety", "bridge_ping", "health_ping", "capabilities",
+            "set_workspace_target", "workspace_status", "apply_topology_snapshot"
+        ],
+        supports_auth: true,
+        supports_idempotency: true,
+        notes: "Envelope and legacy request payloads are accepted."
+    });
+}
 
 // Objects that need float formatting to avoid integer truncation
 var FLOAT_SENSITIVE_OBJECTS = {
@@ -275,11 +856,13 @@ function format_float_arg(arg) {
 function add_object(x, y, type, args, var_name, request_id) {
     // Preflight check: require get_avoid_rect_position to be called first
     if (!avoid_rect_called) {
-        var result = {"request_id": request_id, "results": {
-            "success": false,
-            "error": "PREFLIGHT REQUIRED: Call get_avoid_rect_position() before placing objects."
-        }};
-        outlet(1, "response", JSON.stringify(result));
+        respond_error(
+            request_id,
+            "PRECONDITION_FAILED",
+            "PREFLIGHT REQUIRED: Call get_avoid_rect_position() before placing objects.",
+            "Call get_avoid_rect_position() immediately before add_object().",
+            true
+        );
         return;
     }
 
@@ -302,11 +885,14 @@ function add_object(x, y, type, args, var_name, request_id) {
     // Check for jbogus - object doesn't exist
     if (new_obj.maxclass === "jbogus") {
         current_patcher.remove(new_obj);
-        var result = {"request_id": request_id, "results": {
-            "success": false,
-            "error": "OBJECT DOES NOT EXIST: '" + type + "' is not a valid Max object."
-        }};
-        outlet(1, "response", JSON.stringify(result));
+        respond_error(
+            request_id,
+            "VALIDATION_ERROR",
+            "OBJECT DOES NOT EXIST: '" + type + "' is not a valid Max object.",
+            null,
+            true,
+            { obj_type: type }
+        );
         return;
     }
 
@@ -344,8 +930,7 @@ function add_object(x, y, type, args, var_name, request_id) {
     } else {
         // Send success response
         var response = warnings.length > 0 ? "ok - " + warnings.join(" | ") : "ok";
-        var result = {"request_id": request_id, "results": response};
-        outlet(1, "response", JSON.stringify(result));
+        respond_success(request_id, response);
     }
 }
 
@@ -538,73 +1123,154 @@ function autofit_object(obj, type, args) {
 
 function remove_object(var_name) {
 	var obj = current_patcher.getnamed(var_name);
-    if (obj) {
-	    current_patcher.remove(obj);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + var_name,
+                recoverable: true,
+                details: { varname: var_name }
+            }
+        };
     }
+    current_patcher.remove(obj);
+    return { success: true, varname: var_name };
 }
 
 function connect_objects(src_varname, outlet_idx, dst_varname, inlet_idx) {
     var src = current_patcher.getnamed(src_varname);
     var dst = current_patcher.getnamed(dst_varname);
+    if (!src || !dst) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Source or destination object not found for connect.",
+                recoverable: true,
+                details: { src_varname: src_varname, dst_varname: dst_varname }
+            }
+        };
+    }
     current_patcher.connect(src, outlet_idx, dst, inlet_idx);
+    return { success: true, src_varname: src_varname, dst_varname: dst_varname, outlet_idx: outlet_idx, inlet_idx: inlet_idx };
 }
 
 function disconnect_objects(src_varname, outlet_idx, dst_varname, inlet_idx) {
 	var src = current_patcher.getnamed(src_varname);
     var dst = current_patcher.getnamed(dst_varname);
+    if (!src || !dst) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Source or destination object not found for disconnect.",
+                recoverable: true,
+                details: { src_varname: src_varname, dst_varname: dst_varname }
+            }
+        };
+    }
 	current_patcher.disconnect(src, outlet_idx, dst, inlet_idx);
+    return { success: true, src_varname: src_varname, dst_varname: dst_varname, outlet_idx: outlet_idx, inlet_idx: inlet_idx };
 }
 
 function set_object_attribute(varname, attr_name, attr_value) {
     var obj = current_patcher.getnamed(varname);
-    if (obj) {
-        if (obj.maxclass == "message" || obj.maxclass == "comment") {
-            if (attr_name == "text") {
-                obj.message("set", attr_value);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + varname,
+                recoverable: true,
+                details: { varname: varname }
             }
-        }
-        // Check if the attribute exists before setting it
-        var attrnames = obj.getattrnames();
-        if (attrnames.indexOf(attr_name) == -1) {
-            post("Attribute not found: " + attr_name);
-            return;
-        }
-        // Set the attribute
-        obj.setattr(attr_name, attr_value);
-    } else {
-        post("Object not found: " + varname);
+        };
     }
+    if (obj.maxclass == "message" || obj.maxclass == "comment") {
+        if (attr_name == "text") {
+            obj.message("set", attr_value);
+            return { success: true, varname: varname, attr_name: attr_name };
+        }
+    }
+    // Check if the attribute exists before setting it
+    var attrnames = obj.getattrnames();
+    if (attrnames.indexOf(attr_name) == -1) {
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Attribute not found: " + attr_name,
+                recoverable: true,
+                details: { varname: varname, attr_name: attr_name }
+            }
+        };
+    }
+    // Set the attribute
+    obj.setattr(attr_name, attr_value);
+    return { success: true, varname: varname, attr_name: attr_name };
 }
 
 function set_message_text(varname, new_text) {
     var obj = current_patcher.getnamed(varname);
-    if (obj) {
-        if (obj.maxclass == "message") {
-            obj.message("set", new_text);
-        } else {
-            post("Object is not a message box: " + varname);
-        }
-    } else {
-        post("Object not found: " + varname);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + varname,
+                recoverable: true,
+                details: { varname: varname }
+            }
+        };
     }
+    if (obj.maxclass == "message") {
+        obj.message("set", new_text);
+        return { success: true, varname: varname };
+    }
+    return {
+        success: false,
+        error: {
+            code: "VALIDATION_ERROR",
+            message: "Object is not a message box: " + varname,
+            recoverable: true,
+            details: { varname: varname, maxclass: obj.maxclass }
+        }
+    };
 }
 
 function send_message_to_object(varname, message) {
     var obj = current_patcher.getnamed(varname);
-    if (obj) {
-        obj.message(message);
-    } else {
-        post("Object not found: " + varname);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + varname,
+                recoverable: true,
+                details: { varname: varname }
+            }
+        };
     }
+    obj.message(message);
+    return { success: true, varname: varname };
 }
 
 function send_bang_to_object(varname) {
     var obj = current_patcher.getnamed(varname);
-    if (obj) {
-        obj.message("bang");
-    } else {
-        post("Object not found: " + varname);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + varname,
+                recoverable: true,
+                details: { varname: varname }
+            }
+        };
     }
+    obj.message("bang");
+    return { success: true, varname: varname };
 }
 
 function set_text_in_comment(varname, text) {
@@ -622,11 +1288,19 @@ function set_text_in_comment(varname, text) {
 
 function set_number(varname, num) {
     var obj = current_patcher.getnamed(varname);
-    if (obj) {
-        obj.message("set", num);
-    } else {
-        post("Object not found: " + varname);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + varname,
+                recoverable: true,
+                details: { varname: varname }
+            }
+        };
     }
+    obj.message("set", num);
+    return { success: true, varname: varname, value: num };
 }
 
 // ========================================
@@ -636,19 +1310,34 @@ function create_subpatcher(x, y, name, var_name) {
     var new_obj = current_patcher.newdefault(x, y, "patcher", name);
     new_obj.varname = var_name;
     post("Created subpatcher: " + var_name + " (" + name + ")\n");
+    return { success: true, varname: var_name, name: name, position: [x, y] };
 }
 
 function enter_subpatcher(var_name) {
     var obj = current_patcher.getnamed(var_name);
     if (!obj) {
-        post("Object not found: " + var_name + "\n");
-        return;
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + var_name,
+                recoverable: true,
+                details: { varname: var_name }
+            }
+        };
     }
 
     var subpatch = obj.subpatcher();
     if (!subpatch) {
-        post("Object is not a subpatcher: " + var_name + "\n");
-        return;
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Object is not a subpatcher: " + var_name,
+                recoverable: true,
+                details: { varname: var_name }
+            }
+        };
     }
 
     // Push current context onto stack
@@ -663,13 +1352,14 @@ function enter_subpatcher(var_name) {
     // Reset preflight check - new context requires new avoid rect check
     avoid_rect_called = false;
 
-    post("Entered subpatcher: " + var_name + " (depth: " + patcher_stack.length + ")\n");
+    post("Entered subpatcher: " + var_name + " (depth: " + effective_depth() + ")\n");
+    return { success: true, depth: effective_depth(), path: effective_path() };
 }
 
 function exit_subpatcher() {
-    if (patcher_stack.length == 0) {
+    if (patcher_stack.length <= base_context_depth) {
         post("Already at root patcher\n");
-        return;
+        return { success: true, depth: 0, no_op: true };
     }
 
     var context = patcher_stack.pop();
@@ -678,30 +1368,34 @@ function exit_subpatcher() {
     // Reset preflight check - returning to parent context requires new avoid rect check
     avoid_rect_called = false;
 
-    post("Exited to parent patcher (depth: " + patcher_stack.length + ")\n");
+    post("Exited to parent patcher (depth: " + effective_depth() + ")\n");
+    return { success: true, depth: effective_depth(), path: effective_path() };
 }
 
 function get_patcher_context(request_id) {
-    var path = [];
-    for (var i = 0; i < patcher_stack.length; i++) {
-        path.push(patcher_stack[i].name);
-    }
-
     var context = {
-        depth: patcher_stack.length,
-        path: path,
-        is_root: (patcher_stack.length == 0)
+        depth: effective_depth(),
+        path: effective_path(),
+        is_root: (effective_depth() == 0),
+        target_id: active_workspace_target,
+        workspace_varname: active_workspace_varname
     };
 
-    var results = {"request_id": request_id, "results": context};
-    outlet(1, "response", JSON.stringify(results, null, 0));
+    respond_success(request_id, context);
 }
 
 function add_subpatcher_io(x, y, io_type, var_name, comment) {
     // io_type should be "inlet" or "outlet" (they auto-detect signal vs message)
     if (io_type != "inlet" && io_type != "outlet") {
-        post("Invalid io_type: " + io_type + ". Use inlet or outlet (no ~ needed, they auto-detect)\n");
-        return;
+        return {
+            success: false,
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Invalid io_type: " + io_type + ". Use inlet or outlet (no ~ needed, they auto-detect)",
+                recoverable: true,
+                details: { io_type: io_type }
+            }
+        };
     }
 
     var new_obj = current_patcher.newdefault(x, y, io_type);
@@ -712,6 +1406,7 @@ function add_subpatcher_io(x, y, io_type, var_name, comment) {
     }
 
     post("Created " + io_type + ": " + var_name + "\n");
+    return { success: true, io_type: io_type, varname: var_name, position: [x, y] };
 }
 
 // ========================================
@@ -759,7 +1454,7 @@ function get_objects_in_selected(request_id) {
 function collect_objects(obj) {
     //var keys = Object.keys(obj.varname);
     //post(typeof obj.varname + "\n");
-    if (obj.varname.substring(0, 8) == "maxmcpid"){
+    if (obj.varname && obj.varname.substring(0, 8) == "maxmcpid"){
         return;
     }
     if (!obj.varname){
@@ -776,48 +1471,46 @@ function collect_objects(obj) {
             }})
         }
     }
-    var attrnames = obj.getattrnames();
-    var attr = {};
-    if (attrnames.length){
-        for (var i = 0; i < attrnames.length; i++) {
-            var name = attrnames[i];
-            var value = obj.getattr(name);
-            attr[name] = value;
-        }
+    var attr = collect_serializable_attributes(obj);
+    var boxtext = null;
+    try {
+        boxtext = obj.boxtext;
+    } catch (e) {
+        boxtext = null;
     }
+
     boxes.push({box:{
         maxclass: obj.maxclass,
         varname: obj.varname,
         patching_rect: obj.rect,
-        // numinlets: obj.patchcords.inputs.length,
-        // numoutputs: obj.patchcords.outputs.length,
-        // attributes: attr,
+        numinlets: obj.patchcords && obj.patchcords.inputs ? obj.patchcords.inputs.length : 0,
+        numoutlets: obj.patchcords && obj.patchcords.outputs ? obj.patchcords.outputs.length : 0,
+        boxtext: boxtext,
+        attributes: attr,
     }})
 }
 
 function get_object_attributes(request_id, var_name) {
     var obj = current_patcher.getnamed(var_name);
     if (!obj) {
-        post("Object not found: " + var_name);
-	    return;
+        respond_error(
+            request_id,
+            "OBJECT_NOT_FOUND",
+            "Object not found: " + var_name,
+            null,
+            true,
+            { varname: var_name }
+        );
+        return;
     }
-    var attrnames = obj.getattrnames();
-    var attributes = {};
-    if (attrnames.length){
-        for (var i = 0; i < attrnames.length; i++) {
-            var name = attrnames[i];
-            var value = obj.getattr(name);
-            attributes[name] = value;
-        }
-    }
+    var attributes = collect_serializable_attributes(obj);
 
     // use these if no v8:
     // var results = {"request_id": request_id, "results": patcher_dict}
     // outlet(1, "response", split_long_string(JSON.stringify(results, null, 2), 2000));
 
     // use this if has v8:
-    var results = {"request_id": request_id, "results": attributes}
-    outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
+    respond_success(request_id, attributes);
 }
 
 function get_window_rect() {
@@ -852,9 +1545,7 @@ function get_avoid_rect_position(request_id) {
     // Mark preflight check as done
     avoid_rect_called = true;
 
-    // use this if has v8:
-    var results = {"request_id": request_id, "results": avoid_rect}
-    outlet(1, "response", JSON.stringify(results, null, 1));
+    respond_success(request_id, avoid_rect);
 }
 
 // ========================================
@@ -863,8 +1554,14 @@ function get_avoid_rect_position(request_id) {
 function get_object_connections(request_id, var_name) {
     var obj = current_patcher.getnamed(var_name);
     if (!obj) {
-        var results = {"request_id": request_id, "results": {"error": "Object not found: " + var_name}};
-        outlet(1, "response", JSON.stringify(results, null, 0));
+        respond_error(
+            request_id,
+            "OBJECT_NOT_FOUND",
+            "Object not found: " + var_name,
+            null,
+            true,
+            { varname: var_name }
+        );
         return;
     }
 
@@ -901,15 +1598,20 @@ function get_object_connections(request_id, var_name) {
         outputs: outputs
     };
 
-    var results = {"request_id": request_id, "results": connection_info};
-    outlet(1, "response", JSON.stringify(results, null, 0));
+    respond_success(request_id, connection_info);
 }
 
 function recreate_with_args(request_id, var_name, new_args) {
     var obj = current_patcher.getnamed(var_name);
     if (!obj) {
-        var results = {"request_id": request_id, "results": {"success": false, "error": "Object not found: " + var_name}};
-        outlet(1, "response", JSON.stringify(results, null, 0));
+        respond_error(
+            request_id,
+            "OBJECT_NOT_FOUND",
+            "Object not found: " + var_name,
+            null,
+            true,
+            { varname: var_name }
+        );
         return;
     }
 
@@ -986,26 +1688,28 @@ function recreate_with_args(request_id, var_name, new_args) {
         }
     }
 
-    var results = {
-        "request_id": request_id,
-        "results": {
-            "success": true,
-            "varname": var_name,
-            "obj_type": obj_type,
-            "new_args": new_args,
-            "restored_inputs": inputs.length,
-            "restored_outputs": outputs.length
-        }
-    };
-    outlet(1, "response", JSON.stringify(results, null, 0));
+    respond_success(request_id, {
+        "success": true,
+        "varname": var_name,
+        "obj_type": obj_type,
+        "new_args": new_args,
+        "restored_inputs": inputs.length,
+        "restored_outputs": outputs.length
+    });
     post("Recreated " + var_name + " (" + obj_type + ") with args: " + new_args + "\n");
 }
 
 function move_object(request_id, var_name, x, y) {
     var obj = current_patcher.getnamed(var_name);
     if (!obj) {
-        var results = {"request_id": request_id, "results": {"success": false, "error": "Object not found: " + var_name}};
-        outlet(1, "response", JSON.stringify(results, null, 0));
+        respond_error(
+            request_id,
+            "OBJECT_NOT_FOUND",
+            "Object not found: " + var_name,
+            null,
+            true,
+            { varname: var_name }
+        );
         return;
     }
 
@@ -1018,22 +1722,31 @@ function move_object(request_id, var_name, x, y) {
     var new_rect = [x, y, x + width, y + height];
     obj.rect = new_rect;
 
-    var results = {
-        "request_id": request_id,
-        "results": {
-            "success": true,
-            "varname": var_name,
-            "old_position": [rect[0], rect[1]],
-            "new_position": [x, y]
-        }
-    };
-    outlet(1, "response", JSON.stringify(results, null, 0));
+    respond_success(request_id, {
+        "success": true,
+        "varname": var_name,
+        "old_position": [rect[0], rect[1]],
+        "new_position": [x, y]
+    });
     post("Moved " + var_name + " to [" + x + ", " + y + "]\n");
 }
 
 function autofit_existing(var_name) {
+    var obj = current_patcher.getnamed(var_name);
+    if (!obj) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "Object not found: " + var_name,
+                recoverable: true,
+                details: { varname: var_name }
+            }
+        };
+    }
     // Route to v8 add-on which has access to obj.boxtext
     outlet(2, "autofit_v8", var_name);
+    return { success: true, varname: var_name };
 }
 
 // ========================================
@@ -1227,12 +1940,14 @@ function check_signal_safety(request_id) {
 
 function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) {
     // Check if we're at root level - encapsulate only works at root currently
-    if (patcher_stack.length > 0) {
-        var result = {"request_id": request_id, "results": {
-            "success": false,
-            "error": "ENCAPSULATE ERROR: Currently only works at root patcher level. Use exit_subpatcher() to return to root first."
-        }};
-        outlet(1, "response", JSON.stringify(result));
+    if (effective_depth() > 0) {
+        respond_error(
+            request_id,
+            "PRECONDITION_FAILED",
+            "ENCAPSULATE ERROR: Currently only works at root patcher level. Use exit_subpatcher() to return to root first.",
+            "Call exit_subpatcher() until depth is 0.",
+            true
+        );
         return;
     }
 
@@ -1244,11 +1959,14 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
         var vn = varnames[i];
         var obj = current_patcher.getnamed(vn);
         if (!obj) {
-            var result = {"request_id": request_id, "results": {
-                "success": false,
-                "error": "Object not found: " + vn
-            }};
-            outlet(1, "response", JSON.stringify(result));
+            respond_error(
+                request_id,
+                "OBJECT_NOT_FOUND",
+                "Object not found: " + vn,
+                null,
+                true,
+                { varname: vn }
+            );
             return;
         }
         varname_set[vn] = true;
@@ -1261,11 +1979,13 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
     }
 
     if (objects.length === 0) {
-        var result = {"request_id": request_id, "results": {
-            "success": false,
-            "error": "No objects to encapsulate"
-        }};
-        outlet(1, "response", JSON.stringify(result));
+        respond_error(
+            request_id,
+            "VALIDATION_ERROR",
+            "No objects to encapsulate",
+            "Pass at least one object varname.",
+            true
+        );
         return;
     }
 
