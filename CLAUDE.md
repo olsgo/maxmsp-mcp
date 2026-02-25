@@ -53,8 +53,17 @@ Managed runtime/file workflow tools:
 - Optional file-scope guardrails:
   - `MAXMCP_ENFORCE_PATCH_ROOTS=1`
   - `MAXMCP_ALLOWED_PATCH_ROOTS=/abs/path/a:/abs/path/b`
+- Placement/runtime reliability defaults:
+  - `MAXMCP_PREFLIGHT_MODE=auto`
+  - `MAXMCP_PREFLIGHT_CACHE_SECONDS=30`
+  - `MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS=8`
+  - `MAXMCP_WORKSPACE_CAPTURE_RETRIES=2`
+  - `MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS=0.5`
 - Hygiene defaults:
   - `MAXMCP_HYGIENE_AUTO_CLEANUP=1`
   - `MAXMCP_HYGIENE_SCOPE=all_max_instances`
   - `MAXMCP_HYGIENE_MODE=aggressive`
   - `MAXMCP_HYGIENE_STALE_SECONDS=1800`
+- Compatibility shims:
+  - `add_max_object` accepts legacy `obj_type="newobj"` and rewrites it to the first arg object name.
+  - Import pipeline can synthesize missing varnames and resolve line endpoints from `box.id` when loading `.maxpat`.

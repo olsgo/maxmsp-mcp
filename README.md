@@ -164,6 +164,11 @@ Reliability/security knobs:
 - `MAXMCP_STRICT_CAPABILITY_GATING=1` block actions not advertised by bridge capabilities
 - `MAXMCP_MUTATION_MAX_INFLIGHT=4` / `MAXMCP_MUTATION_MAX_QUEUE=64` mutation concurrency + queue backpressure
 - `MAXMCP_MUTATION_QUEUE_WAIT_TIMEOUT_SECONDS=15` max wait to acquire mutation slot
+- `MAXMCP_PREFLIGHT_MODE=auto` object-placement preflight mode (`auto`, `session`, `manual`)
+- `MAXMCP_PREFLIGHT_CACHE_SECONDS=30` cache window used when `MAXMCP_PREFLIGHT_MODE=session`
+- `MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS=8` timeout for workspace topology capture during persist/switch
+- `MAXMCP_WORKSPACE_CAPTURE_RETRIES=2` retry count for topology capture timeouts
+- `MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS=0.5` linear backoff per retry attempt
 - `MAXMCP_AUTH_TOKEN=...` shared token attached by Python bridge and validated in `max_mcp_node.js`
 - `MAXMCP_AUTH_TOKEN_FILE=~/.maxmsp-mcp/auth_token` fallback token file used when env token is unset
 - `MAXMCP_REQUIRE_HANDSHAKE_AUTH=1` require Socket.IO handshake auth (`auth.token` / `x-maxmcp-token`)
@@ -186,6 +191,10 @@ Patch file import/export tools return structured failures when bridge policy rej
 - capability gating (`PRECONDITION_FAILED`)
 - auth failures (`UNAUTHORIZED`)
 - queue/backpressure (`OVERLOADED`)
+
+Import compatibility notes:
+- `add_max_object` accepts legacy `obj_type="newobj"` shorthand and rewrites it to the first item in `args`.
+- Patch imports auto-generate missing box varnames and remap line references from Max `box.id` values, preserving wiring when source files do not include varnames.
 
 If root enforcement is enabled and no allowlist is provided, defaults are:
 - repository root
