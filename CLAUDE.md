@@ -31,7 +31,7 @@ Key tools for object manipulation:
 
 Managed runtime/file workflow tools:
 - `ensure_max_available()` / `bridge_status()` - no-manual-setup bridge bring-up and health
-- `load_patch_from_path()` / `save_patch_to_path()` - inspect/import/export `.maxpat` directly from filesystem
+- `import_patch()` / `export_workspace()` - import/export `.maxpat` directly for explicit `project_id` + `workspace_id`
 - `get_patch_context()` / `dry_run_plan()` - higher-context introspection and preflight validation
 - `create_checkpoint()` / `restore_checkpoint()` / `run_patch_transaction()` - rollback-safe edit execution
 - `list_max_system_sessions()` / `close_max_system_sessions()` - inspect and close system-wide Max sessions/processes

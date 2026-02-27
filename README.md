@@ -134,23 +134,24 @@ When the MCP server starts, it will automatically:
 1. Ensure Node dependencies are installed in `MaxMSP_Agent/`
 2. Launch Max (`/Applications/Max.app` by default)
 3. Open `MaxMSP_Agent/mcp_host.maxpat`
-4. Provision per-session `active.maxpat` and `scratch.maxpat` under `target/maxmcp/sessions/<session-id>/`
-5. Attach the bridge to a per-session workspace target (`active` by default)
-6. Reconnect the bridge if Max/bridge disconnects
+4. Keep the bridge attached to `host` until a project/workspace is explicitly selected
+5. Reconnect the bridge if Max/bridge disconnects
 
 Useful tools:
 - `ensure_max_available()` - force readiness check and launch/reconnect if needed
 - `bridge_status()` - inspect bridge health
 - `get_bridge_metrics()` - latency/action/queue telemetry (optional recent events)
 - `recover_bridge()` - force recovery sequence
-- `list_patch_targets()` - list managed targets (`host`, `active`, `scratch`)
-- `set_patch_target()` - switch between per-session `active`/`scratch` workspaces or `host`
-- `sync_patch_twin()` / `get_patch_drift()` - twin synchronization and drift checks
-- `create_checkpoint()` / `restore_checkpoint()` - snapshot + rollback
-- `run_patch_transaction()` - multi-step execution with automatic rollback on failure
+- `register_project()` / `list_projects()` - manage project scopes
+- `create_workspace()` / `list_workspaces()` / `select_workspace()` - manage and select workspace scopes
+- `sync_patch_twin(project_id, workspace_id, ...)` / `get_patch_drift(project_id, workspace_id, ...)` - twin synchronization and drift checks
+- `create_checkpoint(project_id, workspace_id, ...)` / `restore_checkpoint(project_id, workspace_id, ...)` - snapshot + rollback
+- `run_patch_transaction(project_id, workspace_id, ...)` - multi-step execution with automatic rollback on failure
 - `validate_patch_file()` - static parse/shape validation for `.maxpat`/JSON files
-- `load_patch_from_path()` - direct file import into `active`/`scratch` (replace/merge/fail-if-not-empty)
-- `save_patch_to_path()` - export workspace topology to `.maxpat`/JSON file
+- `import_patch()` - import topology into a selected workspace (replace/merge/fail-if-not-empty)
+- `export_workspace()` - export a selected workspace topology to `.maxpat`/JSON
+- `open_patch_window()` / `close_patch_window()` - explicit Max document window control
+- `export_amxd(project_id, workspace_id, ...)` - export selected workspace to `.amxd` with validation
 - `list_max_system_sessions()` - system-wide Max process + patch visibility
 - `close_max_system_sessions()` - close stale/managed/custom Max sessions
 - `cleanup_max_hygiene()` - aggressive stale-process + stale-session GC
@@ -169,6 +170,10 @@ Reliability/security knobs:
 - `MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS=8` timeout for workspace topology capture during persist/switch
 - `MAXMCP_WORKSPACE_CAPTURE_RETRIES=2` retry count for topology capture timeouts
 - `MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS=0.5` linear backoff per retry attempt
+- `MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS=25` default bridge timeout for import topology apply
+- `MAXMCP_IMPORT_APPLY_RETRY_COUNT=1` default retry count for import apply timeout/overload failures
+- `MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS=0.5` linear backoff per import apply retry
+- `MAXMCP_IMPORT_APPLY_CHUNK_SIZE=64` default chunk size when progressive apply mode is used
 - `MAXMCP_AUTH_TOKEN=...` shared token attached by Python bridge and validated in `max_mcp_node.js`
 - `MAXMCP_AUTH_TOKEN_FILE=~/.maxmsp-mcp/auth_token` fallback token file used when env token is unset
 - `MAXMCP_REQUIRE_HANDSHAKE_AUTH=1` require Socket.IO handshake auth (`auth.token` / `x-maxmcp-token`)
@@ -301,22 +306,23 @@ Rotate auth token and sync local client config (default client: codex):
 | `ensure_max_available()` | Ensure Max and bridge patch are available |
 | `bridge_status(verbose?)` | Runtime/bridge health summary |
 | `recover_bridge()` | Relaunch/reconnect bridge runtime |
-| `list_max_system_sessions(include_windows?, include_runtime_state?)` | Inventory Max processes, open docs, and managed sessions |
+| `list_max_system_sessions(include_windows?, include_runtime_state?)` | Inventory Max processes/windows/sessions with scan diagnostics |
 | `close_max_system_sessions(target?, pids?, force?, dry_run?, max_count?)` | Close selected Max sessions/processes |
 | `cleanup_max_hygiene(mode?, include_processes?, include_session_dirs?, dry_run?)` | Execute stale process/session cleanup |
 | `get_hygiene_report(limit?)` | Show recent hygiene actions and policy |
 | `set_hygiene_policy(...)` | Update in-memory hygiene policy |
-| `list_patch_targets()` | Show logical patch targets |
-| `get_objects_in_patch()` | Get all objects and connections |
+| `register_project(project_id, ...)` | Register project scope for workspace operations |
+| `select_workspace(project_id, workspace_id, ...)` | Select an explicit project workspace |
+| `get_objects_in_patch(project_id, workspace_id)` | Get all objects and connections |
 | `get_objects_in_selected()` | Get selected objects |
 | `get_object_attributes(varname)` | Get object's attributes |
 | `get_object_connections(varname)` | Get object's connections |
 | `get_avoid_rect_position()` | Get bounding box for placement |
 | `list_all_objects()` | List available Max objects |
-| `search_objects(query, package?, limit?)` | Search MaxPyLang object catalog |
-| `get_object_schema(name)` | Get MaxPyLang object args/attrs/IO schema |
+| `search_objects(query, package?, limit?)` | Search merged object catalog (MaxPy schema + docs fallback) |
+| `get_object_schema(name)` | Get MaxPy schema, or docs-backed fallback when schema is missing |
 | `get_object_doc(name)` | Get Max documentation |
-| `sync_patch_twin(reason?)` | Sync in-memory topology twin |
+| `sync_patch_twin(project_id, workspace_id, reason?)` | Sync in-memory topology twin |
 | `get_patch_drift(auto_resync?)` | Detect topology drift vs twin baseline |
 | `create_checkpoint(label?)` | Capture rollback checkpoint |
 | `list_checkpoints()` | List stored checkpoints |
@@ -339,7 +345,7 @@ Rotate auth token and sync local client config (default client: codex):
 |------|-------------|
 | `check_signal_safety()` | Analyze for dangerous patterns |
 | `encapsulate(varnames, name, varname)` | Encapsulate objects |
-| `dry_run_plan(steps, engine?)` | Validate planned edits (`engine="basic"` or `engine="maxpy"`) |
+| `dry_run_plan(steps, engine?)` | Validate planned edits (canonical step objects; legacy string steps accepted with warnings) |
 
 ---
 
