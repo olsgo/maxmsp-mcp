@@ -187,6 +187,24 @@ function anything() {
                 respond_error(data.request_id, "VALIDATION_ERROR", "Missing obj_type, position, varname, or request_id for add_object");
             }
             break;
+        case "add_object_with_preflight":
+            if (data.obj_type && data.position && data.varname && data.request_id) {
+                add_object_with_preflight(
+                    data.position[0],
+                    data.position[1],
+                    data.obj_type,
+                    data.args,
+                    data.varname,
+                    data.request_id
+                );
+            } else {
+                respond_error(
+                    data.request_id,
+                    "VALIDATION_ERROR",
+                    "Missing obj_type, position, varname, or request_id for add_object_with_preflight"
+                );
+            }
+            break;
         case "remove_object":
             if (data.varname && data.request_id) {
                 var rm = remove_object(data.varname);
@@ -448,6 +466,79 @@ function anything() {
                 respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or snapshot for apply_topology_snapshot");
             }
             break;
+        case "apply_topology_snapshot_progressive":
+            if (data.request_id && data.snapshot) {
+                var applied_progressive = apply_topology_snapshot_progressive(
+                    data.snapshot,
+                    data.state || null,
+                    data.chunk_size
+                );
+                if (applied_progressive.success) {
+                    respond_success(data.request_id, applied_progressive);
+                } else {
+                    respond_error(
+                        data.request_id,
+                        applied_progressive.error.code,
+                        applied_progressive.error.message,
+                        applied_progressive.error.hint,
+                        applied_progressive.error.recoverable,
+                        applied_progressive.error.details
+                    );
+                }
+            } else {
+                respond_error(
+                    data.request_id,
+                    "VALIDATION_ERROR",
+                    "Missing request_id or snapshot for apply_topology_snapshot_progressive"
+                );
+            }
+            break;
+        case "export_amxd":
+            if (data.request_id && data.output_path) {
+                var exported_amxd = export_amxd(data.output_path, data.device_type || "");
+                if (exported_amxd.success) {
+                    respond_success(data.request_id, exported_amxd);
+                } else {
+                    respond_error(
+                        data.request_id,
+                        exported_amxd.error.code,
+                        exported_amxd.error.message,
+                        exported_amxd.error.hint,
+                        exported_amxd.error.recoverable,
+                        exported_amxd.error.details
+                    );
+                }
+            } else {
+                respond_error(
+                    data.request_id,
+                    "VALIDATION_ERROR",
+                    "Missing request_id or output_path for export_amxd"
+                );
+            }
+            break;
+        case "validate_amxd_open":
+            if (data.request_id && data.path) {
+                var amxd_validation = validate_amxd_open(data.path, !!data.probe_open);
+                if (amxd_validation.success) {
+                    respond_success(data.request_id, amxd_validation);
+                } else {
+                    respond_error(
+                        data.request_id,
+                        amxd_validation.error.code,
+                        amxd_validation.error.message,
+                        amxd_validation.error.hint,
+                        amxd_validation.error.recoverable,
+                        amxd_validation.error.details
+                    );
+                }
+            } else {
+                respond_error(
+                    data.request_id,
+                    "VALIDATION_ERROR",
+                    "Missing request_id or path for validate_amxd_open"
+                );
+            }
+            break;
         default:
             respond_error(data.request_id, "UNKNOWN_ACTION", "Unknown action: " + data.action);
     }
@@ -471,6 +562,76 @@ function bridge_ping(request_id) {
     });
 }
 
+function _create_subpatcher_object(parent_patcher, x, y, name, var_name) {
+    var attempts = [];
+    var constructors = [
+        { type: "patcher", args: [name] },
+        { type: "p", args: [name] }
+    ];
+
+    for (var i = 0; i < constructors.length; i++) {
+        var entry = constructors[i];
+        var new_obj = null;
+        try {
+            var create_args = [x, y, entry.type];
+            for (var a = 0; a < entry.args.length; a++) {
+                create_args.push(entry.args[a]);
+            }
+            new_obj = parent_patcher.newdefault.apply(parent_patcher, create_args);
+            if (var_name && typeof var_name === "string") {
+                new_obj.varname = var_name;
+            }
+            var subpatch = null;
+            try {
+                subpatch = new_obj.subpatcher();
+            } catch (_subpatch_error) {
+                subpatch = null;
+            }
+            attempts.push({
+                type: entry.type,
+                ok: !!subpatch
+            });
+            if (subpatch) {
+                return {
+                    success: true,
+                    object: new_obj,
+                    subpatcher: subpatch,
+                    constructor_type: entry.type,
+                    attempts: attempts
+                };
+            }
+            try {
+                parent_patcher.remove(new_obj);
+            } catch (_cleanup_error) {
+                // best effort cleanup
+            }
+        } catch (e) {
+            attempts.push({
+                type: entry.type,
+                ok: false,
+                error: String(e)
+            });
+            if (new_obj) {
+                try {
+                    parent_patcher.remove(new_obj);
+                } catch (_remove_error) {
+                    // best effort cleanup
+                }
+            }
+        }
+    }
+
+    return {
+        success: false,
+        error: {
+            code: "INTERNAL_ERROR",
+            message: "Failed to create subpatcher object.",
+            recoverable: true,
+            details: { attempts: attempts, varname: var_name, name: name }
+        }
+    };
+}
+
 function _ensure_workspace_patcher(workspace_varname, workspace_name) {
     var obj = root_patcher.getnamed(workspace_varname);
     if (obj) {
@@ -490,21 +651,14 @@ function _ensure_workspace_patcher(workspace_varname, workspace_name) {
     }
 
     var name = workspace_name || workspace_varname || "mcp_workspace";
-    var new_obj = root_patcher.newdefault(80, 80, "patcher", name);
-    new_obj.varname = workspace_varname;
-    var subpatch = new_obj.subpatcher();
-    if (!subpatch) {
+    var created = _create_subpatcher_object(root_patcher, 80, 80, name, workspace_varname);
+    if (!created.success) {
         return {
             success: false,
-            error: {
-                code: "INTERNAL_ERROR",
-                message: "Failed to create workspace subpatcher for: " + workspace_varname,
-                recoverable: false,
-                details: { workspace_varname: workspace_varname }
-            }
+            error: created.error
         };
     }
-    return { success: true, patcher: subpatch, created: true };
+    return { success: true, patcher: created.subpatcher, created: true };
 }
 
 function set_workspace_target(target_id, workspace_varname, workspace_name) {
@@ -518,12 +672,12 @@ function set_workspace_target(target_id, workspace_varname, workspace_name) {
         return get_workspace_status();
     }
 
-    if (target_id !== "active" && target_id !== "scratch") {
+    if (!target_id || typeof target_id !== "string") {
         return {
             success: false,
             error: {
                 code: "VALIDATION_ERROR",
-                message: "Unsupported target_id: " + target_id,
+                message: "target_id must be a non-empty string.",
                 recoverable: true,
                 details: { target_id: target_id }
             }
@@ -677,19 +831,73 @@ function apply_snapshot_attributes(obj, attributes) {
     return { applied: applied, skipped: skipped };
 }
 
-function apply_topology_snapshot(snapshot) {
-    if (!snapshot || !snapshot.boxes || !snapshot.lines) {
-        return {
-            success: false,
-            error: {
-                code: "VALIDATION_ERROR",
-                message: "Snapshot must include boxes and lines arrays.",
-                recoverable: true,
-                details: {}
+function _snapshot_validation_error(message, details) {
+    return {
+        success: false,
+        error: {
+            code: "VALIDATION_ERROR",
+            message: message,
+            recoverable: true,
+            details: details || {}
+        }
+    };
+}
+
+function _normalize_snapshot_state(state) {
+    var stats = {
+        restored_boxes: 0,
+        restored_lines: 0,
+        skipped_boxes: 0,
+        skipped_lines: 0,
+        restored_rects: 0,
+        attributes_applied: 0,
+        attributes_skipped: 0
+    };
+    if (state && typeof state === "object" && state.stats && typeof state.stats === "object") {
+        var keys = Object.keys(stats);
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (typeof state.stats[key] === "number" && isFinite(state.stats[key])) {
+                stats[key] = Math.max(0, Math.floor(state.stats[key]));
             }
-        };
+        }
     }
 
+    var normalized = {
+        phase: "boxes",
+        box_index: 0,
+        line_index: 0,
+        reset_done: false,
+        ref_map: {},
+        stats: stats
+    };
+    if (state && typeof state === "object") {
+        if (state.phase === "boxes" || state.phase === "lines" || state.phase === "done") {
+            normalized.phase = state.phase;
+        }
+        if (typeof state.box_index === "number" && isFinite(state.box_index)) {
+            normalized.box_index = Math.max(0, Math.floor(state.box_index));
+        }
+        if (typeof state.line_index === "number" && isFinite(state.line_index)) {
+            normalized.line_index = Math.max(0, Math.floor(state.line_index));
+        }
+        normalized.reset_done = !!state.reset_done;
+        if (state.ref_map && typeof state.ref_map === "object") {
+            normalized.ref_map = {};
+            var map_keys = Object.keys(state.ref_map);
+            for (var k = 0; k < map_keys.length; k++) {
+                var map_key = map_keys[k];
+                var map_value = state.ref_map[map_key];
+                if (typeof map_key === "string" && typeof map_value === "string") {
+                    normalized.ref_map[map_key] = map_value;
+                }
+            }
+        }
+    }
+    return normalized;
+}
+
+function _clear_current_objects() {
     var existing = [];
     current_patcher.apply(function(obj) {
         if (obj.maxclass && obj.maxclass !== "patchline") {
@@ -697,109 +905,390 @@ function apply_topology_snapshot(snapshot) {
         }
     });
     for (var i = 0; i < existing.length; i++) {
-        current_patcher.remove(existing[i]);
-    }
-
-    var created = {};
-    var created_count = 0;
-    var skipped_boxes = 0;
-    var restored_rects = 0;
-    var attributes_applied = 0;
-    var attributes_skipped = 0;
-
-    for (var b = 0; b < snapshot.boxes.length; b++) {
-        var row = snapshot.boxes[b];
-        var box = row && row.box ? row.box : row;
-        if (!box || typeof box !== "object") {
-            skipped_boxes++;
-            continue;
-        }
-
-        var rect = box.patching_rect || [100, 100, 160, 122];
-        var x = rect[0];
-        var y = rect[1];
-        var boxtext = box.boxtext || box.text;
-        var maxclass = box.maxclass;
-        var varname = box.varname;
-
-        var new_obj = null;
         try {
-            if (boxtext && typeof boxtext === "string") {
-                new_obj = current_patcher.newdefault(x, y, boxtext);
-            } else if (maxclass && typeof maxclass === "string") {
-                new_obj = current_patcher.newdefault(x, y, maxclass);
-            } else {
-                skipped_boxes++;
-                continue;
-            }
-            if (varname && typeof varname === "string") {
-                new_obj.varname = varname;
-                created[varname] = new_obj;
-            } else {
-                var generated = "restored_" + b + "_" + Math.floor(Math.random() * 100000);
-                new_obj.varname = generated;
-                created[generated] = new_obj;
-            }
-            if (rect && rect.length >= 4) {
-                try {
-                    new_obj.rect = [rect[0], rect[1], rect[2], rect[3]];
-                    restored_rects++;
-                } catch (e) {
-                    // Keep object even if rect assignment fails.
-                }
-            }
-            var attr_result = apply_snapshot_attributes(new_obj, box.attributes);
-            attributes_applied += attr_result.applied;
-            attributes_skipped += attr_result.skipped;
-            created_count++;
-        } catch (e) {
-            skipped_boxes++;
+            current_patcher.remove(existing[i]);
+        } catch (_remove_error) {
+            // Best effort cleanup.
         }
     }
+}
 
-    var connected = 0;
-    var skipped_lines = 0;
-    for (var l = 0; l < snapshot.lines.length; l++) {
-        var lineRow = snapshot.lines[l];
-        var patchline = lineRow && lineRow.patchline ? lineRow.patchline : lineRow;
-        if (!patchline || typeof patchline !== "object") {
-            skipped_lines++;
-            continue;
-        }
-        var source = patchline.source || [];
-        var destination = patchline.destination || [];
-        if (source.length < 2 || destination.length < 2) {
-            skipped_lines++;
-            continue;
-        }
-        var srcVar = source[0];
-        var srcOutlet = source[1];
-        var dstVar = destination[0];
-        var dstInlet = destination[1];
-        var srcObj = created[srcVar];
-        var dstObj = created[dstVar];
-        if (!srcObj || !dstObj) {
-            skipped_lines++;
-            continue;
-        }
-        try {
-            current_patcher.connect(srcObj, srcOutlet, dstObj, dstInlet);
-            connected++;
-        } catch (e) {
-            skipped_lines++;
-        }
+function _snapshot_box_row(snapshot, box_index) {
+    var row = snapshot.boxes[box_index];
+    return row && row.box ? row.box : row;
+}
+
+function _snapshot_line_row(snapshot, line_index) {
+    var row = snapshot.lines[line_index];
+    return row && row.patchline ? row.patchline : row;
+}
+
+function _register_snapshot_ref(state, key, value) {
+    if (!state || !state.ref_map || typeof key !== "string" || typeof value !== "string") {
+        return;
+    }
+    if (!key || !value) {
+        return;
+    }
+    state.ref_map[key] = value;
+}
+
+function _resolve_snapshot_ref(state, key) {
+    if (typeof key !== "string") {
+        return key;
+    }
+    if (state && state.ref_map && typeof state.ref_map[key] === "string") {
+        return state.ref_map[key];
+    }
+    return key;
+}
+
+function _apply_snapshot_box_at(snapshot, state, box_index) {
+    var box = _snapshot_box_row(snapshot, box_index);
+    if (!box || typeof box !== "object") {
+        state.stats.skipped_boxes++;
+        return;
     }
 
-    avoid_rect_called = false;
+    var rect = box.patching_rect || [100, 100, 160, 122];
+    var x = rect[0];
+    var y = rect[1];
+    var boxtext = box.boxtext || box.text;
+    var maxclass = box.maxclass;
+    var varname = box.varname;
+
+    var new_obj = null;
+    try {
+        if (boxtext && typeof boxtext === "string") {
+            new_obj = current_patcher.newdefault(x, y, boxtext);
+        } else if (maxclass && typeof maxclass === "string") {
+            new_obj = current_patcher.newdefault(x, y, maxclass);
+        } else {
+            state.stats.skipped_boxes++;
+            return;
+        }
+
+        var resolved_varname = "";
+        if (varname && typeof varname === "string") {
+            resolved_varname = varname;
+        } else {
+            resolved_varname = "restored_" + (box_index + 1);
+        }
+        new_obj.varname = resolved_varname;
+        _register_snapshot_ref(state, resolved_varname, resolved_varname);
+        if (typeof varname === "string" && varname) {
+            _register_snapshot_ref(state, varname, resolved_varname);
+        }
+        if (typeof box.id === "string" && box.id) {
+            _register_snapshot_ref(state, box.id, resolved_varname);
+        }
+
+        if (rect && rect.length >= 4) {
+            try {
+                new_obj.rect = [rect[0], rect[1], rect[2], rect[3]];
+                state.stats.restored_rects++;
+            } catch (_rect_error) {
+                // Keep object even if rect assignment fails.
+            }
+        }
+
+        var attr_result = apply_snapshot_attributes(new_obj, box.attributes);
+        state.stats.attributes_applied += attr_result.applied;
+        state.stats.attributes_skipped += attr_result.skipped;
+        state.stats.restored_boxes++;
+    } catch (_box_error) {
+        state.stats.skipped_boxes++;
+    }
+}
+
+function _apply_snapshot_line_at(snapshot, state, line_index) {
+    var patchline = _snapshot_line_row(snapshot, line_index);
+    if (!patchline || typeof patchline !== "object") {
+        state.stats.skipped_lines++;
+        return;
+    }
+
+    var source = patchline.source || [];
+    var destination = patchline.destination || [];
+    if (source.length < 2 || destination.length < 2) {
+        state.stats.skipped_lines++;
+        return;
+    }
+
+    var srcVar = _resolve_snapshot_ref(state, source[0]);
+    var srcOutlet = source[1];
+    var dstVar = _resolve_snapshot_ref(state, destination[0]);
+    var dstInlet = destination[1];
+    var srcObj = current_patcher.getnamed(srcVar);
+    var dstObj = current_patcher.getnamed(dstVar);
+    if (!srcObj || !dstObj) {
+        state.stats.skipped_lines++;
+        return;
+    }
+
+    try {
+        current_patcher.connect(srcObj, srcOutlet, dstObj, dstInlet);
+        state.stats.restored_lines++;
+    } catch (_line_error) {
+        state.stats.skipped_lines++;
+    }
+}
+
+function _coerce_chunk_size(chunk_size) {
+    var chunk = parseInt(chunk_size, 10);
+    if (!isFinite(chunk) || chunk < 1) {
+        chunk = 100;
+    }
+    if (chunk > 2000) {
+        chunk = 2000;
+    }
+    return chunk;
+}
+
+function _progress_payload(snapshot, state) {
+    var total = snapshot.boxes.length + snapshot.lines.length;
+    var processed = state.box_index + state.line_index;
+    return {
+        phase: state.phase,
+        processed: processed,
+        total: total,
+        remaining: Math.max(0, total - processed)
+    };
+}
+
+function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
+    if (!snapshot || !Array.isArray(snapshot.boxes) || !Array.isArray(snapshot.lines)) {
+        return _snapshot_validation_error(
+            "Snapshot must include boxes and lines arrays.",
+            {}
+        );
+    }
+
+    var normalized_state = _normalize_snapshot_state(state);
+    var chunk = _coerce_chunk_size(chunk_size);
+
+    if (!normalized_state.reset_done) {
+        _clear_current_objects();
+        normalized_state.reset_done = true;
+        normalized_state.phase = "boxes";
+        normalized_state.box_index = 0;
+        normalized_state.line_index = 0;
+        normalized_state.ref_map = {};
+        normalized_state.stats = _normalize_snapshot_state(null).stats;
+    }
+
+    var remaining = chunk;
+    while (remaining > 0 && normalized_state.phase === "boxes") {
+        if (normalized_state.box_index >= snapshot.boxes.length) {
+            normalized_state.phase = "lines";
+            break;
+        }
+        _apply_snapshot_box_at(snapshot, normalized_state, normalized_state.box_index);
+        normalized_state.box_index++;
+        remaining--;
+    }
+
+    while (remaining > 0 && normalized_state.phase === "lines") {
+        if (normalized_state.line_index >= snapshot.lines.length) {
+            normalized_state.phase = "done";
+            break;
+        }
+        _apply_snapshot_line_at(snapshot, normalized_state, normalized_state.line_index);
+        normalized_state.line_index++;
+        remaining--;
+    }
+
+    var done = normalized_state.phase === "done";
+    if (done) {
+        avoid_rect_called = false;
+    }
+
     return {
         success: true,
-        restored_boxes: created_count,
-        restored_lines: connected,
-        skipped_boxes: skipped_boxes,
-        skipped_lines: skipped_lines,
-        restored_rects: restored_rects,
-        attributes_applied: attributes_applied,
-        attributes_skipped: attributes_skipped
+        done: done,
+        chunk_size: chunk,
+        progress: _progress_payload(snapshot, normalized_state),
+        state: done ? null : normalized_state,
+        restored_boxes: normalized_state.stats.restored_boxes,
+        restored_lines: normalized_state.stats.restored_lines,
+        skipped_boxes: normalized_state.stats.skipped_boxes,
+        skipped_lines: normalized_state.stats.skipped_lines,
+        restored_rects: normalized_state.stats.restored_rects,
+        attributes_applied: normalized_state.stats.attributes_applied,
+        attributes_skipped: normalized_state.stats.attributes_skipped
+    };
+}
+
+function apply_topology_snapshot(snapshot) {
+    var state = null;
+    var guard = 0;
+    while (guard < 10000) {
+        var step = apply_topology_snapshot_progressive(snapshot, state, 1000);
+        if (!step || !step.success) {
+            return step;
+        }
+        if (step.done) {
+            return step;
+        }
+        state = step.state || null;
+        guard++;
+    }
+    return {
+        success: false,
+        error: {
+            code: "INTERNAL_ERROR",
+            message: "Topology apply exceeded safety iteration guard.",
+            recoverable: true,
+            details: {}
+        }
+    };
+}
+
+function _file_info(path) {
+    var info = {
+        exists: false,
+        size: 0
+    };
+    if (!path || typeof path !== "string") {
+        return info;
+    }
+    try {
+        var f = new File(path, "read");
+        if (f && f.isopen) {
+            info.exists = true;
+            info.size = f.eof || 0;
+            f.close();
+        }
+    } catch (_file_error) {
+        // leave defaults
+    }
+    return info;
+}
+
+function _invoke_patcher_action(target_patcher, action, args) {
+    var attempt = {
+        action: action,
+        success: false,
+        method: null,
+        error: null
+    };
+    if (!target_patcher || typeof action !== "string" || !action) {
+        attempt.error = "Invalid patcher action invocation.";
+        return attempt;
+    }
+    if (!Array.isArray(args)) {
+        args = [];
+    }
+    try {
+        if (typeof target_patcher[action] === "function") {
+            target_patcher[action].apply(target_patcher, args);
+            attempt.success = true;
+            attempt.method = "direct";
+            return attempt;
+        }
+    } catch (direct_error) {
+        attempt.error = String(direct_error);
+        attempt.method = "direct";
+    }
+
+    try {
+        if (typeof target_patcher.message === "function") {
+            var message_args = [action];
+            for (var i = 0; i < args.length; i++) {
+                message_args.push(args[i]);
+            }
+            target_patcher.message.apply(target_patcher, message_args);
+            attempt.success = true;
+            attempt.method = "message";
+            return attempt;
+        }
+    } catch (message_error) {
+        var msg_err = String(message_error);
+        if (attempt.error) {
+            attempt.error += " | " + msg_err;
+        } else {
+            attempt.error = msg_err;
+        }
+        attempt.method = attempt.method ? (attempt.method + "+message") : "message";
+    }
+    return attempt;
+}
+
+function export_amxd(output_path, device_type) {
+    if (!output_path || typeof output_path !== "string") {
+        return _snapshot_validation_error("output_path must be a non-empty string.", {});
+    }
+
+    var before = _file_info(output_path);
+    var attempts = [];
+    var normalized_type = "";
+    if (typeof device_type === "string" && device_type) {
+        normalized_type = device_type;
+        attempts.push(_invoke_patcher_action(current_patcher, "setamxdtype", [normalized_type]));
+    }
+
+    attempts.push(_invoke_patcher_action(current_patcher, "exportamxd", [output_path]));
+    var after = _file_info(output_path);
+    if (!after.exists || after.size <= 0) {
+        attempts.push(_invoke_patcher_action(current_patcher, "makeamxd", [output_path]));
+        after = _file_info(output_path);
+    }
+
+    if (!after.exists || after.size <= 0) {
+        return {
+            success: false,
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to export .amxd file from current patcher.",
+                hint: "Ensure patch is valid for Max for Live and retry.",
+                recoverable: true,
+                details: {
+                    output_path: output_path,
+                    device_type: normalized_type,
+                    file_before: before,
+                    file_after: after,
+                    attempts: attempts
+                }
+            }
+        };
+    }
+
+    return {
+        success: true,
+        output_path: output_path,
+        device_type: normalized_type,
+        file_before: before,
+        file_after: after,
+        attempts: attempts
+    };
+}
+
+function validate_amxd_open(path, probe_open) {
+    if (!path || typeof path !== "string") {
+        return _snapshot_validation_error("path must be a non-empty string.", {});
+    }
+    var file_info = _file_info(path);
+    if (!file_info.exists) {
+        return {
+            success: false,
+            error: {
+                code: "OBJECT_NOT_FOUND",
+                message: "AMXD file not found: " + path,
+                recoverable: true,
+                details: { path: path }
+            }
+        };
+    }
+    var probe_result = null;
+    if (probe_open) {
+        probe_result = _invoke_patcher_action(current_patcher, "openamxd", [path]);
+    }
+    return {
+        success: true,
+        path: path,
+        file: file_info,
+        probe_open_requested: !!probe_open,
+        probe_open_result: probe_result
     };
 }
 
@@ -812,16 +1301,20 @@ function send_capabilities(request_id) {
         set_workspace_target: true,
         workspace_status: true,
         apply_topology_snapshot: true,
+        apply_topology_snapshot_progressive: true,
+        export_amxd: true,
+        validate_amxd_open: true,
         supported_actions: [
             "get_objects_in_patch", "get_objects_in_selected", "get_object_attributes",
-            "get_avoid_rect_position", "add_object", "remove_object",
+            "get_avoid_rect_position", "add_object", "add_object_with_preflight", "remove_object",
             "connect_objects", "disconnect_objects", "set_object_attribute",
             "set_message_text", "send_message_to_object", "send_bang_to_object",
             "set_number", "create_subpatcher", "enter_subpatcher", "exit_subpatcher",
             "get_patcher_context", "add_subpatcher_io", "get_object_connections",
             "recreate_with_args", "move_object", "autofit_existing", "encapsulate",
             "check_signal_safety", "bridge_ping", "health_ping", "capabilities",
-            "set_workspace_target", "workspace_status", "apply_topology_snapshot"
+            "set_workspace_target", "workspace_status", "apply_topology_snapshot",
+            "apply_topology_snapshot_progressive", "export_amxd", "validate_amxd_open"
         ],
         supports_auth: true,
         supports_idempotency: true,
@@ -854,6 +1347,10 @@ function format_float_arg(arg) {
 }
 
 function add_object(x, y, type, args, var_name, request_id) {
+    if (!Array.isArray(args)) {
+        args = (args === undefined || args === null) ? [] : [args];
+    }
+
     // Preflight check: require get_avoid_rect_position to be called first
     if (!avoid_rect_called) {
         respond_error(
@@ -1307,10 +1804,21 @@ function set_number(varname, num) {
 // Subpatcher navigation functions:
 
 function create_subpatcher(x, y, name, var_name) {
-    var new_obj = current_patcher.newdefault(x, y, "patcher", name);
-    new_obj.varname = var_name;
+    var created = _create_subpatcher_object(current_patcher, x, y, name, var_name);
+    if (!created.success) {
+        return {
+            success: false,
+            error: created.error
+        };
+    }
     post("Created subpatcher: " + var_name + " (" + name + ")\n");
-    return { success: true, varname: var_name, name: name, position: [x, y] };
+    return {
+        success: true,
+        varname: var_name,
+        name: name,
+        position: [x, y],
+        constructor_type: created.constructor_type
+    };
 }
 
 function enter_subpatcher(var_name) {
@@ -1520,7 +2028,7 @@ function get_window_rect() {
     // outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
 }
 
-function get_avoid_rect_position(request_id) {
+function _compute_avoid_rect_position() {
     var l, t, r, b;
     var has_rect = false;
     current_patcher.apply(function (obj) {
@@ -1546,8 +2054,17 @@ function get_avoid_rect_position(request_id) {
 
     // Mark preflight check as done
     avoid_rect_called = true;
+    return avoid_rect;
+}
 
+function get_avoid_rect_position(request_id) {
+    var avoid_rect = _compute_avoid_rect_position();
     respond_success(request_id, avoid_rect);
+}
+
+function add_object_with_preflight(x, y, type, args, var_name, request_id) {
+    _compute_avoid_rect_position();
+    add_object(x, y, type, args, var_name, request_id);
 }
 
 // ========================================
@@ -1940,6 +2457,83 @@ function check_signal_safety(request_id) {
 // ========================================
 // Encapsulate function:
 
+function _collect_used_varnames(patcher) {
+    var used = {};
+    patcher.apply(function (obj) {
+        if (obj && obj.varname) {
+            used[obj.varname] = true;
+        }
+    });
+    return used;
+}
+
+function _allocate_unique_varname(base, used) {
+    var stem = (base && typeof base === "string") ? base : "enc_obj";
+    var candidate = stem;
+    var idx = 1;
+    while (used[candidate]) {
+        candidate = stem + "_" + idx;
+        idx += 1;
+    }
+    used[candidate] = true;
+    return candidate;
+}
+
+function _ensure_object_varname(obj, base, used, generated_rows, role) {
+    if (obj.varname) {
+        used[obj.varname] = true;
+        return obj.varname;
+    }
+    var generated = _allocate_unique_varname(base, used);
+    obj.varname = generated;
+    generated_rows.push({ role: role, generated_varname: generated });
+    return generated;
+}
+
+function _parse_object_args_from_boxtext(obj_type, boxtext) {
+    var args = [];
+    if (!boxtext || typeof boxtext !== "string") {
+        return args;
+    }
+
+    if (obj_type === "comment") {
+        return [boxtext];
+    }
+
+    if (obj_type === "message") {
+        args = boxtext.split(" ");
+    } else {
+        var parts = boxtext.split(" ");
+        args = parts.slice(1);
+    }
+
+    for (var j = 0; j < args.length; j++) {
+        var arg = args[j];
+        if (typeof arg !== "string") {
+            continue;
+        }
+        if (
+            arg.indexOf("$") !== -1 ||
+            arg.indexOf("\\") !== -1 ||
+            arg.indexOf(",") !== -1 ||
+            arg.indexOf(";") !== -1
+        ) {
+            continue;
+        }
+        if (arg.match(/^-?\d*\.?\d+$/)) {
+            var num = parseFloat(arg);
+            if (!isNaN(num)) {
+                if (arg.indexOf(".") !== -1) {
+                    args[j] = num;
+                } else {
+                    args[j] = Math.floor(num);
+                }
+            }
+        }
+    }
+    return args;
+}
+
 function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) {
     // Check if we're at root level - encapsulate only works at root currently
     if (effective_depth() > 0) {
@@ -1953,13 +2547,29 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
         return;
     }
 
+    var parent = current_patcher;
+    var used_varnames = _collect_used_varnames(parent);
+    var generated_external_varnames = [];
+
+    if (used_varnames[subpatcher_varname]) {
+        respond_error(
+            request_id,
+            "VALIDATION_ERROR",
+            "Subpatcher varname already exists: " + subpatcher_varname,
+            "Choose a unique subpatcher_varname.",
+            true,
+            { subpatcher_varname: subpatcher_varname }
+        );
+        return;
+    }
+
     // 1. Collect objects and validate
     var objects = [];
     var varname_set = {};
 
     for (var i = 0; i < varnames.length; i++) {
         var vn = varnames[i];
-        var obj = current_patcher.getnamed(vn);
+        var obj = parent.getnamed(vn);
         if (!obj) {
             respond_error(
                 request_id,
@@ -2005,12 +2615,13 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
         if (out_cords) {
             for (var j = 0; j < out_cords.length; j++) {
                 var dst_obj = out_cords[j].dstobject;
-                var dst_vn = dst_obj.varname;
-                // Assign varname if missing
-                if (!dst_vn) {
-                    dst_vn = "obj-ext-" + Math.floor(Math.random() * 10000);
-                    dst_obj.varname = dst_vn;
-                }
+                var dst_vn = _ensure_object_varname(
+                    dst_obj,
+                    "enc_ext_dst",
+                    used_varnames,
+                    generated_external_varnames,
+                    "external_destination"
+                );
                 if (varname_set[dst_vn]) {
                     internal_connections.push({
                         src_varname: vn,
@@ -2034,12 +2645,13 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
         if (in_cords) {
             for (var j = 0; j < in_cords.length; j++) {
                 var src_obj = in_cords[j].srcobject;
-                var src_vn = src_obj.varname;
-                // Assign varname if missing
-                if (!src_vn) {
-                    src_vn = "obj-ext-" + Math.floor(Math.random() * 10000);
-                    src_obj.varname = src_vn;
-                }
+                var src_vn = _ensure_object_varname(
+                    src_obj,
+                    "enc_ext_src",
+                    used_varnames,
+                    generated_external_varnames,
+                    "external_source"
+                );
                 if (!varname_set[src_vn]) {
                     external_inputs.push({
                         src_varname: src_vn,
@@ -2107,63 +2719,197 @@ function encapsulate(request_id, varnames, subpatcher_name, subpatcher_varname) 
         });
     }
 
-    // 5. Create subpatcher at top-left of bounding box
-    var sub_obj = current_patcher.newdefault(min_x, min_y, "patcher", subpatcher_name);
-    sub_obj.varname = subpatcher_varname;
-    var subpatch = sub_obj.subpatcher();
+    var sub_obj = null;
+    try {
+        // 5. Create subpatcher at top-left of bounding box
+        var created_subpatch = _create_subpatcher_object(
+            parent,
+            min_x,
+            min_y,
+            subpatcher_name,
+            subpatcher_varname
+        );
+        if (!created_subpatch.success) {
+            throw new Error(created_subpatch.error.message);
+        }
+        sub_obj = created_subpatch.object;
+        var subpatch = created_subpatch.subpatcher;
 
-    // 6. Calculate internal layout
-    var internal_offset_x = 50;
-    var internal_offset_y = 50 + (inlet_list.length > 0 ? 40 : 0);
-    var outlet_y = (max_y - min_y) + internal_offset_y + 50;
+        // 6. Calculate internal layout
+        var internal_offset_x = 50;
+        var internal_offset_y = 50 + (inlet_list.length > 0 ? 40 : 0);
+        var outlet_y = (max_y - min_y) + internal_offset_y + 50;
 
-    // 7. Create inlets at top of subpatcher
-    var inlet_varnames = [];
-    for (var i = 0; i < inlet_list.length; i++) {
-        var inlet_x = 50 + i * 80;
-        var inlet_vn = "_inlet_" + i;
-        var inlet_obj = subpatch.newdefault(inlet_x, 30, "inlet");
-        inlet_obj.varname = inlet_vn;
-        inlet_varnames.push(inlet_vn);
-    }
+        // 7. Create inlets at top of subpatcher
+        var inlet_varnames = [];
+        for (var ii = 0; ii < inlet_list.length; ii++) {
+            var inlet_x = 50 + ii * 80;
+            var inlet_vn = "_inlet_" + ii;
+            var inlet_obj = subpatch.newdefault(inlet_x, 30, "inlet");
+            inlet_obj.varname = inlet_vn;
+            inlet_varnames.push(inlet_vn);
+        }
 
-    // 8. Create outlets at bottom
-    var outlet_varnames = [];
-    for (var i = 0; i < outlet_list.length; i++) {
-        var outlet_x = 50 + i * 80;
-        var outlet_vn = "_outlet_" + i;
-        var outlet_obj = subpatch.newdefault(outlet_x, outlet_y, "outlet");
-        outlet_obj.varname = outlet_vn;
-        outlet_varnames.push(outlet_vn);
-    }
+        // 8. Create outlets at bottom
+        var outlet_varnames = [];
+        for (var oi = 0; oi < outlet_list.length; oi++) {
+            var outlet_x = 50 + oi * 80;
+            var outlet_vn = "_outlet_" + oi;
+            var outlet_obj = subpatch.newdefault(outlet_x, outlet_y, "outlet");
+            outlet_obj.varname = outlet_vn;
+            outlet_varnames.push(outlet_vn);
+        }
 
-    // 9. Recreate objects inside subpatcher
-    // We need boxtext to get the full object specification - route through v8
-    var objects_info = [];
-    for (var i = 0; i < objects.length; i++) {
-        var o = objects[i];
-        objects_info.push({
-            varname: o.varname,
-            maxclass: o.maxclass,
-            rect: o.rect,
-            new_x: (o.rect[0] - min_x) + internal_offset_x,
-            new_y: (o.rect[1] - min_y) + internal_offset_y
+        // 9. Recreate encapsulated objects inside subpatcher
+        var new_varname_map = {};
+        for (var ri = 0; ri < objects.length; ri++) {
+            var src = objects[ri];
+            var orig_obj = src.obj;
+            var boxtext = "";
+            try {
+                boxtext = orig_obj.boxtext || "";
+            } catch (_boxtextErr) {
+                boxtext = "";
+            }
+
+            var obj_type = src.maxclass;
+            if (boxtext && obj_type !== "message" && obj_type !== "comment") {
+                var boxtext_parts = boxtext.split(" ");
+                if (boxtext_parts[0]) {
+                    obj_type = boxtext_parts[0];
+                }
+            }
+            var obj_args = _parse_object_args_from_boxtext(obj_type, boxtext);
+            var new_vn = "_enc_" + src.varname;
+
+            var new_x = (src.rect[0] - min_x) + internal_offset_x;
+            var new_y = (src.rect[1] - min_y) + internal_offset_y;
+            var new_obj;
+            if (FLOAT_SENSITIVE_OBJECTS[obj_type] && obj_args.length > 0) {
+                var formatted_args = [];
+                for (var fa = 0; fa < obj_args.length; fa++) {
+                    formatted_args.push(format_float_arg(obj_args[fa]));
+                }
+                new_obj = subpatch.newdefault(new_x, new_y, obj_type + " " + formatted_args.join(" "));
+            } else {
+                var create_args = [new_x, new_y, obj_type].concat(obj_args);
+                new_obj = subpatch.newdefault.apply(subpatch, create_args);
+            }
+            new_obj.varname = new_vn;
+            new_varname_map[src.varname] = new_vn;
+
+            if (obj_type === "message" || obj_type === "comment") {
+                new_obj.message("set", obj_args);
+            }
+
+            var orig_rect = orig_obj.rect;
+            var orig_width = orig_rect[2] - orig_rect[0];
+            var orig_height = orig_rect[3] - orig_rect[1];
+            var new_rect = new_obj.rect;
+            new_obj.rect = [new_rect[0], new_rect[1], new_rect[0] + orig_width, new_rect[1] + orig_height];
+        }
+
+        // Reconnect internal connections
+        for (var ic = 0; ic < internal_connections.length; ic++) {
+            var conn = internal_connections[ic];
+            var src_obj = subpatch.getnamed(new_varname_map[conn.src_varname]);
+            var dst_obj = subpatch.getnamed(new_varname_map[conn.dst_varname]);
+            if (src_obj && dst_obj) {
+                subpatch.connect(src_obj, conn.src_outlet, dst_obj, conn.dst_inlet);
+            }
+        }
+
+        // Connect inlets to internal objects
+        for (var ilIdx = 0; ilIdx < inlet_list.length; ilIdx++) {
+            var il = inlet_list[ilIdx];
+            var inlet_conn_obj = subpatch.getnamed(inlet_varnames[ilIdx]);
+            var dst_conn_obj = subpatch.getnamed(new_varname_map[il.dst_varname]);
+            if (inlet_conn_obj && dst_conn_obj) {
+                subpatch.connect(inlet_conn_obj, 0, dst_conn_obj, il.dst_inlet);
+            }
+        }
+
+        // Connect internal objects to outlets
+        for (var olIdx = 0; olIdx < outlet_list.length; olIdx++) {
+            var ol = outlet_list[olIdx];
+            var outlet_conn_obj = subpatch.getnamed(outlet_varnames[olIdx]);
+            var src_conn_obj = subpatch.getnamed(new_varname_map[ol.src_varname]);
+            if (src_conn_obj && outlet_conn_obj) {
+                subpatch.connect(src_conn_obj, ol.src_outlet, outlet_conn_obj, 0);
+            }
+        }
+
+        // Connect external sources to subpatcher inlets (parent patcher)
+        var rewired_inputs = 0;
+        for (var il2 = 0; il2 < inlet_list.length; il2++) {
+            var il_row = inlet_list[il2];
+            for (var ie = 0; ie < il_row.external.length; ie++) {
+                var ext_in = il_row.external[ie];
+                var src_ext_obj = parent.getnamed(ext_in.src_varname);
+                if (src_ext_obj) {
+                    parent.connect(src_ext_obj, ext_in.src_outlet, sub_obj, il2);
+                    rewired_inputs += 1;
+                }
+            }
+        }
+
+        // Connect subpatcher outlets to external destinations (parent patcher)
+        var rewired_outputs = 0;
+        for (var ol2 = 0; ol2 < outlet_list.length; ol2++) {
+            var ol_row = outlet_list[ol2];
+            for (var oe = 0; oe < ol_row.external.length; oe++) {
+                var ext_out = ol_row.external[oe];
+                var dst_ext_obj = parent.getnamed(ext_out.dst_varname);
+                if (dst_ext_obj) {
+                    parent.connect(sub_obj, ol2, dst_ext_obj, ext_out.dst_inlet);
+                    rewired_outputs += 1;
+                }
+            }
+        }
+
+        // Remove original objects only after successful rebuild/rewire.
+        for (var rm = 0; rm < objects.length; rm++) {
+            var original = parent.getnamed(objects[rm].varname);
+            if (original) {
+                parent.remove(original);
+            }
+        }
+
+        respond_success(request_id, {
+            success: true,
+            subpatcher_varname: subpatcher_varname,
+            objects_requested: varnames.length,
+            objects_encapsulated: objects.length,
+            inlets_created: inlet_list.length,
+            outlets_created: outlet_list.length,
+            internal_connections: internal_connections.length,
+            connections_rewired: {
+                external_inputs: rewired_inputs,
+                external_outputs: rewired_outputs
+            },
+            varname_remaps: {
+                internal: new_varname_map,
+                external_generated: generated_external_varnames
+            }
         });
+        post("Encapsulated " + objects.length + " objects into " + subpatcher_varname + "\n");
+    } catch (e) {
+        if (sub_obj) {
+            try {
+                parent.remove(sub_obj);
+            } catch (_cleanup_error) {
+                // best effort cleanup
+            }
+        }
+        respond_error(
+            request_id,
+            "INTERNAL_ERROR",
+            "Encapsulate failed: " + e,
+            "No source objects were removed. Retry with a smaller selection if this persists.",
+            true,
+            { subpatcher_varname: subpatcher_varname }
+        );
     }
-
-    // Send to v8 to complete encapsulation with boxtext access
-    var encap_data = {
-        request_id: request_id,
-        subpatcher_varname: subpatcher_varname,
-        objects_info: objects_info,
-        internal_connections: internal_connections,
-        inlet_list: inlet_list,
-        outlet_list: outlet_list,
-        inlet_varnames: inlet_varnames,
-        outlet_varnames: outlet_varnames,
-        varname_set: varname_set
-    };
-    outlet(2, "complete_encapsulate", JSON.stringify(encap_data));
 }
 
 // ========================================

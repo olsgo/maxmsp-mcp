@@ -125,6 +125,18 @@ MAXMCP_WORKSPACE_CAPTURE_RETRIES = int(
 MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS = float(
     os.environ.get("MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS", "0.5")
 )
+MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS = float(
+    os.environ.get("MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS", "25")
+)
+MAXMCP_IMPORT_APPLY_RETRY_COUNT = int(
+    os.environ.get("MAXMCP_IMPORT_APPLY_RETRY_COUNT", "1")
+)
+MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS = float(
+    os.environ.get("MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS", "0.5")
+)
+MAXMCP_IMPORT_APPLY_CHUNK_SIZE = int(
+    os.environ.get("MAXMCP_IMPORT_APPLY_CHUNK_SIZE", "64")
+)
 if MAXMCP_PREFLIGHT_MODE not in {"auto", "manual", "session"}:
     logging.warning(
         "Invalid MAXMCP_PREFLIGHT_MODE '%s'; falling back to 'auto'.",
@@ -442,6 +454,7 @@ def _normalize_legacy_error(message: str, hint: str | None = None) -> dict:
 UNGATED_ACTIONS = {"capabilities", "health_ping", "bridge_ping"}
 MUTATING_BRIDGE_ACTIONS = {
     "add_object",
+    "add_object_with_preflight",
     "remove_object",
     "connect_objects",
     "disconnect_objects",
@@ -460,12 +473,64 @@ MUTATING_BRIDGE_ACTIONS = {
     "encapsulate",
     "set_workspace_target",
     "apply_topology_snapshot",
+    "apply_topology_snapshot_progressive",
+    "export_amxd",
 }
 BULK_BRIDGE_ACTIONS = {
     "get_objects_in_patch",
     "get_objects_in_selected",
     "apply_topology_snapshot",
+    "apply_topology_snapshot_progressive",
 }
+
+
+def _name_match_score(query_lc: str, candidate: str) -> int | None:
+    candidate_lc = candidate.lower()
+    if candidate_lc == query_lc:
+        return 0
+    if candidate_lc.startswith(query_lc):
+        return 1
+    if query_lc in candidate_lc:
+        return 2
+    return None
+
+
+def _docs_suggest(object_name: str, limit: int = 5) -> list[str]:
+    return get_close_matches(object_name, sorted(flattened_docs.keys()), n=limit, cutoff=0.6)
+
+
+def _build_docs_schema_fallback(object_name: str, include_aliases: bool = True) -> dict | None:
+    doc = flattened_docs.get(object_name)
+    if doc is None:
+        return None
+    inlets = doc.get("inlets") if isinstance(doc, dict) else None
+    outlets = doc.get("outlets") if isinstance(doc, dict) else None
+    num_inlets = len(inlets) if isinstance(inlets, list) else None
+    num_outlets = len(outlets) if isinstance(outlets, list) else None
+    return {
+        "query": object_name,
+        "canonical_name": object_name,
+        "resolved_via_alias": False,
+        "package": None,
+        "path": None,
+        "aliases": [] if not include_aliases else [],
+        "summary": {
+            "maxclass": object_name,
+            "numinlets": num_inlets,
+            "numoutlets": num_outlets,
+            "default_text": object_name,
+        },
+        "schema": None,
+        "schema_available": False,
+        "doc_available": True,
+        "source": "docs_fallback",
+        "limitations": [
+            "MaxPyLang schema metadata is unavailable for this object.",
+            "Use get_object_doc for full Max reference details.",
+        ],
+        "doc": doc,
+        "schema_hash": maxpy_catalog.schema_hash if maxpy_catalog.available else "",
+    }
 
 
 class MaxMSPConnection:
@@ -1170,6 +1235,7 @@ class MaxMSPConnection:
                 "enter_subpatcher",
                 "exit_subpatcher",
                 "apply_topology_snapshot",
+                "apply_topology_snapshot_progressive",
             }:
                 self._preflight_epoch += 1
             if idempotency_key:
@@ -1470,8 +1536,8 @@ class MaxRuntimeManager:
         self.session_id = MAXMCP_SESSION_ID
         self.session_dir = self.sessions_root / self.session_id
         self.enforce_patch_roots = MAXMCP_ENFORCE_PATCH_ROOTS
-        self.session_active_patch = self.session_dir / "active.maxpat"
-        self.session_scratch_patch = self.session_dir / "scratch.maxpat"
+        self.session_active_patch = self.session_dir / "active.maxpat"  # legacy path (unused by default)
+        self.session_scratch_patch = self.session_dir / "scratch.maxpat"  # legacy path (unused by default)
         configured_roots = list(MAXMCP_ALLOWED_PATCH_ROOTS)
         if self.enforce_patch_roots and not configured_roots:
             configured_roots = [Path(current_dir).resolve(), self.session_dir.resolve()]
@@ -1482,7 +1548,11 @@ class MaxRuntimeManager:
         self.workspace_scratch_varname = (
             f"{PROTECTED_VARNAME_PREFIX}workspace_scratch_{self.session_id}"
         )
-        self.active_target = "active"
+        self.active_target = "host"
+        self.active_project_id: str | None = None
+        self.active_workspace_id: str | None = None
+        self.projects: dict[str, dict] = {}
+        self._workspace_lock = asyncio.Lock()
         self.checkpoints: OrderedDict[str, dict] = OrderedDict()
         self.checkpoints_file = self.session_dir / "checkpoints.json"
         self.max_checkpoints = MAXMCP_CHECKPOINT_MAX
@@ -1511,6 +1581,16 @@ class MaxRuntimeManager:
             0.0,
             float(MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS),
         )
+        self.import_apply_timeout_seconds = max(
+            1.0,
+            float(MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS),
+        )
+        self.import_apply_retry_count = max(0, int(MAXMCP_IMPORT_APPLY_RETRY_COUNT))
+        self.import_apply_retry_backoff_seconds = max(
+            0.0,
+            float(MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS),
+        )
+        self.import_apply_chunk_size = max(1, int(MAXMCP_IMPORT_APPLY_CHUNK_SIZE))
 
     @staticmethod
     def _canonical_topology(topology: dict) -> dict:
@@ -1756,9 +1836,9 @@ class MaxRuntimeManager:
             "code": ERROR_PRECONDITION,
             "error": (
                 f"{operation} is blocked while target='host'. "
-                "Switch to 'active' or 'scratch' before mutating topology."
+                "Select a project workspace before mutating topology."
             ),
-            "hint": "Use set_patch_target(target='active') or set_patch_target(target='scratch').",
+            "hint": "Use select_workspace(project_id=..., workspace_id=...).",
             "target": self.active_target,
         }
 
@@ -1845,6 +1925,222 @@ class MaxRuntimeManager:
                 },
             },
         }
+
+    def _bridge_action_supported(self, action: str) -> bool | None:
+        capabilities = getattr(self.maxmsp, "capabilities", {})
+        supported = capabilities.get("supported_actions") if isinstance(capabilities, dict) else None
+        if not isinstance(supported, list) or not supported:
+            return None
+        return action in supported
+
+    @staticmethod
+    def _normalize_apply_mode(mode: str) -> str:
+        normalized = (mode or "auto").strip().lower()
+        if normalized not in {"auto", "single", "progressive"}:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                "apply_mode must be one of: auto, single, progressive.",
+                recoverable=True,
+                details={"apply_mode": mode},
+            )
+        return normalized
+
+    @staticmethod
+    def _is_retryable_import_error(error: MaxMCPError) -> bool:
+        return error.code in {ERROR_BRIDGE_TIMEOUT, ERROR_OVERLOADED}
+
+    async def _apply_topology_snapshot_progressive(
+        self,
+        topology: dict,
+        *,
+        timeout_seconds: float,
+        chunk_size: int,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        safe_chunk_size = max(1, int(chunk_size))
+        box_count = len(topology.get("boxes", [])) if isinstance(topology, dict) else 0
+        line_count = len(topology.get("lines", [])) if isinstance(topology, dict) else 0
+        total_ops = box_count + line_count
+        max_chunks = max(8, int(math.ceil((max(1, total_ops)) / float(safe_chunk_size))) + 16)
+
+        state: dict | None = None
+        for chunk_idx in range(1, max_chunks + 1):
+            payload: dict[str, Any] = {
+                "action": "apply_topology_snapshot_progressive",
+                "snapshot": topology,
+                "chunk_size": safe_chunk_size,
+            }
+            if state is not None:
+                payload["state"] = state
+
+            chunk_idempotency = None
+            if idempotency_key:
+                chunk_idempotency = f"{idempotency_key}:chunk{chunk_idx}"
+
+            response = await self.maxmsp.send_request(
+                payload,
+                timeout=timeout_seconds,
+                idempotency_key=chunk_idempotency,
+            )
+            if not isinstance(response, dict):
+                raise MaxMCPError(
+                    ERROR_INTERNAL,
+                    "Progressive topology apply returned a non-dict payload.",
+                    recoverable=True,
+                    details={"payload_type": str(type(response))},
+                )
+
+            done = bool(response.get("done"))
+            if done:
+                final = dict(response)
+                final.setdefault("chunks_processed", chunk_idx)
+                final.setdefault("apply_mode", "progressive")
+                final.setdefault("chunk_size", safe_chunk_size)
+                return final
+
+            state_raw = response.get("state")
+            if not isinstance(state_raw, dict):
+                raise MaxMCPError(
+                    ERROR_INTERNAL,
+                    "Progressive topology apply response is missing continuation state.",
+                    recoverable=True,
+                    details={"chunk_index": chunk_idx},
+                )
+            state = state_raw
+
+        raise MaxMCPError(
+            ERROR_BRIDGE_TIMEOUT,
+            "Progressive topology apply exceeded chunk iteration limit.",
+            hint="Increase apply_chunk_size or apply_timeout_seconds and retry.",
+            recoverable=True,
+            details={
+                "total_operations": total_ops,
+                "chunk_size": safe_chunk_size,
+                "max_chunks": max_chunks,
+            },
+        )
+
+    async def _apply_topology_with_retries(
+        self,
+        topology: dict,
+        *,
+        requested_apply_mode: str,
+        timeout_seconds: float,
+        chunk_size: int,
+        retry_count: int,
+        retry_backoff_seconds: float,
+        idempotency_key: str = "",
+    ) -> tuple[dict, dict]:
+        progressive_support = self._bridge_action_supported("apply_topology_snapshot_progressive")
+        if requested_apply_mode == "progressive":
+            if progressive_support is False:
+                raise MaxMCPError(
+                    ERROR_PRECONDITION,
+                    "Bridge does not advertise apply_topology_snapshot_progressive.",
+                    hint="Use apply_mode='single' or upgrade bridge capabilities.",
+                    recoverable=False,
+                    details={"apply_mode": requested_apply_mode},
+                )
+            selected_mode = "progressive"
+        elif requested_apply_mode == "auto":
+            selected_mode = "progressive" if progressive_support else "single"
+        else:
+            selected_mode = "single"
+
+        safe_timeout = max(1.0, float(timeout_seconds))
+        safe_retry_count = max(0, int(retry_count))
+        safe_backoff = max(0.0, float(retry_backoff_seconds))
+        safe_chunk_size = max(1, int(chunk_size))
+        max_attempts = 1 + safe_retry_count
+        attempts: list[dict] = []
+
+        for attempt in range(1, max_attempts + 1):
+            attempt_idempotency = ""
+            if idempotency_key:
+                if attempt == 1:
+                    attempt_idempotency = idempotency_key
+                else:
+                    attempt_idempotency = f"{idempotency_key}:retry{attempt}"
+
+            try:
+                if selected_mode == "progressive":
+                    result = await self._apply_topology_snapshot_progressive(
+                        topology,
+                        timeout_seconds=safe_timeout,
+                        chunk_size=safe_chunk_size,
+                        idempotency_key=attempt_idempotency or None,
+                    )
+                else:
+                    result = await self.maxmsp.send_request(
+                        {"action": "apply_topology_snapshot", "snapshot": topology},
+                        timeout=safe_timeout,
+                        idempotency_key=attempt_idempotency or None,
+                    )
+
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result.setdefault("apply_mode", selected_mode)
+                    result["attempt"] = attempt
+                    result["attempts_total"] = max_attempts
+
+                return result, {
+                    "requested_mode": requested_apply_mode,
+                    "selected_mode": selected_mode,
+                    "progressive_supported": progressive_support,
+                    "attempts_failed": attempts,
+                    "attempts_total": max_attempts,
+                    "timeout_seconds": safe_timeout,
+                    "chunk_size": safe_chunk_size,
+                    "retry_count": safe_retry_count,
+                    "retry_backoff_seconds": safe_backoff,
+                }
+            except Exception as raw_error:
+                if isinstance(raw_error, MaxMCPError):
+                    err = raw_error
+                else:
+                    err = MaxMCPError(
+                        ERROR_INTERNAL,
+                        str(raw_error),
+                        recoverable=True,
+                        details={},
+                    )
+
+                retryable = self._is_retryable_import_error(err)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "code": err.code,
+                        "message": err.message,
+                        "recoverable": err.recoverable,
+                        "retryable": retryable,
+                    }
+                )
+
+                if attempt >= max_attempts or not retryable:
+                    merged_details = dict(err.details or {})
+                    merged_details.update(
+                        {
+                            "requested_mode": requested_apply_mode,
+                            "selected_mode": selected_mode,
+                            "progressive_supported": progressive_support,
+                            "attempts_failed": attempts,
+                            "attempts_total": max_attempts,
+                            "timeout_seconds": safe_timeout,
+                            "chunk_size": safe_chunk_size,
+                            "retry_count": safe_retry_count,
+                            "retry_backoff_seconds": safe_backoff,
+                        }
+                    )
+                    raise MaxMCPError(
+                        err.code,
+                        err.message,
+                        hint=err.hint,
+                        recoverable=err.recoverable,
+                        details=merged_details,
+                    ) from raw_error
+
+                if safe_backoff > 0.0:
+                    await asyncio.sleep(safe_backoff * attempt)
 
     def _checkpoint_entry_summary(self, entry: dict) -> dict:
         return {
@@ -1934,7 +2230,7 @@ class MaxRuntimeManager:
             return _error_result(
                 ERROR_PRECONDITION,
                 "create_checkpoint is blocked while target='host'.",
-                hint="Switch to 'active' or 'scratch' before creating checkpoints.",
+                hint="Select a project workspace before creating checkpoints.",
                 recoverable=False,
                 details={"target": self.active_target},
             )
@@ -2025,7 +2321,7 @@ class MaxRuntimeManager:
             return _error_result(
                 ERROR_PRECONDITION,
                 "restore_checkpoint is blocked while target='host'.",
-                hint="Switch to 'active' or 'scratch' before restoring checkpoints.",
+                hint="Select a project workspace before restoring checkpoints.",
                 recoverable=False,
                 details={"target": self.active_target, "checkpoint_id": checkpoint_id},
             )
@@ -2075,6 +2371,7 @@ class MaxRuntimeManager:
     async def after_successful_action(self, action: str, payload: dict, results: Any) -> None:
         topology_mutations = {
             "add_object",
+            "add_object_with_preflight",
             "remove_object",
             "connect_objects",
             "disconnect_objects",
@@ -2084,26 +2381,11 @@ class MaxRuntimeManager:
             "move_object",
             "encapsulate",
             "apply_topology_snapshot",
+            "apply_topology_snapshot_progressive",
             "set_workspace_target",
-        }
-        workspace_persist_actions = (topology_mutations - {"set_workspace_target"}) | {
-            "set_object_attribute",
-            "set_message_text",
-            "send_message_to_object",
-            "set_number",
-            "send_bang_to_object",
-            "autofit_existing",
         }
         if action in topology_mutations and self.twin_auto_sync:
             await self.sync_patch_twin(reason=f"mutation:{action}")
-        if action in workspace_persist_actions and self.active_target in {"active", "scratch"}:
-            persist_result = await self.persist_workspace_target(reason=f"mutation:{action}")
-            if not persist_result.get("persisted"):
-                logging.debug(
-                    "Workspace persistence skipped after action '%s': %s",
-                    action,
-                    persist_result,
-                )
 
     def _resolve_host_patch(self) -> Path | None:
         if self.host_patch_path.exists():
@@ -2162,6 +2444,314 @@ class MaxRuntimeManager:
             "active_patch_path": str(self.session_active_patch),
             "scratch_patch_path": str(self.session_scratch_patch),
         }
+
+    @staticmethod
+    def _normalize_scope_identifier(raw: str, *, field_name: str) -> str:
+        value = str(raw or "").strip().lower()
+        if not value:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"{field_name} must be a non-empty string.",
+                recoverable=True,
+            )
+        normalized = "".join(ch if ch.isalnum() else "_" for ch in value).strip("_")
+        if not normalized:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"{field_name} must contain at least one alphanumeric character.",
+                recoverable=True,
+            )
+        return normalized[:64]
+
+    @staticmethod
+    def _workspace_target_id(project_id: str, workspace_id: str) -> str:
+        return f"{project_id}:{workspace_id}"
+
+    def _workspace_varname_for_scope(self, project_id: str, workspace_id: str) -> str:
+        base = f"{PROTECTED_VARNAME_PREFIX}ws_{project_id}_{workspace_id}"
+        if len(base) <= 96:
+            return base
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
+        trimmed = base[:84].rstrip("_")
+        return f"{trimmed}_{digest}"
+
+    @staticmethod
+    def _workspace_display_name_for_scope(project_id: str, workspace_id: str) -> str:
+        return f"mcp_{project_id}_{workspace_id}"
+
+    def _project_summary(self, project: dict) -> dict:
+        workspaces = project.get("workspaces", {})
+        return {
+            "project_id": project.get("project_id"),
+            "display_name": project.get("display_name"),
+            "workspace_count": len(workspaces) if isinstance(workspaces, dict) else 0,
+            "workspace_ids": sorted(workspaces.keys()) if isinstance(workspaces, dict) else [],
+            "active_workspace_id": (
+                self.active_workspace_id
+                if self.active_project_id == project.get("project_id")
+                else None
+            ),
+            "created_at": project.get("created_at"),
+            "updated_at": project.get("updated_at"),
+        }
+
+    def _get_or_create_project_context(
+        self,
+        project_id: str,
+        *,
+        create: bool,
+        display_name: str = "",
+    ) -> dict | None:
+        existing = self.projects.get(project_id)
+        if existing is not None:
+            return existing
+        if not create:
+            return None
+        now = time.time()
+        project = {
+            "project_id": project_id,
+            "display_name": display_name.strip() or project_id,
+            "created_at": now,
+            "updated_at": now,
+            "workspaces": {},
+        }
+        self.projects[project_id] = project
+        return project
+
+    def register_project(
+        self,
+        *,
+        project_id: str,
+        display_name: str = "",
+        create_default_workspace: bool = True,
+        default_workspace_id: str = "main",
+    ) -> dict:
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        project = self._get_or_create_project_context(
+            pid,
+            create=True,
+            display_name=display_name,
+        )
+        if create_default_workspace:
+            self.create_workspace(
+                project_id=pid,
+                workspace_id=default_workspace_id,
+            )
+        return {"success": True, "project": self._project_summary(project)}
+
+    def list_projects(self) -> list[dict]:
+        rows = [self._project_summary(project) for project in self.projects.values()]
+        rows.sort(key=lambda row: str(row.get("project_id") or ""))
+        return rows
+
+    def list_workspaces(self, *, project_id: str) -> dict:
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        project = self.projects.get(pid)
+        if project is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Unknown project_id '{pid}'.",
+                    "recoverable": True,
+                },
+            }
+        rows = []
+        workspaces = project.get("workspaces", {})
+        if isinstance(workspaces, dict):
+            for workspace_id, entry in workspaces.items():
+                if not isinstance(entry, dict):
+                    continue
+                rows.append(
+                    {
+                        "workspace_id": workspace_id,
+                        "display_name": entry.get("display_name"),
+                        "workspace_varname": entry.get("workspace_varname"),
+                        "created_at": entry.get("created_at"),
+                        "updated_at": entry.get("updated_at"),
+                        "last_topology_hash": entry.get("last_topology_hash"),
+                        "persist_path": entry.get("persist_path"),
+                        "selected": (
+                            self.active_project_id == pid
+                            and self.active_workspace_id == workspace_id
+                        ),
+                    }
+                )
+        rows.sort(key=lambda row: str(row.get("workspace_id") or ""))
+        return {"success": True, "project_id": pid, "workspaces": rows}
+
+    def create_workspace(
+        self,
+        *,
+        project_id: str,
+        workspace_id: str,
+        display_name: str = "",
+    ) -> dict:
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        wid = self._normalize_scope_identifier(workspace_id, field_name="workspace_id")
+        project = self._get_or_create_project_context(pid, create=True)
+        assert project is not None  # create=True guarantees non-None
+        workspaces = project.setdefault("workspaces", {})
+        now = time.time()
+        created = wid not in workspaces
+        if created:
+            workspaces[wid] = {
+                "workspace_id": wid,
+                "display_name": display_name.strip() or wid,
+                "workspace_varname": self._workspace_varname_for_scope(pid, wid),
+                "created_at": now,
+                "updated_at": now,
+                "last_topology_hash": None,
+                "persist_path": None,
+            }
+        else:
+            entry = workspaces[wid]
+            if display_name.strip():
+                entry["display_name"] = display_name.strip()
+            entry["updated_at"] = now
+        project["updated_at"] = now
+        return {
+            "success": True,
+            "created": created,
+            "project_id": pid,
+            "workspace_id": wid,
+            "workspace": workspaces[wid],
+        }
+
+    async def delete_workspace(
+        self,
+        *,
+        project_id: str,
+        workspace_id: str,
+        force: bool = False,
+    ) -> dict:
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        wid = self._normalize_scope_identifier(workspace_id, field_name="workspace_id")
+        project = self.projects.get(pid)
+        if project is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Unknown project_id '{pid}'.",
+                    "recoverable": True,
+                },
+            }
+        workspaces = project.get("workspaces", {})
+        if wid not in workspaces:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Unknown workspace_id '{wid}' in project '{pid}'.",
+                    "recoverable": True,
+                },
+            }
+        if (
+            not force
+            and self.active_project_id == pid
+            and self.active_workspace_id == wid
+        ):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Cannot delete currently selected workspace without force=True.",
+                    "recoverable": True,
+                },
+            }
+
+        removed = workspaces.pop(wid)
+        project["updated_at"] = time.time()
+        deselected = False
+        if self.active_project_id == pid and self.active_workspace_id == wid:
+            self.active_project_id = None
+            self.active_workspace_id = None
+            self.active_target = "host"
+            deselected = True
+            if self.maxmsp.sio.connected:
+                try:
+                    await self.maxmsp.send_request(
+                        {"action": "set_workspace_target", "target_id": "host"},
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
+        return {
+            "success": True,
+            "project_id": pid,
+            "workspace_id": wid,
+            "removed": removed,
+            "deselected": deselected,
+        }
+
+    async def activate_workspace(
+        self,
+        *,
+        project_id: str,
+        workspace_id: str,
+        create_if_missing: bool = True,
+    ) -> dict:
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        wid = self._normalize_scope_identifier(workspace_id, field_name="workspace_id")
+        project = self._get_or_create_project_context(pid, create=create_if_missing)
+        if project is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Unknown project_id '{pid}'.",
+                    "recoverable": True,
+                },
+            }
+        created_workspace = self.create_workspace(
+            project_id=pid,
+            workspace_id=wid,
+        ) if create_if_missing else None
+        workspaces = project.get("workspaces", {})
+        workspace = workspaces.get(wid) if isinstance(workspaces, dict) else None
+        if workspace is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Unknown workspace_id '{wid}' in project '{pid}'.",
+                    "recoverable": True,
+                },
+            }
+        target_id = self._workspace_target_id(pid, wid)
+        workspace_varname = str(workspace.get("workspace_varname") or "")
+        workspace_name = str(workspace.get("display_name") or wid)
+        async with self._workspace_lock:
+            if not self.maxmsp.sio.connected:
+                await self.maxmsp.ensure_connected()
+            bridge_result = await self.maxmsp.send_request(
+                {
+                    "action": "set_workspace_target",
+                    "target_id": target_id,
+                    "workspace_varname": workspace_varname,
+                    "workspace_name": workspace_name,
+                },
+                timeout=3.0,
+            )
+            self.active_target = target_id
+            self.active_project_id = pid
+            self.active_workspace_id = wid
+            workspace["updated_at"] = time.time()
+            project["updated_at"] = time.time()
+            return {
+                "success": True,
+                "project_id": pid,
+                "workspace_id": wid,
+                "target_id": target_id,
+                "workspace_varname": workspace_varname,
+                "created_workspace": (
+                    created_workspace.get("created")
+                    if isinstance(created_workspace, dict)
+                    else False
+                ),
+                "bridge_result": bridge_result,
+            }
 
     def _workspace_path_for_target(self, target: str) -> Path | None:
         if target == "active":
@@ -2233,6 +2823,141 @@ class MaxRuntimeManager:
             )
         self._validate_patch_path_policy(resolved, purpose="patch_read")
         return resolved
+
+    def _resolve_amxd_source_path(self, path: str) -> Path:
+        raw = (path or "").strip()
+        if not raw:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                "AMXD path must be a non-empty string.",
+                recoverable=False,
+            )
+        resolved = Path(raw).expanduser()
+        if not resolved.is_absolute():
+            resolved = (Path.cwd() / resolved).resolve()
+        else:
+            resolved = resolved.resolve()
+        if not resolved.exists() or not resolved.is_file():
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"AMXD path does not exist: {resolved}",
+                recoverable=True,
+            )
+        if resolved.suffix.lower() != ".amxd":
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"Unsupported AMXD extension '{resolved.suffix}'. Expected .amxd.",
+                recoverable=True,
+            )
+        self._validate_patch_path_policy(resolved, purpose="patch_read")
+        return resolved
+
+    def _resolve_amxd_destination_path(self, path: str) -> Path:
+        raw = (path or "").strip()
+        if not raw:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                "AMXD destination path must be a non-empty string.",
+                recoverable=False,
+            )
+        destination = Path(raw).expanduser()
+        if not destination.is_absolute():
+            destination = (Path.cwd() / destination).resolve()
+        else:
+            destination = destination.resolve()
+        if destination.suffix.lower() != ".amxd":
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"Unsupported destination extension '{destination.suffix}'. Expected .amxd.",
+                recoverable=True,
+            )
+        if destination.exists() and destination.is_dir():
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"Destination is a directory: {destination}",
+                recoverable=True,
+            )
+        self._validate_patch_path_policy(destination, purpose="patch_write")
+        return destination
+
+    @staticmethod
+    def _validate_amxd_file_sync(path: Path) -> dict:
+        data = path.read_bytes()
+        if len(data) < 24:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"AMXD file too small to be valid: {path}",
+                recoverable=True,
+                details={"size_bytes": len(data)},
+            )
+        if data[0:4] != b"ampf":
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                f"AMXD magic mismatch for {path}.",
+                recoverable=True,
+                details={"magic_hex": data[0:4].hex()},
+            )
+
+        version = int.from_bytes(data[4:8], byteorder="little", signed=False)
+        container_tag = data[8:12].decode("ascii", errors="replace")
+        offset = 12
+        chunks: list[dict[str, Any]] = []
+        while offset + 8 <= len(data):
+            chunk_id = data[offset : offset + 4].decode("ascii", errors="replace")
+            chunk_size = int.from_bytes(data[offset + 4 : offset + 8], byteorder="little", signed=False)
+            data_offset = offset + 8
+            chunk_end = data_offset + chunk_size
+            if chunk_end > len(data):
+                raise MaxMCPError(
+                    ERROR_VALIDATION,
+                    f"AMXD chunk '{chunk_id}' overflows file bounds.",
+                    recoverable=True,
+                    details={
+                        "chunk_id": chunk_id,
+                        "chunk_size": chunk_size,
+                        "offset": offset,
+                        "file_size": len(data),
+                    },
+                )
+            chunks.append(
+                {
+                    "id": chunk_id,
+                    "size": chunk_size,
+                    "offset": data_offset,
+                }
+            )
+            offset = chunk_end
+
+        if offset != len(data):
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                "AMXD chunk parsing ended before file end.",
+                recoverable=True,
+                details={"parsed_offset": offset, "file_size": len(data)},
+            )
+
+        chunk_ids = [chunk["id"] for chunk in chunks]
+        if "meta" not in chunk_ids or "ptch" not in chunk_ids:
+            raise MaxMCPError(
+                ERROR_VALIDATION,
+                "AMXD file is missing required meta/ptch chunks.",
+                recoverable=True,
+                details={"chunk_ids": chunk_ids},
+            )
+
+        ptch_chunk = next(chunk for chunk in chunks if chunk["id"] == "ptch")
+        ptch_header = data[ptch_chunk["offset"] : ptch_chunk["offset"] + min(4, ptch_chunk["size"])]
+        return {
+            "path": str(path),
+            "size_bytes": len(data),
+            "magic": "ampf",
+            "version": version,
+            "container_tag": container_tag,
+            "chunk_count": len(chunks),
+            "chunk_ids": chunk_ids,
+            "ptch_prefix_hex": ptch_header.hex(),
+            "ptch_size": ptch_chunk["size"],
+        }
 
     @staticmethod
     def _extract_topology_with_format(payload: Any) -> tuple[str, dict] | None:
@@ -2722,6 +3447,622 @@ class MaxRuntimeManager:
             "warnings": warnings,
         }
 
+    async def import_patch(
+        self,
+        *,
+        path: str,
+        project_id: str,
+        workspace_id: str,
+        mode: str = "replace",
+        auto_rename_collisions: bool = True,
+        create_checkpoint_before_load: bool = True,
+        checkpoint_label: str = "pre_import",
+        apply_timeout_seconds: float | None = None,
+        apply_chunk_size: int | None = None,
+        apply_mode: str = "auto",
+        apply_retry_count: int | None = None,
+        apply_retry_backoff_seconds: float | None = None,
+        idempotency_key: str = "",
+    ) -> dict:
+        mode_normalized = mode.strip().lower()
+        if mode_normalized not in {"replace", "merge", "fail_if_not_empty"}:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "mode must be one of: replace, merge, fail_if_not_empty.",
+                    "recoverable": True,
+                    "details": {"mode": mode},
+                },
+            }
+        try:
+            requested_apply_mode = self._normalize_apply_mode(apply_mode)
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+
+        try:
+            safe_apply_timeout = (
+                self.import_apply_timeout_seconds
+                if apply_timeout_seconds is None
+                else float(apply_timeout_seconds)
+            )
+            safe_apply_chunk_size = (
+                self.import_apply_chunk_size
+                if apply_chunk_size is None
+                else int(apply_chunk_size)
+            )
+            safe_apply_retry_count = (
+                self.import_apply_retry_count
+                if apply_retry_count is None
+                else int(apply_retry_count)
+            )
+            safe_apply_retry_backoff = (
+                self.import_apply_retry_backoff_seconds
+                if apply_retry_backoff_seconds is None
+                else float(apply_retry_backoff_seconds)
+            )
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        "apply_* parameters must be numeric: timeout_seconds(float), "
+                        "chunk_size(int), retry_count(int), retry_backoff_seconds(float)."
+                    ),
+                    "recoverable": True,
+                    "details": {
+                        "apply_timeout_seconds": apply_timeout_seconds,
+                        "apply_chunk_size": apply_chunk_size,
+                        "apply_retry_count": apply_retry_count,
+                        "apply_retry_backoff_seconds": apply_retry_backoff_seconds,
+                    },
+                },
+            }
+        if safe_apply_timeout < 1.0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_timeout_seconds must be >= 1.0.",
+                    "recoverable": True,
+                    "details": {"apply_timeout_seconds": apply_timeout_seconds},
+                },
+            }
+        if safe_apply_chunk_size < 1:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_chunk_size must be >= 1.",
+                    "recoverable": True,
+                    "details": {"apply_chunk_size": apply_chunk_size},
+                },
+            }
+        if safe_apply_retry_count < 0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_retry_count must be >= 0.",
+                    "recoverable": True,
+                    "details": {"apply_retry_count": apply_retry_count},
+                },
+            }
+        if safe_apply_retry_backoff < 0.0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_retry_backoff_seconds must be >= 0.0.",
+                    "recoverable": True,
+                    "details": {"apply_retry_backoff_seconds": apply_retry_backoff_seconds},
+                },
+            }
+        try:
+            readiness = await self.ensure_runtime_ready()
+        except Exception as e:
+            return self._operation_error(
+                operation="import_patch",
+                action="ensure_runtime_ready",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "mode": mode_normalized},
+            )
+        if not readiness.get("ready"):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_BRIDGE_UNAVAILABLE,
+                    "message": readiness.get("error", "Bridge runtime is not ready."),
+                    "recoverable": True,
+                    "details": readiness,
+                },
+            }
+        required_actions = {"set_workspace_target", "get_objects_in_patch"}
+        if requested_apply_mode == "progressive":
+            required_actions.add("apply_topology_snapshot_progressive")
+        else:
+            required_actions.add("apply_topology_snapshot")
+        capability_error = self._check_required_capabilities(
+            required_actions=required_actions,
+            operation="import_patch",
+        )
+        if capability_error:
+            return capability_error
+
+        try:
+            switch_result = await self.activate_workspace(
+                project_id=project_id,
+                workspace_id=workspace_id,
+                create_if_missing=True,
+            )
+        except Exception as e:
+            return self._operation_error(
+                operation="import_patch",
+                action="set_workspace_target",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "mode": mode_normalized},
+            )
+        if not switch_result.get("success"):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Failed to select workspace before import.",
+                    "recoverable": False,
+                    "details": switch_result,
+                },
+            }
+        try:
+            resolved_path = self._resolve_patch_path(path)
+            source_payload = await asyncio.to_thread(self._load_patch_topology_sync, resolved_path)
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_INTERNAL,
+                    "message": str(e),
+                    "recoverable": True,
+                    "details": {"path": path},
+                },
+            }
+
+        source_topology = source_payload["topology"]
+        try:
+            existing_topology = await self._capture_live_topology()
+        except Exception as e:
+            return self._operation_error(
+                operation="import_patch",
+                action="get_objects_in_patch",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "mode": mode_normalized},
+            )
+        if mode_normalized == "fail_if_not_empty" and not self._is_topology_empty(existing_topology):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Target workspace is not empty.",
+                    "hint": "Use mode='replace' or clear workspace first.",
+                    "recoverable": False,
+                    "details": {
+                        "project_id": project_id,
+                        "workspace_id": workspace_id,
+                        "object_count": len(existing_topology.get("boxes", [])),
+                        "connection_count": len(existing_topology.get("lines", [])),
+                    },
+                },
+            }
+
+        reserved = self._topology_varnames(existing_topology) if mode_normalized == "merge" else set()
+        try:
+            normalized_source = self._normalize_import_topology(
+                source_topology,
+                reserved_varnames=reserved,
+                auto_rename_collisions=auto_rename_collisions,
+            )
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_INTERNAL,
+                    "message": str(e),
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+        incoming_topology = normalized_source["topology"]
+        final_topology = (
+            self._merge_topologies(existing_topology, incoming_topology)
+            if mode_normalized == "merge"
+            else incoming_topology
+        )
+        checkpoint_result = None
+        if create_checkpoint_before_load:
+            checkpoint_result = await self.create_checkpoint(label=checkpoint_label or "pre_import")
+            if not checkpoint_result.get("success"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": ERROR_PRECONDITION,
+                        "message": "Failed to create pre-import checkpoint.",
+                        "recoverable": False,
+                        "details": checkpoint_result,
+                    },
+                }
+        apply_meta = {}
+        try:
+            apply_result, apply_meta = await self._apply_topology_with_retries(
+                final_topology,
+                requested_apply_mode=requested_apply_mode,
+                timeout_seconds=safe_apply_timeout,
+                chunk_size=safe_apply_chunk_size,
+                retry_count=safe_apply_retry_count,
+                retry_backoff_seconds=safe_apply_retry_backoff,
+                idempotency_key=idempotency_key,
+            )
+        except Exception as e:
+            selected_mode = None
+            if isinstance(e, MaxMCPError) and isinstance(e.details, dict):
+                selected_mode = e.details.get("selected_mode")
+            apply_action = (
+                "apply_topology_snapshot_progressive"
+                if selected_mode == "progressive"
+                else "apply_topology_snapshot"
+            )
+            return self._operation_error(
+                operation="import_patch",
+                action=apply_action,
+                error=e,
+                details={
+                    "project_id": project_id,
+                    "workspace_id": workspace_id,
+                    "mode": mode_normalized,
+                    "apply_mode": requested_apply_mode,
+                    "apply_timeout_seconds": safe_apply_timeout,
+                    "apply_chunk_size": safe_apply_chunk_size,
+                    "apply_retry_count": safe_apply_retry_count,
+                    "apply_retry_backoff_seconds": safe_apply_retry_backoff,
+                },
+            )
+
+        twin_sync = await self.sync_patch_twin(reason=f"import_patch:{mode_normalized}")
+        post_import_drift = await self.check_patch_drift(auto_resync=False)
+        final_hash, final_objects, final_connections = self._topology_hash(final_topology)
+
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        wid = self._normalize_scope_identifier(workspace_id, field_name="workspace_id")
+        project = self.projects.get(pid, {})
+        workspaces = project.get("workspaces", {}) if isinstance(project, dict) else {}
+        workspace = workspaces.get(wid) if isinstance(workspaces, dict) else None
+        if isinstance(workspace, dict):
+            workspace["last_topology_hash"] = final_hash
+            workspace["updated_at"] = time.time()
+
+        return {
+            "success": True,
+            "source_path": str(resolved_path),
+            "project_id": pid,
+            "workspace_id": wid,
+            "mode": mode_normalized,
+            "switch_result": switch_result,
+            "checkpoint": checkpoint_result,
+            "apply_result": apply_result,
+            "apply_meta": apply_meta,
+            "twin_sync": twin_sync,
+            "post_import_drift": post_import_drift,
+            "import_summary": {
+                "detected_format": source_payload["format"],
+                "source_hash": source_payload["hash"],
+                "final_hash": final_hash,
+                "objects_in_source": source_payload["object_count"],
+                "lines_in_source": source_payload["connection_count"],
+                "objects_loaded": (
+                    apply_result.get("restored_boxes")
+                    if isinstance(apply_result, dict)
+                    else final_objects
+                ),
+                "lines_loaded": (
+                    apply_result.get("restored_lines")
+                    if isinstance(apply_result, dict)
+                    else final_connections
+                ),
+                "skipped_objects": (
+                    apply_result.get("skipped_boxes", 0)
+                    if isinstance(apply_result, dict)
+                    else 0
+                ),
+                "skipped_lines": (
+                    normalized_source.get("skipped_lines", 0)
+                    + (apply_result.get("skipped_lines", 0) if isinstance(apply_result, dict) else 0)
+                ),
+                "collisions_count": normalized_source.get("collisions_count", 0),
+                "varname_remap": normalized_source.get("varname_remap", {}),
+                "generated_varnames": normalized_source.get("generated_varnames", 0),
+                "line_ref_map_size": normalized_source.get("line_ref_map_size", 0),
+                "line_ref_id_mappings": normalized_source.get("line_ref_id_mappings", 0),
+                "apply_mode_requested": requested_apply_mode,
+                "apply_mode_selected": (
+                    apply_meta.get("selected_mode")
+                    if isinstance(apply_meta, dict)
+                    else requested_apply_mode
+                ),
+                "apply_attempts_total": (
+                    apply_meta.get("attempts_total")
+                    if isinstance(apply_meta, dict)
+                    else 1
+                ),
+            },
+        }
+
+    async def export_workspace(
+        self,
+        *,
+        path: str,
+        project_id: str,
+        workspace_id: str,
+        overwrite: bool = False,
+    ) -> dict:
+        destination_raw = (path or "").strip()
+        if not destination_raw:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "path must be a non-empty string.",
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+        destination = Path(destination_raw).expanduser()
+        if not destination.is_absolute():
+            destination = (Path.cwd() / destination).resolve()
+        else:
+            destination = destination.resolve()
+        if destination.exists() and destination.is_dir():
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": f"Destination is a directory: {destination}",
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+        if destination.exists() and not overwrite:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": f"Destination already exists: {destination}",
+                    "hint": "Set overwrite=True to replace existing file.",
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+        if destination.suffix.lower() not in {".maxpat", ".json"}:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        f"Unsupported destination extension '{destination.suffix}'. "
+                        "Expected .maxpat or .json."
+                    ),
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+        try:
+            self._validate_patch_path_policy(destination, purpose="patch_write")
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+        try:
+            readiness = await self.ensure_runtime_ready()
+        except Exception as e:
+            return self._operation_error(
+                operation="export_workspace",
+                action="ensure_runtime_ready",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "path": str(destination)},
+            )
+        if not readiness.get("ready"):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_BRIDGE_UNAVAILABLE,
+                    "message": readiness.get("error", "Bridge runtime is not ready."),
+                    "recoverable": True,
+                    "details": readiness,
+                },
+            }
+        capability_error = self._check_required_capabilities(
+            required_actions={"set_workspace_target", "get_objects_in_patch"},
+            operation="export_workspace",
+        )
+        if capability_error:
+            return capability_error
+        try:
+            switch_result = await self.activate_workspace(
+                project_id=project_id,
+                workspace_id=workspace_id,
+                create_if_missing=False,
+            )
+        except Exception as e:
+            return self._operation_error(
+                operation="export_workspace",
+                action="set_workspace_target",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "path": str(destination)},
+            )
+        if not switch_result.get("success"):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Failed to select workspace before export.",
+                    "recoverable": False,
+                    "details": switch_result,
+                },
+            }
+        try:
+            topology = await self._capture_live_topology()
+        except Exception as e:
+            return self._operation_error(
+                operation="export_workspace",
+                action="get_objects_in_patch",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "path": str(destination)},
+            )
+        digest, object_count, connection_count = self._topology_hash(topology)
+        patch_payload = self._topology_to_patch_payload(topology)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json.dumps(patch_payload, indent=2))
+        except Exception as e:
+            return self._operation_error(
+                operation="export_workspace",
+                action="write_file",
+                error=e,
+                details={"project_id": project_id, "workspace_id": workspace_id, "path": str(destination)},
+            )
+        pid = self._normalize_scope_identifier(project_id, field_name="project_id")
+        wid = self._normalize_scope_identifier(workspace_id, field_name="workspace_id")
+        project = self.projects.get(pid, {})
+        workspaces = project.get("workspaces", {}) if isinstance(project, dict) else {}
+        workspace = workspaces.get(wid) if isinstance(workspaces, dict) else None
+        if isinstance(workspace, dict):
+            workspace["persist_path"] = str(destination)
+            workspace["last_topology_hash"] = digest
+            workspace["updated_at"] = time.time()
+        return {
+            "success": True,
+            "project_id": pid,
+            "workspace_id": wid,
+            "path": str(destination),
+            "overwrite": overwrite,
+            "hash": digest,
+            "object_count": object_count,
+            "connection_count": connection_count,
+            "switch_result": switch_result,
+        }
+
+    async def open_patch_window(self, path: str, bring_to_front: bool = True) -> dict:
+        try:
+            resolved = self._resolve_patch_path(path)
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+        if not self.max_app_path.exists():
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": f"Max app not found at {self.max_app_path}.",
+                    "recoverable": False,
+                    "details": {"max_app_path": str(self.max_app_path)},
+                },
+            }
+        args = ["open"]
+        if bring_to_front:
+            args.extend(["-a", str(self.max_app_path), str(resolved)])
+        else:
+            args.extend(["-g", "-a", str(self.max_app_path), str(resolved)])
+        try:
+            subprocess.run(
+                args,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            return self._operation_error(
+                operation="open_patch_window",
+                action="open",
+                error=e,
+                details={"path": str(resolved)},
+            )
+        return {
+            "success": True,
+            "path": str(resolved),
+            "bring_to_front": bool(bring_to_front),
+        }
+
+    async def list_open_patch_windows(self) -> dict:
+        if self.hygiene_manager is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Hygiene manager is unavailable.",
+                    "recoverable": False,
+                    "details": {},
+                },
+            }
+        windows = await asyncio.to_thread(self.hygiene_manager._scan_open_documents_sync)
+        return {"success": True, "windows": windows}
+
+    async def close_patch_window(self, path: str) -> dict:
+        resolved = Path(path).expanduser()
+        if not resolved.is_absolute():
+            resolved = (Path.cwd() / resolved).resolve()
+        else:
+            resolved = resolved.resolve()
+        script = (
+            "const app = Application('Max');"
+            "const target = " + json.dumps(str(resolved)) + ";"
+            "let closed = 0;"
+            "let errors = 0;"
+            "try {"
+            "  const docs = app.documents();"
+            "  for (let i = 0; i < docs.length; i++) {"
+            "    const d = docs[i];"
+            "    let p = '';"
+            "    try { const f = d.file(); if (f) { p = String(f.toString()); } } catch (e) {}"
+            "    if (p === target) {"
+            "      try { d.close({ saving: 'no' }); closed++; } catch (e) { errors++; }"
+            "    }"
+            "  }"
+            "} catch (e) { errors++; }"
+            "JSON.stringify({closed: closed, errors: errors, path: target});"
+        )
+        try:
+            out = await asyncio.to_thread(
+                subprocess.run,
+                ["osascript", "-l", "JavaScript", "-e", script],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5.0,
+            )
+        except Exception as e:
+            return self._operation_error(
+                operation="close_patch_window",
+                action="osascript",
+                error=e,
+                details={"path": str(resolved)},
+            )
+        if out.returncode != 0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_INTERNAL,
+                    "message": (out.stderr or "").strip() or "Failed to close patch window.",
+                    "recoverable": True,
+                    "details": {"path": str(resolved)},
+                },
+            }
+        payload = {}
+        try:
+            payload = json.loads(out.stdout.strip() or "{}")
+        except Exception:
+            payload = {"raw": (out.stdout or "").strip()}
+        return {"success": True, "path": str(resolved), "result": payload}
+
     async def load_patch_from_path(
         self,
         path: str,
@@ -2731,6 +4072,11 @@ class MaxRuntimeManager:
         auto_rename_collisions: bool = True,
         create_checkpoint_before_load: bool = True,
         checkpoint_label: str = "pre_load_import",
+        apply_timeout_seconds: float | None = None,
+        apply_chunk_size: int | None = None,
+        apply_mode: str = "auto",
+        apply_retry_count: int | None = None,
+        apply_retry_backoff_seconds: float | None = None,
         idempotency_key: str = "",
     ) -> dict:
         target_id = target.strip().lower()
@@ -2758,6 +4104,95 @@ class MaxRuntimeManager:
             }
 
         try:
+            requested_apply_mode = self._normalize_apply_mode(apply_mode)
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+
+        try:
+            safe_apply_timeout = (
+                self.import_apply_timeout_seconds
+                if apply_timeout_seconds is None
+                else float(apply_timeout_seconds)
+            )
+            safe_apply_chunk_size = (
+                self.import_apply_chunk_size
+                if apply_chunk_size is None
+                else int(apply_chunk_size)
+            )
+            safe_apply_retry_count = (
+                self.import_apply_retry_count
+                if apply_retry_count is None
+                else int(apply_retry_count)
+            )
+            safe_apply_retry_backoff = (
+                self.import_apply_retry_backoff_seconds
+                if apply_retry_backoff_seconds is None
+                else float(apply_retry_backoff_seconds)
+            )
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        "apply_* parameters must be numeric: timeout_seconds(float), "
+                        "chunk_size(int), retry_count(int), retry_backoff_seconds(float)."
+                    ),
+                    "recoverable": True,
+                    "details": {
+                        "apply_timeout_seconds": apply_timeout_seconds,
+                        "apply_chunk_size": apply_chunk_size,
+                        "apply_retry_count": apply_retry_count,
+                        "apply_retry_backoff_seconds": apply_retry_backoff_seconds,
+                    },
+                },
+            }
+
+        if safe_apply_timeout < 1.0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_timeout_seconds must be >= 1.0.",
+                    "recoverable": True,
+                    "details": {"apply_timeout_seconds": apply_timeout_seconds},
+                },
+            }
+
+        if safe_apply_chunk_size < 1:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_chunk_size must be >= 1.",
+                    "recoverable": True,
+                    "details": {"apply_chunk_size": apply_chunk_size},
+                },
+            }
+
+        if safe_apply_retry_count < 0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_retry_count must be >= 0.",
+                    "recoverable": True,
+                    "details": {"apply_retry_count": apply_retry_count},
+                },
+            }
+
+        if safe_apply_retry_backoff < 0.0:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": "apply_retry_backoff_seconds must be >= 0.0.",
+                    "recoverable": True,
+                    "details": {"apply_retry_backoff_seconds": apply_retry_backoff_seconds},
+                },
+            }
+
+        try:
             readiness = await self.ensure_runtime_ready()
         except Exception as e:
             return self._operation_error(
@@ -2777,12 +4212,42 @@ class MaxRuntimeManager:
                 },
             }
 
+        required_actions = {"set_workspace_target", "get_objects_in_patch"}
+        if requested_apply_mode == "progressive":
+            required_actions.add("apply_topology_snapshot_progressive")
+        else:
+            required_actions.add("apply_topology_snapshot")
         capability_error = self._check_required_capabilities(
-            required_actions={"set_workspace_target", "get_objects_in_patch", "apply_topology_snapshot"},
+            required_actions=required_actions,
             operation="load_patch_from_path",
         )
         if capability_error:
             return capability_error
+        if requested_apply_mode == "auto":
+            progressive_support = self._bridge_action_supported("apply_topology_snapshot_progressive")
+            single_support = self._bridge_action_supported("apply_topology_snapshot")
+            if progressive_support is False and single_support is False:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": ERROR_PRECONDITION,
+                        "message": "Bridge does not advertise any topology-apply action.",
+                        "hint": "Run get_bridge_diagnostics() and verify supported_actions.",
+                        "recoverable": False,
+                        "details": {
+                            "operation": "load_patch_from_path",
+                            "required_any_of": [
+                                "apply_topology_snapshot",
+                                "apply_topology_snapshot_progressive",
+                            ],
+                            "supported_actions": (
+                                self.maxmsp.capabilities.get("supported_actions")
+                                if isinstance(self.maxmsp.capabilities, dict)
+                                else []
+                            ),
+                        },
+                    },
+                }
 
         switch_result = None
         if self.active_target != target_id:
@@ -2888,18 +4353,39 @@ class MaxRuntimeManager:
                     },
                 }
 
+        apply_meta = {}
         try:
-            apply_result = await self.maxmsp.send_request(
-                {"action": "apply_topology_snapshot", "snapshot": final_topology},
-                timeout=25.0,
-                idempotency_key=idempotency_key or None,
+            apply_result, apply_meta = await self._apply_topology_with_retries(
+                final_topology,
+                requested_apply_mode=requested_apply_mode,
+                timeout_seconds=safe_apply_timeout,
+                chunk_size=safe_apply_chunk_size,
+                retry_count=safe_apply_retry_count,
+                retry_backoff_seconds=safe_apply_retry_backoff,
+                idempotency_key=idempotency_key,
             )
         except Exception as e:
+            selected_mode = None
+            if isinstance(e, MaxMCPError) and isinstance(e.details, dict):
+                selected_mode = e.details.get("selected_mode")
+            apply_action = (
+                "apply_topology_snapshot_progressive"
+                if selected_mode == "progressive"
+                else "apply_topology_snapshot"
+            )
             return self._operation_error(
                 operation="load_patch_from_path",
-                action="apply_topology_snapshot",
+                action=apply_action,
                 error=e,
-                details={"target": target_id, "mode": mode_normalized},
+                details={
+                    "target": target_id,
+                    "mode": mode_normalized,
+                    "apply_mode": requested_apply_mode,
+                    "apply_timeout_seconds": safe_apply_timeout,
+                    "apply_chunk_size": safe_apply_chunk_size,
+                    "apply_retry_count": safe_apply_retry_count,
+                    "apply_retry_backoff_seconds": safe_apply_retry_backoff,
+                },
             )
 
         persist_result = await self.persist_workspace_target(
@@ -2918,6 +4404,7 @@ class MaxRuntimeManager:
             "switch_result": switch_result,
             "checkpoint": checkpoint_result,
             "apply_result": apply_result,
+            "apply_meta": apply_meta,
             "persist_result": persist_result,
             "twin_sync": twin_sync,
             "post_load_drift": post_load_drift,
@@ -2951,6 +4438,17 @@ class MaxRuntimeManager:
                 "generated_varnames": normalized_source.get("generated_varnames", 0),
                 "line_ref_map_size": normalized_source.get("line_ref_map_size", 0),
                 "line_ref_id_mappings": normalized_source.get("line_ref_id_mappings", 0),
+                "apply_mode_requested": requested_apply_mode,
+                "apply_mode_selected": (
+                    apply_meta.get("selected_mode")
+                    if isinstance(apply_meta, dict)
+                    else requested_apply_mode
+                ),
+                "apply_attempts_total": (
+                    apply_meta.get("attempts_total")
+                    if isinstance(apply_meta, dict)
+                    else 1
+                ),
             },
         }
 
@@ -3112,17 +4610,287 @@ class MaxRuntimeManager:
             "switch_result": switch_result,
         }
 
+    async def export_amxd(
+        self,
+        path: str,
+        *,
+        target: str = "",
+        overwrite: bool = False,
+        device_type: str = "midi_effect",
+        validation_mode: str = "format_only",
+        probe_open: bool = False,
+        idempotency_key: str = "",
+    ) -> dict:
+        target_id = (target or self.active_target).strip().lower()
+        if not target_id or target_id == "host":
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "target must be a selected workspace target '<project_id>:<workspace_id>'.",
+                    "recoverable": False,
+                    "details": {"target": target},
+                },
+            }
+        if ":" not in target_id:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": (
+                        "Legacy target names are removed for AMXD export. "
+                        "Use '<project_id>:<workspace_id>'."
+                    ),
+                    "recoverable": False,
+                    "details": {"target": target},
+                },
+            }
+
+        mode = (validation_mode or "format_only").strip().lower()
+        if mode not in {"format_only", "open_if_available", "strict_open", "none"}:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        "validation_mode must be one of: "
+                        "format_only, open_if_available, strict_open, none."
+                    ),
+                    "recoverable": True,
+                    "details": {"validation_mode": validation_mode},
+                },
+            }
+
+        try:
+            destination = self._resolve_amxd_destination_path(path)
+        except MaxMCPError as e:
+            return {"success": False, "error": e.to_dict()}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_INTERNAL,
+                    "message": str(e),
+                    "recoverable": True,
+                    "details": {"path": path},
+                },
+            }
+
+        if destination.exists() and not overwrite:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": f"Destination already exists: {destination}",
+                    "hint": "Set overwrite=True to replace existing file.",
+                    "recoverable": True,
+                    "details": {},
+                },
+            }
+
+        try:
+            readiness = await self.ensure_runtime_ready()
+        except Exception as e:
+            return self._operation_error(
+                operation="export_amxd",
+                action="ensure_runtime_ready",
+                error=e,
+                details={"target": target_id, "path": str(destination)},
+            )
+        if not readiness.get("ready"):
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_BRIDGE_UNAVAILABLE,
+                    "message": readiness.get("error", "Bridge runtime is not ready."),
+                    "recoverable": True,
+                    "details": readiness,
+                },
+            }
+
+        required_actions = {"set_workspace_target", "export_amxd"}
+        if mode == "strict_open":
+            required_actions.add("validate_amxd_open")
+        capability_error = self._check_required_capabilities(
+            required_actions=required_actions,
+            operation="export_amxd",
+        )
+        if capability_error:
+            return capability_error
+
+        switch_result = None
+        if self.active_target != target_id:
+            try:
+                switch_result = await self.set_active_target(target_id)
+            except Exception as e:
+                return self._operation_error(
+                    operation="export_amxd",
+                    action="set_workspace_target",
+                    error=e,
+                    details={"target": target_id, "path": str(destination)},
+                )
+            if not switch_result.get("success"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": ERROR_PRECONDITION,
+                        "message": "Failed to switch target workspace before AMXD export.",
+                        "recoverable": False,
+                        "details": switch_result,
+                    },
+                }
+
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return self._operation_error(
+                operation="export_amxd",
+                action="mkdir",
+                error=e,
+                details={"target": target_id, "path": str(destination)},
+            )
+
+        try:
+            bridge_result = await self.maxmsp.send_request(
+                {
+                    "action": "export_amxd",
+                    "output_path": str(destination),
+                    "device_type": device_type or "",
+                },
+                timeout=45.0,
+                idempotency_key=idempotency_key or None,
+            )
+        except Exception as e:
+            return self._operation_error(
+                operation="export_amxd",
+                action="export_amxd",
+                error=e,
+                details={"target": target_id, "path": str(destination)},
+            )
+
+        format_validation = None
+        if mode in {"format_only", "open_if_available", "strict_open"}:
+            try:
+                format_validation = await asyncio.to_thread(
+                    self._validate_amxd_file_sync,
+                    destination,
+                )
+            except Exception as e:
+                if isinstance(e, MaxMCPError):
+                    return {"success": False, "error": e.to_dict()}
+                return self._operation_error(
+                    operation="export_amxd",
+                    action="validate_amxd_format",
+                    error=e,
+                    details={"target": target_id, "path": str(destination)},
+                )
+
+        open_validation = None
+        if mode in {"open_if_available", "strict_open"}:
+            open_probe_supported = self._bridge_action_supported("validate_amxd_open")
+            if mode == "strict_open" and open_probe_supported is not True:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": ERROR_PRECONDITION,
+                        "message": "Bridge does not advertise validate_amxd_open.",
+                        "hint": "Use validation_mode='format_only' or upgrade bridge capabilities.",
+                        "recoverable": False,
+                        "details": {"validation_mode": mode},
+                    },
+                }
+            if open_probe_supported:
+                try:
+                    open_validation = await self.maxmsp.send_request(
+                        {
+                            "action": "validate_amxd_open",
+                            "path": str(destination),
+                            "probe_open": bool(probe_open),
+                        },
+                        timeout=15.0,
+                    )
+                except Exception as e:
+                    if mode == "strict_open":
+                        return self._operation_error(
+                            operation="export_amxd",
+                            action="validate_amxd_open",
+                            error=e,
+                            details={"target": target_id, "path": str(destination)},
+                        )
+                    open_validation = {
+                        "success": False,
+                        "error": str(e),
+                        "skipped": False,
+                    }
+            else:
+                open_validation = {
+                    "success": False,
+                    "skipped": True,
+                    "reason": "validate_amxd_open not advertised by bridge",
+                }
+            if (
+                mode == "strict_open"
+                and isinstance(open_validation, dict)
+                and open_validation.get("success") is False
+            ):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": ERROR_PRECONDITION,
+                        "message": "Strict AMXD open validation failed.",
+                        "recoverable": False,
+                        "details": {"open_validation": open_validation},
+                    },
+                }
+
+        file_size = destination.stat().st_size if destination.exists() else 0
+        project_id, workspace_id = target_id.split(":", 1)
+        return {
+            "success": True,
+            "target": target_id,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
+            "path": str(destination),
+            "overwrite": overwrite,
+            "file_size": file_size,
+            "validation_mode": mode,
+            "bridge_result": bridge_result,
+            "format_validation": format_validation,
+            "open_validation": open_validation,
+            "switch_result": switch_result,
+        }
+
     def _workspace_varname_for_target(self, target: str) -> str | None:
+        if target == "host":
+            return None
         if target == "active":
             return self.workspace_active_varname
         if target == "scratch":
             return self.workspace_scratch_varname
+        if ":" in target:
+            project_id, workspace_id = target.split(":", 1)
+            project = self.projects.get(project_id)
+            workspaces = project.get("workspaces", {}) if isinstance(project, dict) else {}
+            workspace = workspaces.get(workspace_id) if isinstance(workspaces, dict) else None
+            if isinstance(workspace, dict):
+                return str(workspace.get("workspace_varname") or "")
         return None
 
     def _workspace_display_name_for_target(self, target: str) -> str:
+        if target == "host":
+            return "mcp_host"
         if target == "scratch":
             return f"mcp_scratch_{self.session_id}"
-        return f"mcp_active_{self.session_id}"
+        if target == "active":
+            return f"mcp_active_{self.session_id}"
+        if ":" in target:
+            project_id, workspace_id = target.split(":", 1)
+            project = self.projects.get(project_id)
+            workspaces = project.get("workspaces", {}) if isinstance(project, dict) else {}
+            workspace = workspaces.get(workspace_id) if isinstance(workspaces, dict) else None
+            if isinstance(workspace, dict):
+                return str(workspace.get("display_name") or workspace_id)
+        return "mcp_workspace"
 
     async def _apply_target_to_bridge(self) -> dict:
         if not self.maxmsp.sio.connected:
@@ -3145,43 +4913,46 @@ class MaxRuntimeManager:
         return {"applied": True, "response": response}
 
     async def set_active_target(self, target: str) -> dict:
-        allowed = {"host", "active", "scratch"}
-        if target not in allowed:
+        normalized = (target or "").strip().lower()
+        if normalized == "host":
+            previous_target = self.active_target
+            self.active_target = "host"
+            self.active_project_id = None
+            self.active_workspace_id = None
+            apply_result = await self._apply_target_to_bridge()
             return {
-                "success": False,
-                "error": f"Invalid target '{target}'. Use one of {sorted(allowed)}.",
+                "success": True,
+                "active_target": self.active_target,
+                "previous_target": previous_target,
+                "apply_result": apply_result,
             }
 
-        previous_target = self.active_target
-        persist_result = {"persisted": False, "reason": "not_switched", "target": previous_target}
-        if previous_target != target and previous_target in {"active", "scratch"}:
-            persist_result = await self.persist_workspace_target(
-                target=previous_target,
-                reason=f"switch:{previous_target}->{target}",
+        if normalized in {"active", "scratch"}:
+            return {
+                "success": False,
+                "error": {
+                    "code": ERROR_PRECONDITION,
+                    "message": "Legacy target switching is removed. Use project/workspace selection APIs.",
+                    "recoverable": False,
+                    "details": {"target": target},
+                },
+            }
+
+        if ":" in normalized:
+            project_id, workspace_id = normalized.split(":", 1)
+            return await self.activate_workspace(
+                project_id=project_id,
+                workspace_id=workspace_id,
+                create_if_missing=False,
             )
-
-        self.active_target = target
-        apply_result = await self._apply_target_to_bridge()
-        hydrate_result = {"applied": False, "reason": "not_switched", "target": target}
-        if previous_target != target and target in {"active", "scratch"}:
-            hydrate_result = await self.hydrate_workspace_target(
-                target=target,
-                reason=f"switch:{previous_target}->{target}",
-            )
-
-        twin_sync = None
-        if self.maxmsp.sio.connected and target in {"active", "scratch"}:
-            twin_sync = await self.sync_patch_twin(reason=f"switch_target:{target}")
-
         return {
-            "success": True,
-            "active_target": self.active_target,
-            "previous_target": previous_target,
-            "apply_result": apply_result,
-            "persist_result": persist_result,
-            "hydrate_result": hydrate_result,
-            "twin_sync": twin_sync,
-            "targets": self.list_patch_targets(),
+            "success": False,
+            "error": {
+                "code": ERROR_VALIDATION,
+                "message": "Invalid target format. Use 'host' or '<project_id>:<workspace_id>'.",
+                "recoverable": True,
+                "details": {"target": target},
+            },
         }
 
     def _write_state(self, payload: dict) -> None:
@@ -3271,11 +5042,9 @@ class MaxRuntimeManager:
             "state_file": str(self.state_file),
             "session_id": self.session_id,
             "session_dir": str(self.session_dir),
-            "session_active_patch": str(self.session_active_patch),
-            "session_active_patch_exists": self.session_active_patch.exists(),
-            "session_scratch_patch": str(self.session_scratch_patch),
-            "session_scratch_patch_exists": self.session_scratch_patch.exists(),
             "active_target": self.active_target,
+            "active_project_id": self.active_project_id,
+            "active_workspace_id": self.active_workspace_id,
             "active_workspace_varname": self._workspace_varname_for_target(self.active_target),
             "checkpoint_count": len(self.checkpoints),
             "checkpoint_journal_file": str(self.checkpoints_file),
@@ -3283,7 +5052,8 @@ class MaxRuntimeManager:
             "enforce_patch_roots": self.enforce_patch_roots,
             "allowed_patch_roots": [str(root) for root in self.allowed_patch_roots],
             "twin": self._twin_status_payload(),
-            "targets": self.list_patch_targets(),
+            "project_count": len(self.projects),
+            "projects": self.list_projects(),
         }
         if self.hygiene_manager is not None:
             status["hygiene_policy"] = self.hygiene_manager.policy_snapshot()
@@ -3315,7 +5085,6 @@ class MaxRuntimeManager:
 
         async with self._lock:
             self._ensure_state_dir()
-            await asyncio.to_thread(self._ensure_session_patches_sync)
             checkpoint_journal = await asyncio.to_thread(self._load_checkpoint_journal_sync)
             host_patch = self._resolve_host_patch()
             if not host_patch:
@@ -3351,21 +5120,11 @@ class MaxRuntimeManager:
                 await self._wait_for_bridge(timeout_seconds=20.0)
 
             workspace_apply_error = None
-            workspace_hydrate_error = None
-            workspace_hydrate_result = None
             if self.maxmsp.sio.connected:
                 try:
                     await self._apply_target_to_bridge()
                 except Exception as e:
                     workspace_apply_error = str(e)
-                if self.active_target in {"active", "scratch"}:
-                    try:
-                        workspace_hydrate_result = await self.hydrate_workspace_target(
-                            target=self.active_target,
-                            reason="runtime_ready",
-                        )
-                    except Exception as e:
-                        workspace_hydrate_error = str(e)
 
             status = await self.collect_status(check_bridge=True)
             status["ready"] = bool(status.get("bridge_connected"))
@@ -3374,10 +5133,6 @@ class MaxRuntimeManager:
                 status["error"] = self.maxmsp._offline_error_message()
             if workspace_apply_error:
                 status["workspace_apply_error"] = workspace_apply_error
-            if workspace_hydrate_result is not None:
-                status["workspace_hydrate"] = workspace_hydrate_result
-            if workspace_hydrate_error:
-                status["workspace_hydrate_error"] = workspace_hydrate_error
             if status["ready"]:
                 twin_sync = await self.sync_patch_twin(reason="runtime_ready")
                 status["twin_sync"] = twin_sync
@@ -3396,31 +5151,34 @@ class MaxRuntimeManager:
         return status
 
     def list_patch_targets(self) -> list:
+        # Legacy helper retained for status compatibility.
         host_patch = self._resolve_host_patch()
-        host = {
+        rows = [{
             "id": "host",
             "description": "Managed MCP bridge host patch",
             "path": str(host_patch) if host_patch else None,
             "exists": bool(host_patch and host_patch.exists()),
             "selected": self.active_target == "host",
-        }
-        active = {
-            "id": "active",
-            "description": "Per-session editable workspace target",
-            "path": str(self.session_active_patch),
-            "exists": self.session_active_patch.exists(),
-            "workspace_varname": self.workspace_active_varname,
-            "selected": self.active_target == "active",
-        }
-        scratch = {
-            "id": "scratch",
-            "description": "Per-session fallback workspace target",
-            "path": str(self.session_scratch_patch),
-            "exists": self.session_scratch_patch.exists(),
-            "workspace_varname": self.workspace_scratch_varname,
-            "selected": self.active_target == "scratch",
-        }
-        return [host, active, scratch]
+        }]
+        for project_id, project in sorted(self.projects.items()):
+            workspaces = project.get("workspaces", {})
+            if not isinstance(workspaces, dict):
+                continue
+            for workspace_id, workspace in sorted(workspaces.items()):
+                if not isinstance(workspace, dict):
+                    continue
+                target_id = self._workspace_target_id(project_id, workspace_id)
+                rows.append(
+                    {
+                        "id": target_id,
+                        "description": "Project-scoped workspace",
+                        "project_id": project_id,
+                        "workspace_id": workspace_id,
+                        "workspace_varname": workspace.get("workspace_varname"),
+                        "selected": self.active_target == target_id,
+                    }
+                )
+        return rows
 
 
 class MaxHygieneManager:
@@ -3555,20 +5313,10 @@ class MaxHygieneManager:
         token = lower.split()[0]
         return token.endswith("/max") or token == "max"
 
-    def _read_process_table_sync(self) -> list[dict]:
-        try:
-            out = subprocess.run(
-                ["ps", "-axo", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3.0,
-            )
-        except Exception:
-            return []
+    @staticmethod
+    def _parse_process_rows(raw_stdout: str) -> list[dict]:
         rows: list[dict] = []
-        for raw in out.stdout.splitlines():
+        for raw in raw_stdout.splitlines():
             line = raw.strip()
             if not line:
                 continue
@@ -3594,6 +5342,84 @@ class MaxHygieneManager:
                 }
             )
         return rows
+
+    def _run_process_scan_sync(self, command: list[str], method: str, timeout: float) -> tuple[list[dict], dict]:
+        diag = {
+            "method": method,
+            "available": False,
+            "error": None,
+            "row_count": 0,
+        }
+        try:
+            out = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception as e:
+            diag["error"] = str(e)
+            return [], diag
+
+        if out.returncode != 0:
+            diag["error"] = (out.stderr or "").strip() or f"{method}_exit_{out.returncode}"
+            return [], diag
+
+        rows = self._parse_process_rows(out.stdout)
+        diag["available"] = True
+        diag["row_count"] = len(rows)
+        return rows, diag
+
+    def _read_process_table_sync(self) -> tuple[list[dict], dict]:
+        attempts: list[dict] = []
+        primary_rows, primary_diag = self._run_process_scan_sync(
+            ["ps", "-axo", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
+            method="ps_axo",
+            timeout=3.0,
+        )
+        attempts.append(primary_diag)
+        if primary_rows:
+            return (
+                primary_rows,
+                {
+                    "available": True,
+                    "method": "ps_axo",
+                    "fallback_used": False,
+                    "error": None,
+                    "attempts": attempts,
+                },
+            )
+
+        fallback_rows, fallback_diag = self._run_process_scan_sync(
+            ["ps", "-Ac", "-o", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
+            method="ps_Ac",
+            timeout=3.0,
+        )
+        attempts.append(fallback_diag)
+        if fallback_rows:
+            return (
+                fallback_rows,
+                {
+                    "available": True,
+                    "method": "ps_Ac",
+                    "fallback_used": True,
+                    "error": None,
+                    "attempts": attempts,
+                },
+            )
+
+        return (
+            [],
+            {
+                "available": False,
+                "method": "ps_axo",
+                "fallback_used": bool(primary_diag.get("available")),
+                "error": primary_diag.get("error") or fallback_diag.get("error"),
+                "attempts": attempts,
+            },
+        )
 
     def _discover_bridge_listener_pid_sync(self) -> int | None:
         port = str(getattr(self.maxmsp, "server_port", "") or "").strip()
@@ -3644,9 +5470,23 @@ class MaxHygieneManager:
 
     def _scan_open_documents_sync(self) -> dict:
         if not self.enable_window_scan:
-            return {"available": False, "reason": "disabled", "documents": []}
+            return {
+                "available": False,
+                "method": "osascript_jxa",
+                "reason": "disabled",
+                "failure_kind": "disabled",
+                "timeout_seconds": 3.0,
+                "documents": [],
+            }
         if os.name != "posix" or "darwin" not in os.uname().sysname.lower():
-            return {"available": False, "reason": "unsupported_platform", "documents": []}
+            return {
+                "available": False,
+                "method": "osascript_jxa",
+                "reason": "unsupported_platform",
+                "failure_kind": "unsupported_platform",
+                "timeout_seconds": 3.0,
+                "documents": [],
+            }
         script = (
             "const app = Application('Max');"
             "app.includeStandardAdditions = true;"
@@ -3672,14 +5512,38 @@ class MaxHygieneManager:
                 timeout=3.0,
             )
         except Exception as e:
-            return {"available": False, "reason": f"osascript_error:{e}", "documents": []}
+            reason = f"osascript_error:{e}"
+            failure_kind = "timeout" if "timed out" in reason.lower() else "osascript_error"
+            return {
+                "available": False,
+                "method": "osascript_jxa",
+                "reason": reason,
+                "failure_kind": failure_kind,
+                "timeout_seconds": 3.0,
+                "documents": [],
+            }
         if out.returncode != 0:
             reason = (out.stderr or "").strip() or f"osascript_exit_{out.returncode}"
-            return {"available": False, "reason": reason, "documents": []}
+            failure_kind = "timeout" if "timed out" in reason.lower() else "exit_nonzero"
+            return {
+                "available": False,
+                "method": "osascript_jxa",
+                "reason": reason,
+                "failure_kind": failure_kind,
+                "timeout_seconds": 3.0,
+                "documents": [],
+            }
         try:
             payload = json.loads(out.stdout.strip() or "{}")
         except Exception as e:
-            return {"available": False, "reason": f"parse_error:{e}", "documents": []}
+            return {
+                "available": False,
+                "method": "osascript_jxa",
+                "reason": f"parse_error:{e}",
+                "failure_kind": "parse_error",
+                "timeout_seconds": 3.0,
+                "documents": [],
+            }
         docs = payload.get("documents") if isinstance(payload, dict) else []
         if not isinstance(docs, list):
             docs = []
@@ -3717,7 +5581,14 @@ class MaxHygieneManager:
                     "session_id_guess": session_id_guess,
                 }
             )
-        return {"available": True, "reason": None, "documents": rows}
+        return {
+            "available": True,
+            "method": "osascript_jxa",
+            "reason": None,
+            "failure_kind": None,
+            "timeout_seconds": 3.0,
+            "documents": rows,
+        }
 
     @staticmethod
     def _session_dir_size_bytes(path: Path) -> int:
@@ -3801,7 +5672,27 @@ class MaxHygieneManager:
         include_runtime_state: bool,
     ) -> dict:
         now = time.time()
-        all_processes = self._read_process_table_sync()
+        raw_process_scan = self._read_process_table_sync()
+        if (
+            isinstance(raw_process_scan, tuple)
+            and len(raw_process_scan) == 2
+            and isinstance(raw_process_scan[1], dict)
+        ):
+            all_processes = raw_process_scan[0]
+            process_scan = raw_process_scan[1]
+        else:
+            all_processes = raw_process_scan
+            process_scan = {
+                "available": isinstance(all_processes, list) and len(all_processes) > 0,
+                "method": "legacy_hook",
+                "fallback_used": False,
+                "error": None,
+                "attempts": [],
+            }
+
+        if not isinstance(all_processes, list):
+            all_processes = []
+        all_processes = [row for row in all_processes if isinstance(row, dict)]
         process_index = {
             row["pid"]: row
             for row in all_processes
@@ -3833,7 +5724,14 @@ class MaxHygieneManager:
                 }
             )
 
-        windows = {"available": False, "reason": "not_requested", "documents": []}
+        windows = {
+            "available": False,
+            "method": "osascript_jxa",
+            "reason": "not_requested",
+            "failure_kind": "not_requested",
+            "timeout_seconds": 3.0,
+            "documents": [],
+        }
         if include_windows:
             windows = self._scan_open_documents_sync()
 
@@ -3849,11 +5747,28 @@ class MaxHygieneManager:
             }
         stale_process_count = sum(1 for row in process_rows if row.get("is_stale"))
         stale_session_count = sum(1 for row in sessions if row.get("is_stale"))
+        if process_rows and not process_scan.get("fallback_used"):
+            process_confidence = "high"
+        elif process_rows:
+            process_confidence = "medium"
+        elif self.maxmsp.sio.connected:
+            process_confidence = "low"
+        else:
+            process_confidence = "medium"
+
         return {
             "now_epoch": now,
             "policy": self.policy_snapshot(),
             "max_processes": process_rows,
+            "process_scan": process_scan,
             "open_patch_windows": windows,
+            "window_scan": {
+                "available": windows.get("available", False),
+                "method": windows.get("method", "osascript_jxa"),
+                "reason": windows.get("reason"),
+                "failure_kind": windows.get("failure_kind"),
+                "timeout_seconds": windows.get("timeout_seconds"),
+            },
             "managed_sessions_on_disk": sessions,
             "current_runtime": runtime_state,
             "summary": {
@@ -3862,6 +5777,7 @@ class MaxHygieneManager:
                 "managed_session_count": len(sessions),
                 "stale_session_count": stale_session_count,
                 "bridge_owner_pid": bridge_owner_pid,
+                "process_inventory_confidence": process_confidence,
             },
         }
 
@@ -4374,6 +6290,78 @@ def _get_hygiene(ctx: Context) -> MaxHygieneManager | None:
     return ctx.request_context.lifespan_context.get("hygiene")
 
 
+def _deprecated_tool_error(tool_name: str, replacement: str) -> dict:
+    return {
+        "success": False,
+        "error": {
+            "code": ERROR_PRECONDITION,
+            "message": f"'{tool_name}' is removed in project/workspace mode.",
+            "hint": f"Use '{replacement}' instead.",
+            "recoverable": False,
+            "details": {"tool": tool_name, "replacement": replacement},
+        },
+    }
+
+
+async def _activate_workspace_scope(
+    ctx: Context,
+    *,
+    project_id: str,
+    workspace_id: str,
+    create_if_missing: bool = True,
+) -> tuple[MaxRuntimeManager | None, Any, dict | None]:
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return None, None, {
+            "success": False,
+            "error": {
+                "code": ERROR_PRECONDITION,
+                "message": "Runtime manager is unavailable.",
+                "recoverable": False,
+                "details": {},
+            },
+        }
+    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    if maxmsp is None:
+        return runtime, None, {
+            "success": False,
+            "error": {
+                "code": ERROR_BRIDGE_UNAVAILABLE,
+                "message": "Bridge connection is unavailable in this MCP lifespan context.",
+                "recoverable": True,
+                "details": {},
+            },
+        }
+    try:
+        switch = await runtime.activate_workspace(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            create_if_missing=create_if_missing,
+        )
+    except MaxMCPError as e:
+        return runtime, maxmsp, {"success": False, "error": e.to_dict()}
+    except Exception as e:
+        return runtime, maxmsp, {
+            "success": False,
+            "error": {
+                "code": ERROR_INTERNAL,
+                "message": str(e),
+                "recoverable": True,
+                "details": {
+                    "project_id": project_id,
+                    "workspace_id": workspace_id,
+                    "create_if_missing": create_if_missing,
+                },
+            },
+        }
+    if not switch.get("success"):
+        return runtime, maxmsp, {
+            "success": False,
+            "error": switch.get("error", switch),
+        }
+    return runtime, maxmsp, None
+
+
 @mcp.tool()
 async def ensure_max_available(ctx: Context) -> dict:
     """Ensure Max and the managed bridge patch are available.
@@ -4405,6 +6393,9 @@ async def bridge_status(ctx: Context, verbose: bool = False) -> dict:
         "bridge_connected": status.get("bridge_connected"),
         "bridge_healthy": status.get("bridge_healthy"),
         "active_target": status.get("active_target"),
+        "active_project_id": status.get("active_project_id"),
+        "active_workspace_id": status.get("active_workspace_id"),
+        "project_count": status.get("project_count"),
         "host_patch_path": status.get("host_patch_path"),
         "node_modules_ready": status.get("node_modules_ready"),
     }
@@ -4578,23 +6569,123 @@ def set_hygiene_policy(
 
 @mcp.tool()
 def list_patch_targets(ctx: Context) -> list:
-    """List patch targets exposed by the managed runtime."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return []
-    return runtime.list_patch_targets()
+    """Legacy API: removed."""
+    _ = ctx
+    return [_deprecated_tool_error("list_patch_targets", "list_projects + list_workspaces")]
 
 
 @mcp.tool()
 async def set_patch_target(ctx: Context, target: str = "active") -> dict:
-    """Set logical patch target.
+    """Legacy API: removed."""
+    _ = target
+    return _deprecated_tool_error("set_patch_target", "select_workspace")
 
-    `active` and `scratch` map to per-session managed workspaces inside the host patch.
-    """
+
+@mcp.tool()
+def register_project(
+    ctx: Context,
+    project_id: str,
+    display_name: str = "",
+    create_default_workspace: bool = True,
+    default_workspace_id: str = "main",
+) -> dict:
+    """Register a project and optional default workspace."""
     runtime = _get_runtime(ctx)
     if runtime is None:
         return {"success": False, "error": "Runtime manager is unavailable."}
-    return await runtime.set_active_target(target)
+    try:
+        return runtime.register_project(
+            project_id=project_id,
+            display_name=display_name,
+            create_default_workspace=create_default_workspace,
+            default_workspace_id=default_workspace_id,
+        )
+    except MaxMCPError as e:
+        return {"success": False, "error": e.to_dict()}
+
+
+@mcp.tool()
+def list_projects(ctx: Context) -> dict:
+    """List all registered projects."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "projects": [], "error": "Runtime manager is unavailable."}
+    return {"success": True, "projects": runtime.list_projects()}
+
+
+@mcp.tool()
+def list_workspaces(ctx: Context, project_id: str) -> dict:
+    """List workspaces for a project."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    try:
+        return runtime.list_workspaces(project_id=project_id)
+    except MaxMCPError as e:
+        return {"success": False, "error": e.to_dict()}
+
+
+@mcp.tool()
+def create_workspace(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    display_name: str = "",
+) -> dict:
+    """Create a workspace under a project."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    try:
+        return runtime.create_workspace(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            display_name=display_name,
+        )
+    except MaxMCPError as e:
+        return {"success": False, "error": e.to_dict()}
+
+
+@mcp.tool()
+async def delete_workspace(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    force: bool = False,
+) -> dict:
+    """Delete a workspace from a project."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    try:
+        return await runtime.delete_workspace(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            force=force,
+        )
+    except MaxMCPError as e:
+        return {"success": False, "error": e.to_dict()}
+
+
+@mcp.tool()
+async def select_workspace(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    create_if_missing: bool = True,
+) -> dict:
+    """Select the active workspace for subsequent operations."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    try:
+        return await runtime.activate_workspace(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            create_if_missing=create_if_missing,
+        )
+    except MaxMCPError as e:
+        return {"success": False, "error": e.to_dict()}
 
 
 @mcp.tool()
@@ -4615,21 +6706,29 @@ async def load_patch_from_path(
     auto_rename_collisions: bool = True,
     create_checkpoint_before_load: bool = True,
     checkpoint_label: str = "pre_load_import",
+    apply_timeout_seconds: float = 25.0,
+    apply_chunk_size: int = 64,
+    apply_mode: str = "auto",
+    apply_retry_count: int = 1,
+    apply_retry_backoff_seconds: float = 0.5,
     idempotency_key: str = "",
 ) -> dict:
-    """Load a patch file from disk directly into a managed workspace target."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
-    return await runtime.load_patch_from_path(
-        path=path,
-        target=target,
-        mode=mode,
-        auto_rename_collisions=auto_rename_collisions,
-        create_checkpoint_before_load=create_checkpoint_before_load,
-        checkpoint_label=checkpoint_label,
-        idempotency_key=idempotency_key,
+    """Legacy API: removed."""
+    _ = (
+        path,
+        target,
+        mode,
+        auto_rename_collisions,
+        create_checkpoint_before_load,
+        checkpoint_label,
+        apply_timeout_seconds,
+        apply_chunk_size,
+        apply_mode,
+        apply_retry_count,
+        apply_retry_backoff_seconds,
+        idempotency_key,
     )
+    return _deprecated_tool_error("load_patch_from_path", "import_patch")
 
 
 @mcp.tool()
@@ -4639,71 +6738,232 @@ async def save_patch_to_path(
     target: str = "",
     overwrite: bool = False,
 ) -> dict:
-    """Export the current managed workspace topology to a .maxpat/.json path."""
+    """Legacy API: removed."""
+    _ = (path, target, overwrite)
+    return _deprecated_tool_error("save_patch_to_path", "export_workspace")
+
+
+@mcp.tool()
+async def import_patch(
+    ctx: Context,
+    path: str,
+    project_id: str,
+    workspace_id: str,
+    mode: str = "replace",
+    auto_rename_collisions: bool = True,
+    create_checkpoint_before_load: bool = True,
+    checkpoint_label: str = "pre_import",
+    apply_timeout_seconds: float = 25.0,
+    apply_chunk_size: int = 64,
+    apply_mode: str = "auto",
+    apply_retry_count: int = 1,
+    apply_retry_backoff_seconds: float = 0.5,
+    idempotency_key: str = "",
+) -> dict:
+    """Import a patch file into a workspace without opening the source document."""
     runtime = _get_runtime(ctx)
     if runtime is None:
         return {"success": False, "error": "Runtime manager is unavailable."}
-    return await runtime.save_patch_to_path(
+    return await runtime.import_patch(
         path=path,
-        target=target,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        mode=mode,
+        auto_rename_collisions=auto_rename_collisions,
+        create_checkpoint_before_load=create_checkpoint_before_load,
+        checkpoint_label=checkpoint_label,
+        apply_timeout_seconds=apply_timeout_seconds,
+        apply_chunk_size=apply_chunk_size,
+        apply_mode=apply_mode,
+        apply_retry_count=apply_retry_count,
+        apply_retry_backoff_seconds=apply_retry_backoff_seconds,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+async def export_workspace(
+    ctx: Context,
+    path: str,
+    project_id: str,
+    workspace_id: str,
+    overwrite: bool = False,
+) -> dict:
+    """Export a project workspace topology to .maxpat/.json."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    return await runtime.export_workspace(
+        path=path,
+        project_id=project_id,
+        workspace_id=workspace_id,
         overwrite=overwrite,
     )
 
 
 @mcp.tool()
-async def sync_patch_twin(ctx: Context, reason: str = "manual") -> dict:
-    """Synchronize the in-memory patch twin with the live patch topology."""
+async def export_amxd(
+    ctx: Context,
+    path: str,
+    project_id: str,
+    workspace_id: str,
+    overwrite: bool = False,
+    device_type: str = "midi_effect",
+    validation_mode: str = "format_only",
+    probe_open: bool = False,
+    idempotency_key: str = "",
+) -> dict:
+    """Export the current managed workspace as a Max for Live `.amxd` file."""
     runtime = _get_runtime(ctx)
     if runtime is None:
         return {"success": False, "error": "Runtime manager is unavailable."}
+    target = f"{project_id}:{workspace_id}"
+    return await runtime.export_amxd(
+        path=path,
+        target=target,
+        overwrite=overwrite,
+        device_type=device_type,
+        validation_mode=validation_mode,
+        probe_open=probe_open,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+async def open_patch_window(ctx: Context, path: str, bring_to_front: bool = True) -> dict:
+    """Open an existing patch file in Max by explicit request."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    return await runtime.open_patch_window(path=path, bring_to_front=bring_to_front)
+
+
+@mcp.tool()
+async def list_open_patch_windows(ctx: Context) -> dict:
+    """List currently open Max patch document windows."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    return await runtime.list_open_patch_windows()
+
+
+@mcp.tool()
+async def close_patch_window(ctx: Context, path: str) -> dict:
+    """Close an open Max patch document window by absolute path."""
+    runtime = _get_runtime(ctx)
+    if runtime is None:
+        return {"success": False, "error": "Runtime manager is unavailable."}
+    return await runtime.close_patch_window(path=path)
+
+
+@mcp.tool()
+async def sync_patch_twin(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    reason: str = "manual",
+) -> dict:
+    """Synchronize the in-memory patch twin with the live patch topology."""
+    runtime, _maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert runtime is not None
     return await runtime.sync_patch_twin(reason=reason)
 
 
 @mcp.tool()
-async def get_patch_drift(ctx: Context, auto_resync: bool = False) -> dict:
+async def get_patch_drift(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    auto_resync: bool = False,
+) -> dict:
     """Check if live patch topology drifted from the in-memory patch twin baseline."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
+    runtime, _maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert runtime is not None
     return await runtime.check_patch_drift(auto_resync=auto_resync)
 
 
 @mcp.tool()
-async def create_checkpoint(ctx: Context, label: str = "") -> dict:
+async def create_checkpoint(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    label: str = "",
+) -> dict:
     """Create a topology checkpoint for rollback/restore."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
+    runtime, _maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert runtime is not None
     return await runtime.create_checkpoint(label=label)
 
 
 @mcp.tool()
-def list_checkpoints(ctx: Context) -> list:
+def list_checkpoints(ctx: Context, project_id: str, workspace_id: str) -> list:
     """List available topology checkpoints (newest first)."""
     runtime = _get_runtime(ctx)
     if runtime is None:
         return []
+    _ = (project_id, workspace_id)
     return runtime.list_checkpoints()
 
 
 @mcp.tool()
-async def restore_checkpoint(ctx: Context, checkpoint_id: str) -> dict:
+async def restore_checkpoint(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    checkpoint_id: str,
+) -> dict:
     """Restore a previously captured topology checkpoint."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
+    runtime, _maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert runtime is not None
     return await runtime.restore_checkpoint(checkpoint_id=checkpoint_id)
 
 
 @mcp.tool()
 async def dry_run_plan(
     ctx: Context,
-    steps: list,
+    project_id: str,
+    workspace_id: str,
+    steps: list[dict],
     engine: str = "basic",
     unknown_action_policy: str = "error",
 ) -> dict:
     """Validate a planned sequence of patch mutations without applying any change."""
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, scope_error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if scope_error:
+        return {"valid": False, "errors": [scope_error], "warnings": [], "steps": []}
     starting_context = {"depth": 0, "path": [], "is_root": True}
     topology = None
     if maxmsp is not None:
@@ -4753,6 +7013,66 @@ async def dry_run_plan(
             }
         )
         unknown_policy = "error"
+
+    def _normalize_step(raw_step: Any, step_idx: int) -> tuple[str | None, dict | None]:
+        if isinstance(raw_step, str):
+            action = raw_step.strip()
+            if not action:
+                errors.append(
+                    {
+                        "step": step_idx,
+                        "code": ERROR_VALIDATION,
+                        "message": "Legacy string step must contain a non-empty action name.",
+                    }
+                )
+                return None, None
+            warnings.append(
+                {
+                    "step": step_idx,
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        "Legacy string step format is deprecated. "
+                        "Use {'action': 'name', 'params': {...}} objects."
+                    ),
+                    "details": {"normalized_action": action},
+                }
+            )
+            return action, {}
+        if not isinstance(raw_step, dict):
+            errors.append(
+                {
+                    "step": step_idx,
+                    "code": ERROR_VALIDATION,
+                    "message": (
+                        "Each step must be either an action string or an object "
+                        "with action and params keys."
+                    ),
+                }
+            )
+            return None, None
+
+        action = raw_step.get("action")
+        params = raw_step.get("params", {})
+        if not isinstance(params, dict):
+            errors.append(
+                {
+                    "step": step_idx,
+                    "code": ERROR_VALIDATION,
+                    "message": "Step params must be an object.",
+                }
+            )
+            return None, None
+
+        if not isinstance(action, str) or not action:
+            errors.append(
+                {
+                    "step": step_idx,
+                    "code": ERROR_VALIDATION,
+                    "message": "Missing or invalid action.",
+                }
+            )
+            return None, None
+        return action, params
 
     virtual_objects: dict[str, dict] = {}
     virtual_connections: set[tuple[str, int, str, int]] = set()
@@ -4873,36 +7193,8 @@ async def dry_run_plan(
 
     for index, raw_step in enumerate(steps):
         step_idx = index + 1
-        if not isinstance(raw_step, dict):
-            errors.append(
-                {
-                    "step": step_idx,
-                    "code": ERROR_VALIDATION,
-                    "message": "Each step must be an object with action and params keys.",
-                }
-            )
-            continue
-
-        action = raw_step.get("action")
-        params = raw_step.get("params", {})
-        if not isinstance(params, dict):
-            errors.append(
-                {
-                    "step": step_idx,
-                    "code": ERROR_VALIDATION,
-                    "message": "Step params must be an object.",
-                }
-            )
-            continue
-
-        if not isinstance(action, str) or not action:
-            errors.append(
-                {
-                    "step": step_idx,
-                    "code": ERROR_VALIDATION,
-                    "message": "Missing or invalid action.",
-                }
-            )
+        action, params = _normalize_step(raw_step, step_idx)
+        if action is None or params is None:
             continue
 
         if action == "add_max_object":
@@ -5514,25 +7806,30 @@ def _build_transaction_bridge_request(step_idx: int, action: str, params: dict) 
 @mcp.tool()
 async def run_patch_transaction(
     ctx: Context,
-    steps: list,
+    project_id: str,
+    workspace_id: str,
+    steps: list[dict],
     dry_run_engine: str = "maxpy",
     rollback_on_error: bool = True,
     checkpoint_label: str = "",
     idempotency_seed: str = "",
 ) -> dict:
     """Execute a multi-step patch transaction with optional rollback on failure."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
-    if runtime.active_target == "host":
-        return runtime._host_mutation_error("run_patch_transaction")
-
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
-    if maxmsp is None:
-        return {"success": False, "error": "Bridge connection is unavailable."}
+    runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert runtime is not None
+    assert maxmsp is not None
 
     preflight = await dry_run_plan(
         ctx,
+        project_id,
+        workspace_id,
         steps,
         engine=dry_run_engine,
         unknown_action_policy="error",
@@ -5542,6 +7839,8 @@ async def run_patch_transaction(
             "success": False,
             "error": "Preflight dry-run failed. Transaction aborted.",
             "preflight": preflight,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
         }
 
     checkpoint = await runtime.create_checkpoint(label=checkpoint_label or "transaction")
@@ -5550,19 +7849,31 @@ async def run_patch_transaction(
             "success": False,
             "error": "Failed to create pre-transaction checkpoint.",
             "checkpoint": checkpoint,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
         }
 
     tx_id = uuid.uuid4().hex[:10]
     step_results = []
     for idx, raw_step in enumerate(steps):
         step_index = idx + 1
-        action = raw_step.get("action") if isinstance(raw_step, dict) else None
-        params = raw_step.get("params", {}) if isinstance(raw_step, dict) else {}
+        if isinstance(raw_step, str):
+            action = raw_step.strip()
+            params = {}
+        elif isinstance(raw_step, dict):
+            action = raw_step.get("action")
+            params = raw_step.get("params", {})
+        else:
+            action = None
+            params = {}
         try:
             if not isinstance(action, str) or not isinstance(params, dict):
                 raise MaxMCPError(
                     ERROR_VALIDATION,
-                    f"Step {step_index}: each step must include action + params object.",
+                    (
+                        f"Step {step_index}: each step must be either an action string "
+                        "or an object with action + params."
+                    ),
                     recoverable=False,
                 )
             payload, timeout = _build_transaction_bridge_request(step_index, action, params)
@@ -5606,12 +7917,16 @@ async def run_patch_transaction(
                 "step_results": step_results,
                 "checkpoint": checkpoint,
                 "rollback": rollback_result,
+                "project_id": project_id,
+                "workspace_id": workspace_id,
             }
 
     drift = await runtime.check_patch_drift(auto_resync=False)
     return {
         "success": True,
         "transaction_id": tx_id,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
         "steps_completed": len(step_results),
         "step_results": step_results,
         "checkpoint": checkpoint,
@@ -5853,6 +8168,30 @@ async def _ensure_preflight_for_add(maxmsp: Any) -> dict:
     }
 
 
+def _is_preflight_required_error(exc: MaxMCPError) -> bool:
+    if exc.code != ERROR_PRECONDITION:
+        return False
+    return "PREFLIGHT REQUIRED" in (exc.message or "").upper()
+
+
+async def _bridge_supports_action(maxmsp: Any, action: str) -> bool:
+    capabilities = getattr(maxmsp, "capabilities", {})
+    supported = capabilities.get("supported_actions") if isinstance(capabilities, dict) else None
+    if isinstance(supported, list) and supported:
+        return action in supported
+
+    refresh = getattr(maxmsp, "refresh_capabilities", None)
+    if callable(refresh):
+        try:
+            refreshed = await refresh()
+        except Exception:
+            return False
+        supported = refreshed.get("supported_actions") if isinstance(refreshed, dict) else None
+        if isinstance(supported, list):
+            return action in supported
+    return False
+
+
 def _validate_add_max_object_payload(
     *,
     obj_type: str,
@@ -6005,6 +8344,8 @@ def _validate_add_max_object_payload(
 @mcp.tool()
 async def add_max_object(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     position: list,
     obj_type: str,
     varname: str,
@@ -6060,16 +8401,89 @@ async def add_max_object(
     if validation_error:
         return validation_error
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     if not isinstance(position, list) or len(position) != 2:
         return _error_result(
             ERROR_VALIDATION,
             "Position must be a list of two integers.",
         )
 
+    # Convert string args to proper types (preserves float intent from "25." strings)
+    converted_args = _convert_string_args(normalized_args)
+
+    mode = MAXMCP_PREFLIGHT_MODE
     preflight_meta = None
+    payload = {
+        "position": position,
+        "obj_type": normalized_obj_type,
+        "args": converted_args,
+        "varname": varname,
+    }
+    atomic_preflight_supported = False
+    if mode != "manual":
+        atomic_preflight_supported = await _bridge_supports_action(maxmsp, "add_object_with_preflight")
+
     try:
-        preflight_meta = await _ensure_preflight_for_add(maxmsp)
+        if atomic_preflight_supported:
+            response = await maxmsp.send_request(
+                dict(payload, action="add_object_with_preflight"),
+                timeout=5.0,
+                idempotency_key=idempotency_key or None,
+            )
+            preflight_meta = {
+                "mode": mode,
+                "performed": True,
+                "cache_hit": False,
+                "reason": "atomic_bridge_preflight",
+                "atomic": True,
+                "retry_performed": False,
+            }
+        else:
+            if mode == "manual":
+                preflight_meta = {
+                    "mode": mode,
+                    "performed": False,
+                    "cache_hit": False,
+                    "reason": "manual_mode",
+                    "atomic": False,
+                    "retry_performed": False,
+                }
+            else:
+                preflight_meta = await _ensure_preflight_for_add(maxmsp)
+                preflight_meta["atomic"] = False
+                preflight_meta["retry_performed"] = False
+
+            try:
+                response = await maxmsp.send_request(
+                    dict(payload, action="add_object"),
+                    timeout=5.0,
+                    idempotency_key=idempotency_key or None,
+                )
+            except MaxMCPError as e:
+                if mode != "manual" and _is_preflight_required_error(e):
+                    retry_meta = await _ensure_preflight_for_add(maxmsp)
+                    response = await maxmsp.send_request(
+                        dict(payload, action="add_object"),
+                        timeout=5.0,
+                        idempotency_key=idempotency_key or None,
+                    )
+                    preflight_meta.update(
+                        {
+                            "retry_performed": True,
+                            "retry_reason": "stale_preflight_state",
+                            "retry_preflight": retry_meta,
+                        }
+                    )
+                else:
+                    raise
     except MaxMCPError as e:
         return _error_result(
             e.code,
@@ -6086,22 +8500,6 @@ async def add_max_object(
             recoverable=True,
             details={"error": str(e)},
         )
-
-    # Convert string args to proper types (preserves float intent from "25." strings)
-    converted_args = _convert_string_args(normalized_args)
-
-    payload = {
-        "action": "add_object",
-        "position": position,
-        "obj_type": normalized_obj_type,
-        "args": converted_args,
-        "varname": varname,
-    }
-    response = await maxmsp.send_request(
-        payload,
-        timeout=5.0,
-        idempotency_key=idempotency_key or None,
-    )
     if compat_rewrite:
         try:
             maxmsp.newobj_compat_rewrites = int(getattr(maxmsp, "newobj_compat_rewrites", 0)) + 1
@@ -6124,6 +8522,8 @@ async def add_max_object(
 @mcp.tool()
 async def remove_max_object(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     idempotency_key: str = "",
 ):
@@ -6135,7 +8535,15 @@ async def remove_max_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "remove_object", "varname": varname}
     return await maxmsp.send_command(
         payload,
@@ -6146,6 +8554,8 @@ async def remove_max_object(
 @mcp.tool()
 async def connect_max_objects(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     src_varname: str,
     outlet_idx: int,
     dst_varname: str,
@@ -6165,7 +8575,15 @@ async def connect_max_objects(
     if _is_protected_varname(dst_varname):
         return _protected_varname_error(dst_varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "connect_objects",
         "src_varname": src_varname,
@@ -6182,6 +8600,8 @@ async def connect_max_objects(
 @mcp.tool()
 async def disconnect_max_objects(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     src_varname: str,
     outlet_idx: int,
     dst_varname: str,
@@ -6201,7 +8621,15 @@ async def disconnect_max_objects(
     if _is_protected_varname(dst_varname):
         return _protected_varname_error(dst_varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "disconnect_objects",
         "src_varname": src_varname,
@@ -6218,6 +8646,8 @@ async def disconnect_max_objects(
 @mcp.tool()
 async def set_object_attribute(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     attr_name: str,
     attr_value: list,
@@ -6233,7 +8663,15 @@ async def set_object_attribute(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "set_object_attribute",
         "varname": varname,
@@ -6249,6 +8687,8 @@ async def set_object_attribute(
 @mcp.tool()
 async def set_message_text(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     text_list: list,
     not_line_msg: bool = False,
@@ -6279,7 +8719,15 @@ async def set_message_text(
                 "Set not_line_msg=True if this message is not for line~/line.",
             )
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "set_message_text", "varname": varname, "new_text": text_list}
     return await maxmsp.send_command(
         payload,
@@ -6288,7 +8736,13 @@ async def set_message_text(
 
 
 @mcp.tool()
-async def send_bang_to_object(ctx: Context, varname: str, idempotency_key: str = ""):
+async def send_bang_to_object(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    varname: str,
+    idempotency_key: str = "",
+):
     """Send a bang to an object in MaxMSP.
 
     Args:
@@ -6297,7 +8751,15 @@ async def send_bang_to_object(ctx: Context, varname: str, idempotency_key: str =
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "send_bang_to_object", "varname": varname}
     return await maxmsp.send_command(
         payload,
@@ -6308,6 +8770,8 @@ async def send_bang_to_object(ctx: Context, varname: str, idempotency_key: str =
 @mcp.tool()
 async def send_messages_to_object(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     message: list,
     idempotency_key: str = "",
@@ -6328,7 +8792,15 @@ async def send_messages_to_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "send_message_to_object", "varname": varname, "message": message}
     return await maxmsp.send_command(
         payload,
@@ -6339,6 +8811,8 @@ async def send_messages_to_object(
 @mcp.tool()
 async def set_number(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     num: float,
     idempotency_key: str = "",
@@ -6354,7 +8828,15 @@ async def set_number(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "set_number", "varname": varname, "num": num}
     return await maxmsp.send_command(
         payload,
@@ -6377,14 +8859,7 @@ def search_objects(
     limit: int = 20,
     include_aliases: bool = True,
 ) -> dict:
-    """Search Max objects by name/alias using MaxPyLang metadata."""
-    if not maxpy_catalog.available:
-        return _error_result(
-            ERROR_PRECONDITION,
-            "MaxPyLang metadata index is unavailable.",
-            hint=f"Expected metadata under {maxpy_catalog.obj_info_dir}",
-            recoverable=True,
-        )
+    """Search Max objects by name/alias across MaxPyLang metadata and docs."""
     if not query.strip():
         return _error_result(
             ERROR_VALIDATION,
@@ -6392,36 +8867,111 @@ def search_objects(
             recoverable=True,
         )
 
+    query_lc = query.lower().strip()
     pkg = package.strip() or None
-    rows = maxpy_catalog.search(
-        query,
-        package=pkg,
-        limit=limit,
-        include_aliases=include_aliases,
-    )
+    bounded_limit = max(1, min(limit, 100))
+    merged_rows: dict[str, dict] = {}
+    ranking: dict[str, int] = {}
+
+    if maxpy_catalog.available:
+        maxpy_rows = maxpy_catalog.search(
+            query,
+            package=pkg,
+            limit=max(bounded_limit * 2, 20),
+            include_aliases=include_aliases,
+        )
+        for row in maxpy_rows:
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            merged_rows[name] = {
+                "name": name,
+                "package": row.get("package"),
+                "aliases": list(row.get("aliases") or []),
+                "source": "maxpy",
+                "schema_available": True,
+                "doc_available": name in flattened_docs,
+            }
+            score = _name_match_score(query_lc, name)
+            if score is None:
+                aliases = list(row.get("aliases") or [])
+                score_candidates = [
+                    _name_match_score(query_lc, str(alias))
+                    for alias in aliases
+                    if isinstance(alias, str)
+                ]
+                score_candidates = [candidate for candidate in score_candidates if candidate is not None]
+                score = min(score_candidates) if score_candidates else 3
+            ranking[name] = score
+
+    if pkg is None:
+        for name in flattened_docs.keys():
+            score = _name_match_score(query_lc, name)
+            if score is None:
+                continue
+            existing = merged_rows.get(name)
+            if existing:
+                existing["source"] = "merged"
+                existing["doc_available"] = True
+                ranking[name] = min(ranking.get(name, 99), score)
+                continue
+            merged_rows[name] = {
+                "name": name,
+                "package": None,
+                "aliases": [],
+                "source": "docs",
+                "schema_available": False,
+                "doc_available": True,
+            }
+            ranking[name] = score
+
+    ordered_names = sorted(
+        merged_rows.keys(),
+        key=lambda name: (ranking.get(name, 99), name),
+    )[:bounded_limit]
+    rows = [merged_rows[name] for name in ordered_names]
+
+    docs_only_count = sum(1 for row in rows if row.get("source") == "docs")
+    maxpy_only_count = sum(1 for row in rows if row.get("source") == "maxpy")
+    merged_count = sum(1 for row in rows if row.get("source") == "merged")
     return {
         "query": query,
         "package": pkg,
         "count": len(rows),
         "results": rows,
-        "schema_hash": maxpy_catalog.schema_hash,
+        "schema_hash": maxpy_catalog.schema_hash if maxpy_catalog.available else "",
+        "coverage": {
+            "maxpy_catalog_available": maxpy_catalog.available,
+            "maxpy_catalog_count": maxpy_catalog.count if maxpy_catalog.available else 0,
+            "docs_catalog_count": len(flattened_docs),
+            "docs_only_results": docs_only_count,
+            "maxpy_only_results": maxpy_only_count,
+            "merged_results": merged_count,
+        },
     }
 
 
 @mcp.tool()
 def get_object_schema(ctx: Context, object_name: str, include_aliases: bool = True) -> dict:
     """Return MaxPyLang schema details for a single Max object."""
+    fallback_schema = _build_docs_schema_fallback(object_name, include_aliases=include_aliases)
     if not maxpy_catalog.available:
+        if fallback_schema is not None:
+            return fallback_schema
+        suggestions = _docs_suggest(object_name)
         return _error_result(
             ERROR_PRECONDITION,
             "MaxPyLang metadata index is unavailable.",
             hint=f"Expected metadata under {maxpy_catalog.obj_info_dir}",
             recoverable=True,
+            details={"suggestions": suggestions},
         )
 
     schema = maxpy_catalog.get_schema(object_name)
     if schema is None:
-        suggestions = maxpy_catalog.suggest(object_name)
+        if fallback_schema is not None:
+            return fallback_schema
+        suggestions = sorted(set(maxpy_catalog.suggest(object_name) + _docs_suggest(object_name)))
         return _error_result(
             ERROR_OBJECT_NOT_FOUND,
             f"Object not found in MaxPyLang catalog: '{object_name}'.",
@@ -6434,8 +8984,12 @@ def get_object_schema(ctx: Context, object_name: str, include_aliases: bool = Tr
         schema["aliases"] = []
 
     doc = flattened_docs.get(schema["canonical_name"]) or flattened_docs.get(object_name)
+    schema["schema_available"] = True
+    schema["doc_available"] = bool(doc)
+    schema["source"] = "maxpy"
     if doc:
         schema["doc"] = doc
+        schema["source"] = "merged"
     schema["schema_hash"] = maxpy_catalog.schema_hash
     return schema
 
@@ -6455,7 +9009,9 @@ def get_object_doc(ctx: Context, object_name: str) -> dict:
     try:
         return flattened_docs[object_name]
     except KeyError:
-        suggestions = maxpy_catalog.suggest(object_name) if maxpy_catalog.available else []
+        suggestions = _docs_suggest(object_name)
+        if maxpy_catalog.available:
+            suggestions = sorted(set(suggestions + maxpy_catalog.suggest(object_name)))
         return _error_result(
             ERROR_VALIDATION,
             "Invalid object name.",
@@ -6467,6 +9023,8 @@ def get_object_doc(ctx: Context, object_name: str) -> dict:
 @mcp.tool()
 async def get_objects_in_patch(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
 ):
     """Retrieve the list of existing objects in the current Max patch.
 
@@ -6479,7 +9037,15 @@ async def get_objects_in_patch(
     Returns:
         list: A list of objects and patch cords.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return [error]
+    assert maxmsp is not None
     payload = {"action": "get_objects_in_patch"}
     response = await maxmsp.send_request(payload, timeout=5.0)
 
@@ -6489,6 +9055,8 @@ async def get_objects_in_patch(
 @mcp.tool()
 async def get_objects_in_selected(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
 ):
     """Retrieve the list of objects that is selected in a (unlocked) patcher window.
 
@@ -6497,7 +9065,15 @@ async def get_objects_in_selected(
     Returns:
         list: A list of objects and patch cords.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return [error]
+    assert maxmsp is not None
     payload = {"action": "get_objects_in_selected"}
     response = await maxmsp.send_request(payload, timeout=5.0)
 
@@ -6505,7 +9081,12 @@ async def get_objects_in_selected(
 
 
 @mcp.tool()
-async def get_object_attributes(ctx: Context, varname: str):
+async def get_object_attributes(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    varname: str,
+):
     """Retrieve an objects' attributes and values of the attributes.
 
     Use this to understand the state of an object.
@@ -6513,7 +9094,15 @@ async def get_object_attributes(ctx: Context, varname: str):
     Returns:
         list: A list of attributes name and attributes values.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return [error]
+    assert maxmsp is not None
     payload = {"action": "get_object_attributes"}
     kwargs = {"varname": varname}
     payload.update(kwargs)
@@ -6523,7 +9112,11 @@ async def get_object_attributes(ctx: Context, varname: str):
 
 
 @mcp.tool()
-async def get_avoid_rect_position(ctx: Context):
+async def get_avoid_rect_position(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+):
     """When deciding the position to add a new object to the path, this rectangular area
     should be avoid. This is useful when you want to add an object to the patch without
     overlapping with existing objects.
@@ -6531,7 +9124,15 @@ async def get_avoid_rect_position(ctx: Context):
     Returns:
         list: A list of four numbers representing the left, top, right, bottom of the rectangular area.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "get_avoid_rect_position"}
     response = await maxmsp.send_request(payload)
     avoid_rect, valid = _normalize_avoid_rect_payload(response)
@@ -6547,11 +9148,21 @@ async def get_avoid_rect_position(ctx: Context):
 @mcp.tool()
 async def get_patch_context(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     include_topology: bool = True,
     include_hierarchy: bool = True,
 ) -> dict:
     """Return a context-rich patch summary for planning and diagnostics."""
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     patch = await maxmsp.send_request({"action": "get_objects_in_patch"}, timeout=8.0)
     summary = {
         "object_count": 0,
@@ -6596,6 +9207,8 @@ async def get_patch_context(
 @mcp.tool()
 async def create_subpatcher(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     position: list,
     varname: str,
     name: str = "subpatch",
@@ -6614,7 +9227,15 @@ async def create_subpatcher(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "create_subpatcher",
         "position": position,
@@ -6628,7 +9249,13 @@ async def create_subpatcher(
 
 
 @mcp.tool()
-async def enter_subpatcher(ctx: Context, varname: str, idempotency_key: str = ""):
+async def enter_subpatcher(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    varname: str,
+    idempotency_key: str = "",
+):
     """Navigate into a subpatcher to add/modify objects inside it.
 
     After entering, all object operations (add_max_object, connect_max_objects, etc.)
@@ -6639,7 +9266,15 @@ async def enter_subpatcher(ctx: Context, varname: str, idempotency_key: str = ""
     Args:
         varname (str): Variable name of the subpatcher object to enter.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "enter_subpatcher", "varname": varname}
     return await maxmsp.send_command(
         payload,
@@ -6648,12 +9283,25 @@ async def enter_subpatcher(ctx: Context, varname: str, idempotency_key: str = ""
 
 
 @mcp.tool()
-async def exit_subpatcher(ctx: Context, idempotency_key: str = ""):
+async def exit_subpatcher(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    idempotency_key: str = "",
+):
     """Exit the current subpatcher and return to the parent patcher.
 
     If already at root level, this has no effect.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "exit_subpatcher"}
     return await maxmsp.send_command(
         payload,
@@ -6662,7 +9310,11 @@ async def exit_subpatcher(ctx: Context, idempotency_key: str = ""):
 
 
 @mcp.tool()
-async def get_patcher_context(ctx: Context):
+async def get_patcher_context(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+):
     """Get information about the current patcher navigation context.
 
     Returns the depth (0 = root), path of subpatcher names, and whether at root.
@@ -6670,7 +9322,15 @@ async def get_patcher_context(ctx: Context):
     Returns:
         dict: Context info with 'depth', 'path' (list of varnames), and 'is_root'.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "get_patcher_context"}
     response = await maxmsp.send_request(payload)
     return response
@@ -6679,6 +9339,8 @@ async def get_patcher_context(ctx: Context):
 @mcp.tool()
 async def add_subpatcher_io(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     position: list,
     io_type: str,
     varname: str,
@@ -6699,7 +9361,15 @@ async def add_subpatcher_io(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "add_subpatcher_io",
         "position": position,
@@ -6718,7 +9388,12 @@ async def add_subpatcher_io(
 
 
 @mcp.tool()
-async def get_object_connections(ctx: Context, varname: str):
+async def get_object_connections(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    varname: str,
+):
     """Get all connections (inputs and outputs) for a specific object.
 
     Returns connection information that can be used to restore connections
@@ -6731,7 +9406,15 @@ async def get_object_connections(ctx: Context, varname: str):
         dict: Contains 'inputs' (connections coming INTO this object) and
               'outputs' (connections going OUT of this object).
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "get_object_connections", "varname": varname}
     response = await maxmsp.send_request(payload)
     return response
@@ -6740,6 +9423,8 @@ async def get_object_connections(ctx: Context, varname: str):
 @mcp.tool()
 async def recreate_with_args(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     new_args: list,
     idempotency_key: str = "",
@@ -6764,7 +9449,15 @@ async def recreate_with_args(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "recreate_with_args", "varname": varname, "new_args": new_args}
     response = await maxmsp.send_request(
         payload,
@@ -6777,6 +9470,8 @@ async def recreate_with_args(
 @mcp.tool()
 async def move_object(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     x: int,
     y: int,
@@ -6795,7 +9490,15 @@ async def move_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "move_object", "varname": varname, "x": x, "y": y}
     response = await maxmsp.send_request(
         payload,
@@ -6807,6 +9510,8 @@ async def move_object(
 @mcp.tool()
 async def autofit_existing(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varname: str,
     idempotency_key: str = "",
 ):
@@ -6821,7 +9526,15 @@ async def autofit_existing(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "autofit_existing", "varname": varname}
     return await maxmsp.send_command(
         payload,
@@ -6830,7 +9543,11 @@ async def autofit_existing(
 
 
 @mcp.tool()
-async def check_signal_safety(ctx: Context):
+async def check_signal_safety(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+):
     """Analyze the current patch for potentially dangerous signal patterns.
 
     Checks for:
@@ -6842,7 +9559,15 @@ async def check_signal_safety(ctx: Context):
     Returns:
         dict: Contains 'warnings' list and 'safe' boolean.
     """
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {"action": "check_signal_safety"}
     response = await maxmsp.send_request(payload, timeout=5.0)
     return response
@@ -6851,6 +9576,8 @@ async def check_signal_safety(ctx: Context):
 @mcp.tool()
 async def encapsulate(
     ctx: Context,
+    project_id: str,
+    workspace_id: str,
     varnames: list,
     subpatcher_name: str,
     subpatcher_varname: str,
@@ -6876,7 +9603,15 @@ async def encapsulate(
     if _is_protected_varname(subpatcher_varname):
         return _protected_varname_error(subpatcher_varname)
 
-    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=True,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
     payload = {
         "action": "encapsulate",
         "varnames": varnames,
