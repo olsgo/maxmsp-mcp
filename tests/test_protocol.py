@@ -14,8 +14,10 @@ from server import (
     ERROR_PRECONDITION,
     ERROR_UNKNOWN_ACTION,
     ERROR_UNAUTHORIZED,
+    ERROR_VALIDATION,
     MaxMCPError,
     MaxMSPConnection,
+    MaxHygieneManager,
     MaxRuntimeManager,
     _normalize_add_object_spec,
     _normalize_avoid_rect_payload,
@@ -23,7 +25,9 @@ from server import (
     _resolve_auth_token_from_sources,
     add_max_object,
     get_avoid_rect_position,
+    get_object_schema,
     maxpy_catalog,
+    search_objects,
     dry_run_plan,
     run_patch_transaction,
 )
@@ -480,6 +484,26 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["valid"])
         self.assertTrue(any(warn.get("code") == ERROR_UNKNOWN_ACTION for warn in result["warnings"]))
 
+    async def test_dry_run_accepts_legacy_string_steps_with_warning(self):
+        fake_conn = SimpleNamespace()
+
+        async def fake_send_request(_payload, timeout=2.0):
+            return {"depth": 0, "path": [], "is_root": True}
+
+        fake_conn.send_request = fake_send_request
+        ctx = SimpleNamespace(
+            request_context=SimpleNamespace(lifespan_context={"maxmsp": fake_conn})
+        )
+        result = await dry_run_plan(
+            ctx,
+            steps=["check_signal_safety", "exit_subpatcher"],
+        )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["ending_virtual_depth"], 0)
+        self.assertTrue(
+            any("Legacy string step format is deprecated" in warn.get("message", "") for warn in result["warnings"])
+        )
+
 
 class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
     def test_normalize_add_object_spec_newobj_rewrite(self):
@@ -564,6 +588,46 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
         self.assertEqual(bridge.preflight_invalid_rects, 1)
 
+    async def test_add_max_object_prefers_atomic_preflight_when_supported(self):
+        actions = []
+
+        class FakeBridge:
+            def __init__(self):
+                self.capabilities = {
+                    "supported_actions": ["add_object_with_preflight"]
+                }
+                self.preflight_auto_calls = 0
+                self.preflight_cache_hits = 0
+                self.preflight_invalid_rects = 0
+                self.newobj_compat_rewrites = 0
+                self._preflight_last_at = 0.0
+
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                actions.append((payload.get("action"), json.loads(json.dumps(payload))))
+                return {"success": True}
+
+        bridge = FakeBridge()
+        ctx = SimpleNamespace(
+            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
+        )
+        original_mode = server_module.MAXMCP_PREFLIGHT_MODE
+        try:
+            server_module.MAXMCP_PREFLIGHT_MODE = "auto"
+            result = await add_max_object(
+                ctx,
+                position=[10, 20],
+                obj_type="button",
+                varname="atomic_obj",
+                args=[],
+            )
+        finally:
+            server_module.MAXMCP_PREFLIGHT_MODE = original_mode
+
+        self.assertTrue(result["success"])
+        self.assertEqual([entry[0] for entry in actions], ["add_object_with_preflight"])
+        self.assertTrue(result["meta"]["preflight"]["atomic"])
+        self.assertEqual(result["meta"]["preflight"]["reason"], "atomic_bridge_preflight")
+
 
 class MaxPyCatalogTests(unittest.TestCase):
     def test_maxpy_catalog_has_core_objects(self):
@@ -577,6 +641,56 @@ class MaxPyCatalogTests(unittest.TestCase):
         canonical, via_alias = maxpy_catalog.resolve_name("t")
         self.assertTrue(via_alias)
         self.assertEqual(canonical, "trigger")
+
+    def test_search_objects_includes_docs_fallback_for_live_path(self):
+        result = search_objects(None, query="live.path")
+        self.assertGreaterEqual(result["count"], 1)
+        self.assertTrue(any(row.get("name") == "live.path" for row in result["results"]))
+        self.assertTrue(any(row.get("source") in {"docs", "merged"} for row in result["results"]))
+
+    def test_get_object_schema_falls_back_to_docs_when_schema_missing(self):
+        result = get_object_schema(None, "live.path")
+        if isinstance(result, dict) and result.get("success") is False:
+            self.skipTest("live.path exists in MaxPy catalog for this environment.")
+        self.assertFalse(result["schema_available"])
+        self.assertTrue(result["doc_available"])
+        self.assertEqual(result["source"], "docs_fallback")
+
+
+class HygieneInventoryTests(unittest.TestCase):
+    def test_inventory_exposes_scan_diagnostics(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        runtime = MaxRuntimeManager(conn)
+        hygiene = MaxHygieneManager(runtime, conn)
+        hygiene._read_process_table_sync = lambda: (
+            [],
+            {
+                "available": False,
+                "method": "ps_axo",
+                "fallback_used": True,
+                "error": "ps_timeout",
+                "attempts": [{"method": "ps_axo"}, {"method": "ps_Ac"}],
+            },
+        )
+        hygiene._scan_open_documents_sync = lambda: {
+            "available": False,
+            "method": "osascript_jxa",
+            "reason": "osascript_error:timed out",
+            "failure_kind": "timeout",
+            "timeout_seconds": 3.0,
+            "documents": [],
+        }
+        hygiene._discover_managed_session_dirs_sync = lambda: []
+        inventory = hygiene._build_inventory_sync(
+            include_windows=True,
+            include_runtime_state=False,
+        )
+        self.assertIn("process_scan", inventory)
+        self.assertEqual(inventory["process_scan"]["method"], "ps_axo")
+        self.assertIn("window_scan", inventory)
+        self.assertEqual(inventory["window_scan"]["failure_kind"], "timeout")
+        self.assertEqual(inventory["summary"]["process_inventory_confidence"], "low")
 
 
 class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -860,6 +974,20 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
         def __init__(self):
             self.sio = SimpleNamespace(connected=True)
             self.current_target = "active"
+            self.progressive_calls = 0
+            self.export_calls = 0
+            self.strict_capability_gating = False
+            self.capabilities = {
+                "supported_actions": [
+                    "set_workspace_target",
+                    "get_objects_in_patch",
+                    "get_patcher_context",
+                    "apply_topology_snapshot",
+                    "apply_topology_snapshot_progressive",
+                    "export_amxd",
+                    "validate_amxd_open",
+                ]
+            }
             self.topologies = {
                 "active": {"boxes": [], "lines": []},
                 "scratch": {"boxes": [], "lines": []},
@@ -876,6 +1004,8 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             if action == "set_workspace_target":
                 self.current_target = payload.get("target_id", "active")
                 return {"success": True, "target_id": self.current_target}
+            if action == "capabilities":
+                return self.capabilities
             if action == "get_objects_in_patch":
                 return json.loads(
                     json.dumps(self.topologies.get(self.current_target, {"boxes": [], "lines": []}))
@@ -892,6 +1022,40 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     "skipped_boxes": 0,
                     "skipped_lines": 0,
                 }
+            if action == "apply_topology_snapshot_progressive":
+                snapshot = json.loads(json.dumps(payload.get("snapshot", {"boxes": [], "lines": []})))
+                self.topologies[self.current_target] = snapshot
+                self.progressive_calls += 1
+                return {
+                    "success": True,
+                    "done": True,
+                    "restored_boxes": len(snapshot.get("boxes", [])),
+                    "restored_lines": len(snapshot.get("lines", [])),
+                    "skipped_boxes": 0,
+                    "skipped_lines": 0,
+                    "chunks_processed": 1,
+                }
+            if action == "export_amxd":
+                output_path = Path(payload.get("output_path", ""))
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                ptch_payload = b"mx@c{}"
+                payload_bytes = (
+                    b"ampf"
+                    + (4).to_bytes(4, "little", signed=False)
+                    + b"aaaa"
+                    + b"meta"
+                    + (4).to_bytes(4, "little", signed=False)
+                    + (7).to_bytes(4, "little", signed=False)
+                    + b"ptch"
+                    + len(ptch_payload).to_bytes(4, "little", signed=False)
+                    + ptch_payload
+                )
+                output_path.write_bytes(payload_bytes)
+                self.export_calls += 1
+                return {"success": True, "output_path": str(output_path)}
+            if action == "validate_amxd_open":
+                target = Path(payload.get("path", ""))
+                return {"success": target.exists(), "path": str(target)}
             if action == "health_ping":
                 return {"ok": True}
             if action == "workspace_status":
@@ -1095,6 +1259,131 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("patcher", payload)
             self.assertEqual(payload["patcher"]["boxes"][0]["box"]["varname"], "out1")
 
+    async def test_load_patch_from_path_uses_progressive_apply_in_auto_mode(self):
+        bridge = self.FakeBridge()
+        runtime = MaxRuntimeManager(bridge)
+        runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "source.maxpat"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "patcher": {
+                            "boxes": [{"box": {"maxclass": "newobj", "varname": "a"}}],
+                            "lines": [],
+                        }
+                    }
+                )
+            )
+            loaded = await runtime.load_patch_from_path(
+                str(source_path),
+                target="active",
+                apply_mode="auto",
+                create_checkpoint_before_load=False,
+            )
+            self.assertTrue(loaded["success"])
+            self.assertEqual(loaded["import_summary"]["apply_mode_selected"], "progressive")
+            self.assertEqual(bridge.progressive_calls, 1)
+
+    async def test_load_patch_from_path_retries_progressive_timeout(self):
+        class FlakyProgressiveBridge(self.FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self._progressive_attempts = 0
+
+            async def send_request(
+                self,
+                payload,
+                timeout=2.0,
+                idempotency_key=None,
+                include_envelope=False,
+            ):
+                action = payload.get("action")
+                if action == "apply_topology_snapshot_progressive":
+                    self._progressive_attempts += 1
+                    if self._progressive_attempts == 1:
+                        raise MaxMCPError(
+                            ERROR_BRIDGE_TIMEOUT,
+                            "No response received in 1.0 seconds.",
+                            recoverable=True,
+                            details={},
+                        )
+                return await super().send_request(
+                    payload,
+                    timeout=timeout,
+                    idempotency_key=idempotency_key,
+                    include_envelope=include_envelope,
+                )
+
+        bridge = FlakyProgressiveBridge()
+        runtime = MaxRuntimeManager(bridge)
+        runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "source.maxpat"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "patcher": {
+                            "boxes": [{"box": {"maxclass": "newobj", "varname": "a"}}],
+                            "lines": [],
+                        }
+                    }
+                )
+            )
+            loaded = await runtime.load_patch_from_path(
+                str(source_path),
+                target="active",
+                apply_mode="progressive",
+                apply_retry_count=1,
+                apply_retry_backoff_seconds=0.0,
+                create_checkpoint_before_load=False,
+            )
+            self.assertTrue(loaded["success"])
+            self.assertEqual(loaded["apply_result"]["attempt"], 2)
+            self.assertEqual(len(loaded["apply_meta"]["attempts_failed"]), 1)
+
+    async def test_export_amxd_writes_and_validates_container(self):
+        bridge = self.FakeBridge()
+        runtime = MaxRuntimeManager(bridge)
+        runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            destination = tmp_path / "device.amxd"
+            exported = await runtime.export_amxd(
+                path=str(destination),
+                target="active",
+                validation_mode="format_only",
+            )
+            self.assertTrue(exported["success"])
+            self.assertTrue(destination.exists())
+            self.assertEqual(exported["format_validation"]["magic"], "ampf")
+            self.assertIn("ptch", exported["format_validation"]["chunk_ids"])
+            self.assertEqual(bridge.export_calls, 1)
+
+    async def test_export_amxd_rejects_non_amxd_extension(self):
+        bridge = self.FakeBridge()
+        runtime = MaxRuntimeManager(bridge)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            destination = tmp_path / "device.maxpat"
+            exported = await runtime.export_amxd(path=str(destination), target="active")
+            self.assertFalse(exported["success"])
+            self.assertEqual(exported["error"]["code"], ERROR_VALIDATION)
+
+    async def test_validate_amxd_file_sync_rejects_invalid_magic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            invalid = tmp_path / "invalid.amxd"
+            invalid.write_bytes(b"not-a-valid-amxd")
+            with self.assertRaises(MaxMCPError):
+                MaxRuntimeManager._validate_amxd_file_sync(invalid)
+
     async def test_load_patch_from_path_capability_gating_preflight(self):
         bridge = self.FakeBridge()
         bridge.strict_capability_gating = True
@@ -1118,6 +1407,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             result = await runtime.load_patch_from_path(
                 str(source),
                 target="active",
+                apply_mode="single",
                 create_checkpoint_before_load=False,
             )
             self.assertFalse(result["success"])
@@ -1168,6 +1458,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             result = await runtime.load_patch_from_path(
                 str(source),
                 target="active",
+                apply_mode="single",
                 create_checkpoint_before_load=False,
             )
             self.assertFalse(result["success"])
