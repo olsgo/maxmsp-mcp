@@ -136,11 +136,13 @@ When the MCP server starts, it will automatically:
 3. Open `MaxMSP_Agent/mcp_host.maxpat`
 4. Keep the bridge attached to `host` until a project/workspace is explicitly selected
 5. Reconnect the bridge if Max/bridge disconnects
+6. Acquire a single-instance server lock so only one MCP process can own the bridge at a time
 
 Useful tools:
 - `ensure_max_available()` - force readiness check and launch/reconnect if needed
 - `bridge_status()` - inspect bridge health
 - `get_bridge_metrics()` - latency/action/queue telemetry (optional recent events)
+- `get_bridge_slo_report()` - SLO-focused reliability report over rolling windows
 - `recover_bridge()` - force recovery sequence
 - `register_project()` / `list_projects()` - manage project scopes
 - `create_workspace()` / `list_workspaces()` / `select_workspace()` - manage and select workspace scopes
@@ -151,7 +153,6 @@ Useful tools:
 - `import_patch()` - import topology into a selected workspace (replace/merge/fail-if-not-empty)
 - `export_workspace()` - export a selected workspace topology to `.maxpat`/JSON
 - `open_patch_window()` / `close_patch_window()` - explicit Max document window control
-- `export_amxd(project_id, workspace_id, ...)` - export selected workspace to `.amxd` with validation
 - `list_max_system_sessions()` - system-wide Max process + patch visibility
 - `close_max_system_sessions()` - close stale/managed/custom Max sessions
 - `cleanup_max_hygiene()` - aggressive stale-process + stale-session GC
@@ -161,10 +162,14 @@ If your Max app is in a non-default path, set:
 - `MAXMCP_MAX_APP=/path/to/Max.app`
 
 Reliability/security knobs:
-- `MAXMCP_STRICT_V2_ENFORCEMENT=1` require protocol-v2 response envelopes
+- `MAXMCP_STRICT_V3=1` enforce strict protocol envelope validation (hard-cut; disabling is ignored)
+- `MAXMCP_STRICT_V2_ENFORCEMENT=1` legacy alias for strict protocol mode (deprecated; disabling is ignored)
 - `MAXMCP_STRICT_CAPABILITY_GATING=1` block actions not advertised by bridge capabilities
-- `MAXMCP_MUTATION_MAX_INFLIGHT=4` / `MAXMCP_MUTATION_MAX_QUEUE=64` mutation concurrency + queue backpressure
+- `MAXMCP_MUTATION_MAX_INFLIGHT=2` / `MAXMCP_MUTATION_MAX_QUEUE=32` mutation concurrency + queue backpressure
 - `MAXMCP_MUTATION_QUEUE_WAIT_TIMEOUT_SECONDS=15` max wait to acquire mutation slot
+- `MAXMCP_SERVER_LOCK_PATH=target/maxmcp/server.lock` single-instance lock file path (prevents dual MCP server processes)
+- `MAXMCP_MAXPYLANG_CHECK_EXTENDED_TIMEOUT_SECONDS=25` timeout for extended MaxPyLang readiness checks
+- `MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD="maxpylang --json --strict check --in {input_path}"` override command used for extended checks
 - `MAXMCP_PREFLIGHT_MODE=auto` object-placement preflight mode (`auto`, `session`, `manual`)
 - `MAXMCP_PREFLIGHT_CACHE_SECONDS=30` cache window used when `MAXMCP_PREFLIGHT_MODE=session`
 - `MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS=8` timeout for workspace topology capture during persist/switch
@@ -174,6 +179,9 @@ Reliability/security knobs:
 - `MAXMCP_IMPORT_APPLY_RETRY_COUNT=1` default retry count for import apply timeout/overload failures
 - `MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS=0.5` linear backoff per import apply retry
 - `MAXMCP_IMPORT_APPLY_CHUNK_SIZE=64` default chunk size when progressive apply mode is used
+- `MAXMCP_TRANSPORT_MAX_INFLIGHT=48` cap Node bridge in-flight request count
+- `MAXMCP_TRANSPORT_INFLIGHT_TTL_MS=45000` stale in-flight request timeout before Node bridge drops and fails request
+- `MAXMCP_TRANSPORT_INFLIGHT_SWEEP_MS=2000` Node bridge sweep interval for stale in-flight request cleanup
 - `MAXMCP_AUTH_TOKEN=...` shared token attached by Python bridge and validated in `max_mcp_node.js`
 - `MAXMCP_AUTH_TOKEN_FILE=~/.maxmsp-mcp/auth_token` fallback token file used when env token is unset
 - `MAXMCP_REQUIRE_HANDSHAKE_AUTH=1` require Socket.IO handshake auth (`auth.token` / `x-maxmcp-token`)
@@ -184,6 +192,8 @@ Reliability/security knobs:
 - `MAXMCP_ALERT_FAILURE_RATE=0.10` rolling failure-rate alert threshold
 - `MAXMCP_ALERT_P95_MS=1500` rolling p95 latency alert threshold (ms)
 - `MAXMCP_ALERT_QUEUE_DEPTH=0.80` queue saturation alert threshold (fraction)
+- `MAXMCP_ALERT_FILE_FALLBACK_RATIO=0.25` alert threshold for file-fallback handoff ratio
+- `MAXMCP_ALERT_FILE_FALLBACK_MIN_SUCCESSES=20` minimum successful handoffs before fallback ratio alerting
 - `MAXMCP_ALERT_WINDOW_SECONDS=300` rolling alert window
 - `MAXMCP_HYGIENE_AUTO_CLEANUP=1` enable background hygiene cleanup loop
 - `MAXMCP_HYGIENE_SCOPE=all_max_instances` cleanup scope (`all_max_instances` or `managed_only`)
@@ -191,6 +201,31 @@ Reliability/security knobs:
 - `MAXMCP_HYGIENE_STALE_SECONDS=1800` stale threshold (30m default)
 - `MAXMCP_HYGIENE_STARTUP_SWEEP=1` run startup cleanup once when runtime becomes ready
 - `MAXMCP_HYGIENE_MAX_KILLS_PER_SWEEP=50` cap process kills per sweep
+- `MAXMCP_REQUIRE_HEALTHY_READY=1` require bridge health success before runtime reports `ready=true`
+- `MAXMCP_HEALTH_CHECK_COOLDOWN_SECONDS=2.0` base cooldown between failed bridge health probes
+- `MAXMCP_FAILURE_BACKOFF_MAX_SECONDS=30.0` max exponential backoff for repeated health probe failures
+- `MAXMCP_TRANSPORT_FAILURE_CLEAR_CAPS_THRESHOLD=2` clear cached capabilities after repeated dict transport failures
+- `MAXMCP_TRANSPORT_HEALTH_PROBE_INTERVAL_MS=1500` Node-for-Max dict transport probe interval
+- `MAXMCP_TRANSPORT_FAILURE_THRESHOLD=3` consecutive dict handoff failures before opening transport circuit
+- `MAXMCP_TRANSPORT_FAILURE_COOLDOWN_MS=5000` circuit-open cooldown before next dict transport probe
+- `MAXMCP_TRANSPORT_REQUEST_RETRY_ATTEMPTS=2` per-request dict handoff retry attempts before fallback/error
+- `MAXMCP_TRANSPORT_REQUEST_RETRY_DELAY_MS=120` delay between dict handoff retries
+- `MAXMCP_TRANSPORT_REQUEST_FILE_FALLBACK=1` enable file-based request handoff fallback when Node `setDict` fails
+- `MAXMCP_TRANSPORT_FILE_DIR=/tmp/maxmcp_transport` temp directory for file-handoff payloads
+
+Transport contract:
+- Bridge transport is hard-cut to `dict_ref` for request/response payloads.
+- Legacy flat response payloads are no longer accepted; responses must include strict envelope fields (`protocol_version`, `request_id`, `state`).
+- Legacy framed transport actions (`_maxmcp_transport_begin/_chunk/_end`) are rejected with `TRANSPORT_LEGACY_DISABLED`.
+- Request handoff prefers dictionary transport and automatically retries; if Node `setDict` fails, the bridge can fall back to file-based request handoff (small control atom + temp JSON payload file).
+- If both dict and file handoff fail, the bridge returns `TRANSPORT_PROTOCOL_ERROR` immediately (no timeout-based hang fallback).
+- Node bridge tracks request ownership and routes responses back to the originating socket when possible.
+- Node bridge enforces bounded in-flight requests and expires stale in-flight requests with explicit failures instead of unbounded queue growth.
+- Under repeated dict handoff failures, health probes back off and runtime readiness remains `ready=false` until health recovers.
+
+Progressive import timeout semantics:
+- `apply_timeout_seconds` is enforced as a total budget per apply attempt (not per chunk call).
+- Each progressive chunk receives only the remaining timeout budget for that attempt.
 
 Patch file import/export tools return structured failures when bridge policy rejects an operation:
 - capability gating (`PRECONDITION_FAILED`)
@@ -232,10 +267,62 @@ Fast local checks (compile/parse + unit/protocol/soak):
 ./.venv/bin/python scripts/check_fast.py
 ```
 
-Live bridge checks (smoke + live E2E + soak):
+Live bridge checks (smoke + live E2E + synthetic queue soak + live runtime soak):
 
 ```bash
 ./.venv/bin/python scripts/check_live.py
+```
+
+Run extended MaxPyLang gate directly:
+
+```bash
+./.venv/bin/python scripts/maxpylang_check_extended.py --json
+```
+
+Run chaos/fault-injection gate directly:
+
+```bash
+./.venv/bin/python scripts/chaos_live_bridge.py --json --preset pr
+```
+
+Tiered gate runner:
+
+```bash
+./.venv/bin/python scripts/release_gate.py --profile fast
+./.venv/bin/python scripts/release_gate.py --profile full
+# strict release gate (extended + chaos + soak SLO)
+./.venv/bin/python scripts/release_gate.py --profile release --soak-seconds 1800
+```
+
+Quick live check without the long soak:
+
+```bash
+./.venv/bin/python scripts/check_live.py --profile quick --run-chaos --chaos-preset pr
+```
+
+Standalone live soak command:
+
+```bash
+./.venv/bin/python scripts/soak_live_bridge.py --duration-seconds 1800 --concurrency 4
+```
+
+If live soak fails, artifacts are written under:
+- `target/live_soak_artifacts/soak_failure_<timestamp>/`
+- Includes failure summary JSON, transport/metrics snapshot, process snapshot, and copied recent Max crash reports (when available).
+
+`check_live.py` also writes per-stage outputs and summary under:
+- `target/live_check_artifacts/live_check_<timestamp>/`
+- Includes stdout/stderr logs for each stage to speed up failure triage.
+
+### Release Verification Gate (Tiered)
+
+Run in this exact order for release sign-off:
+
+```bash
+./.venv/bin/python scripts/check_fast.py
+./.venv/bin/python scripts/smoke_managed_runtime.py --ready-timeout 30
+MAXMCP_RUN_LIVE_E2E=1 ./.venv/bin/python -m unittest -v tests/test_live_bridge_e2e.py
+./.venv/bin/python scripts/soak_live_bridge.py --duration-seconds 1800 --concurrency 4
 ```
 
 Rotate auth token and sync local client config (default client: codex):
@@ -305,6 +392,7 @@ Rotate auth token and sync local client config (default client: codex):
 |------|-------------|
 | `ensure_max_available()` | Ensure Max and bridge patch are available |
 | `bridge_status(verbose?)` | Runtime/bridge health summary |
+| `get_bridge_slo_report(window_seconds?, include_series?, max_points?)` | Reliability SLO snapshot with optional trend series |
 | `recover_bridge()` | Relaunch/reconnect bridge runtime |
 | `list_max_system_sessions(include_windows?, include_runtime_state?)` | Inventory Max processes/windows/sessions with scan diagnostics |
 | `close_max_system_sessions(target?, pids?, force?, dry_run?, max_count?)` | Close selected Max sessions/processes |
@@ -324,6 +412,9 @@ Rotate auth token and sync local client config (default client: codex):
 | `get_object_doc(name)` | Get Max documentation |
 | `sync_patch_twin(project_id, workspace_id, reason?)` | Sync in-memory topology twin |
 | `get_patch_drift(auto_resync?)` | Detect topology drift vs twin baseline |
+| `qa_audit_patch(project_id, workspace_id, ...)` | Run standards-oriented patch QA scoring and findings |
+| `validate_publish_readiness(project_id, workspace_id, ...)` | Aggregate QA/signal/diff gates into release readiness |
+| `diff_patch_summary(before_path, after_path, ...)` | Produce readable patch diff summary (maxdiff + fallback) |
 | `create_checkpoint(label?)` | Capture rollback checkpoint |
 | `list_checkpoints()` | List stored checkpoints |
 | `restore_checkpoint(id)` | Restore a checkpoint snapshot |
