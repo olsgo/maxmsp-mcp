@@ -1,10 +1,12 @@
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import server as server_module
 from server import (
@@ -12,9 +14,11 @@ from server import (
     ERROR_INTERNAL,
     ERROR_OVERLOADED,
     ERROR_PRECONDITION,
+    ERROR_PROTO_V3_MISSING_FIELD,
     ERROR_UNKNOWN_ACTION,
     ERROR_UNAUTHORIZED,
     ERROR_VALIDATION,
+    TRANSPORT_DICT_REF,
     MaxMCPError,
     MaxMSPConnection,
     MaxHygieneManager,
@@ -22,12 +26,17 @@ from server import (
     _normalize_add_object_spec,
     _normalize_avoid_rect_payload,
     _build_transaction_bridge_request,
+    _ServerInstanceLock,
     _resolve_auth_token_from_sources,
     add_max_object,
     get_avoid_rect_position,
+    get_bridge_slo_report,
     get_object_schema,
     maxpy_catalog,
     search_objects,
+    qa_audit_patch,
+    diff_patch_summary,
+    validate_publish_readiness,
     dry_run_plan,
     run_patch_transaction,
 )
@@ -49,6 +58,51 @@ class FakeSocketClient:
 
     async def disconnect(self):
         self.connected = False
+
+
+TEST_PROJECT_ID = "testproj"
+TEST_WORKSPACE_ID = "main"
+TEST_SCOPE = f"{TEST_PROJECT_ID}:{TEST_WORKSPACE_ID}"
+
+
+class _ScopedRuntimeStub:
+    async def activate_workspace(
+        self,
+        *,
+        project_id: str,
+        workspace_id: str,
+        create_if_missing: bool = True,
+    ) -> dict:
+        _ = create_if_missing
+        return {
+            "success": True,
+            "project_id": project_id,
+            "workspace_id": workspace_id,
+            "target_id": f"{project_id}:{workspace_id}",
+        }
+
+
+def _make_scoped_ctx(maxmsp, runtime=None):
+    selected_runtime = runtime if runtime is not None else _ScopedRuntimeStub()
+    return SimpleNamespace(
+        request_context=SimpleNamespace(
+            lifespan_context={"maxmsp": maxmsp, "runtime": selected_runtime}
+        )
+    )
+
+
+def _seed_workspace(runtime: MaxRuntimeManager) -> None:
+    runtime.register_project(
+        project_id=TEST_PROJECT_ID,
+        create_default_workspace=False,
+    )
+    runtime.create_workspace(
+        project_id=TEST_PROJECT_ID,
+        workspace_id=TEST_WORKSPACE_ID,
+    )
+    runtime.active_project_id = TEST_PROJECT_ID
+    runtime.active_workspace_id = TEST_WORKSPACE_ID
+    runtime.active_target = TEST_SCOPE
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -81,6 +135,118 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["action"], "health_ping")
         self.assertEqual(payload["payload"], {})
 
+    def test_build_request_envelope_does_not_mirror_payload_fields(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        envelope = conn._build_request_envelope(  # noqa: SLF001
+            {
+                "action": "add_object",
+                "payload": {
+                    "obj_type": "button",
+                    "position": [10, 20],
+                    "varname": "x1",
+                },
+            }
+        )
+        self.assertEqual(envelope["action"], "add_object")
+        self.assertIn("payload", envelope)
+        self.assertEqual(envelope["payload"]["obj_type"], "button")
+        self.assertNotIn("obj_type", envelope)
+        self.assertNotIn("position", envelope)
+        self.assertNotIn("varname", envelope)
+
+    async def test_refresh_capabilities_selects_dict_transport(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+
+        async def handler(_event, payload, _namespace):
+            req_id = payload["request_id"]
+            fut = conn._pending[req_id]
+            fut.set_result(
+                {
+                    "protocol_version": "2.0",
+                    "request_id": req_id,
+                    "state": "succeeded",
+                    "results": {
+                        "bridge_proto": server_module.BRIDGE_PROTO,
+                        "supported_actions": [],
+                        "supported_transports": [TRANSPORT_DICT_REF],
+                    },
+                }
+            )
+
+        conn.sio = FakeSocketClient(handler=handler)
+        caps = await conn.refresh_capabilities()
+        self.assertEqual(caps.get("bridge_proto"), server_module.BRIDGE_PROTO)
+        self.assertEqual(conn.request_transport, TRANSPORT_DICT_REF)
+        self.assertIn(TRANSPORT_DICT_REF, conn.supported_transports)
+
+    async def test_send_request_envelope_forces_dict_transport(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.request_transport = TRANSPORT_DICT_REF
+        conn.supported_transports = [TRANSPORT_DICT_REF]
+
+        async def handler(_event, payload, _namespace):
+            req_id = payload["request_id"]
+            fut = conn._pending[req_id]
+            fut.set_result(
+                {
+                    "protocol_version": "2.0",
+                    "request_id": req_id,
+                    "state": "succeeded",
+                    "results": {"transport": payload.get("transport")},
+                }
+            )
+
+        fake_sio = FakeSocketClient(handler=handler)
+        conn.sio = fake_sio
+        result = await conn.send_request(
+            {"action": "health_ping", "transport": "framed_json"},
+            timeout=1.0,
+        )
+        self.assertEqual(result.get("transport"), TRANSPORT_DICT_REF)
+        self.assertEqual(fake_sio.emits[0][1].get("transport"), TRANSPORT_DICT_REF)
+
+    async def test_send_request_rejects_capabilities_without_dict_transport(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        fake_sio = FakeSocketClient(handler=None)
+        conn.sio = fake_sio
+        conn.capabilities = {
+            "supported_actions": ["health_ping"],
+            "supported_transports": ["framed_json"],
+        }
+
+        with self.assertRaises(MaxMCPError) as ctx:
+            await conn.send_request({"action": "health_ping"}, timeout=1.0)
+        self.assertEqual(ctx.exception.code, ERROR_PRECONDITION)
+        self.assertEqual(len(fake_sio.emits), 0)
+
+    async def test_refresh_capabilities_without_dict_transport_blocks_requests(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+
+        async def handler(_event, payload, _namespace):
+            req_id = payload["request_id"]
+            fut = conn._pending[req_id]
+            fut.set_result(
+                {
+                    "protocol_version": "2.0",
+                    "request_id": req_id,
+                    "state": "succeeded",
+                    "results": {
+                        "bridge_proto": server_module.BRIDGE_PROTO,
+                        "supported_actions": ["health_ping"],
+                        "supported_transports": ["framed_json"],
+                    },
+                }
+            )
+
+        fake_sio = FakeSocketClient(handler=handler)
+        conn.sio = fake_sio
+        caps = await conn.refresh_capabilities()
+        self.assertEqual(caps.get("supported_transports"), ["framed_json"])
+        with self.assertRaises(MaxMCPError) as ctx:
+            await conn.send_request({"action": "health_ping"}, timeout=1.0)
+        self.assertEqual(ctx.exception.code, ERROR_PRECONDITION)
+        self.assertEqual(len(fake_sio.emits), 1)
+
     async def test_send_request_rejects_legacy_response_shape_when_strict(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
 
@@ -94,20 +260,23 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         conn.sio = FakeSocketClient(handler=handler)
         with self.assertRaises(MaxMCPError) as ctx:
             await conn.send_request({"action": "health_ping"}, timeout=1.0)
-        self.assertEqual(ctx.exception.code, ERROR_PRECONDITION)
+        self.assertEqual(ctx.exception.code, ERROR_PROTO_V3_MISSING_FIELD)
 
-    async def test_send_request_accepts_legacy_response_when_strict_disabled(self):
+    async def test_send_request_rejects_legacy_response_when_legacy_flag_disabled(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         conn.strict_v2_enforcement = False
 
         async def handler(_event, payload, _namespace):
             req_id = payload["request_id"]
             fut = conn._pending[req_id]
-            fut.set_result({"request_id": req_id, "results": {"legacy": True}})
+            fut.set_result(
+                conn._normalize_response({"request_id": req_id, "results": {"legacy": True}})
+            )
 
         conn.sio = FakeSocketClient(handler=handler)
-        result = await conn.send_request({"action": "health_ping"}, timeout=1.0)
-        self.assertEqual(result, {"legacy": True})
+        with self.assertRaises(MaxMCPError) as ctx:
+            await conn.send_request({"action": "health_ping"}, timeout=1.0)
+        self.assertEqual(ctx.exception.code, ERROR_PROTO_V3_MISSING_FIELD)
 
     async def test_send_request_raises_structured_failure(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
@@ -135,12 +304,74 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.code, ERROR_INTERNAL)
         self.assertEqual(ctx.exception.details["where"], "unit-test")
 
+    async def test_transport_failure_streak_clears_capabilities(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.capabilities = {
+            "supported_actions": ["health_ping", "workspace_status"],
+            "supported_transports": [TRANSPORT_DICT_REF],
+        }
+
+        async def handler(_event, payload, _namespace):
+            req_id = payload["request_id"]
+            fut = conn._pending[req_id]
+            fut.set_result(
+                {
+                    "protocol_version": "2.0",
+                    "request_id": req_id,
+                    "state": "failed",
+                    "error": {
+                        "code": "TRANSPORT_PROTOCOL_ERROR",
+                        "message": "Failed to hand off request through dictionary transport.",
+                        "recoverable": True,
+                        "details": {
+                            "required_transport": TRANSPORT_DICT_REF,
+                            "event": "request",
+                        },
+                    },
+                }
+            )
+
+        conn.sio = FakeSocketClient(handler=handler)
+        with self.assertRaises(MaxMCPError):
+            await conn.send_request({"action": "health_ping"}, timeout=1.0)
+        self.assertGreaterEqual(conn.transport_failure_streak, 1)
+        with self.assertRaises(MaxMCPError):
+            await conn.send_request({"action": "health_ping"}, timeout=1.0)
+        self.assertEqual(conn.capabilities, {})
+        self.assertEqual(conn.request_transport, TRANSPORT_DICT_REF)
+
     async def test_send_request_timeout_maps_to_bridge_timeout_error(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         conn.sio = FakeSocketClient(handler=None)
         with self.assertRaises(MaxMCPError) as ctx:
             await conn.send_request({"action": "health_ping"}, timeout=0.01)
         self.assertEqual(ctx.exception.code, ERROR_BRIDGE_TIMEOUT)
+
+    async def test_send_request_timeout_budget_exhausted_by_queue_wait(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = FakeSocketClient(handler=None)
+        conn.capabilities = {"supported_actions": ["add_object"]}
+
+        async def fake_acquire_mutation_slot(_action: str) -> float:
+            await asyncio.sleep(0.2)
+            return 0.2
+
+        conn._acquire_mutation_slot = fake_acquire_mutation_slot  # type: ignore[method-assign]
+
+        with self.assertRaises(MaxMCPError) as ctx:
+            await conn.send_request(
+                {
+                    "action": "add_object",
+                    "position": [10, 10],
+                    "obj_type": "button",
+                    "varname": "queue_timeout_obj",
+                    "args": [],
+                },
+                timeout=0.05,
+            )
+        self.assertEqual(ctx.exception.code, ERROR_BRIDGE_TIMEOUT)
+        self.assertEqual(len(conn.sio.emits), 0)
+        self.assertGreaterEqual(conn.total_timeouts, 1)
 
     async def test_idempotency_cache_prevents_duplicate_emit(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
@@ -250,7 +481,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         seen = []
 
         async def handler(_event, payload, _namespace):
-            seen.append(payload.get("varname"))
+            embedded = payload.get("payload", {}) if isinstance(payload.get("payload"), dict) else {}
+            varname = embedded.get("varname")
+            seen.append(varname)
             await asyncio.sleep(0.02)
             req_id = payload["request_id"]
             fut = conn._pending[req_id]
@@ -259,7 +492,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     "protocol_version": "2.0",
                     "request_id": req_id,
                     "state": "succeeded",
-                    "results": {"ok": True, "varname": payload.get("varname")},
+                    "results": {"ok": True, "varname": varname},
                 }
             )
 
@@ -385,6 +618,139 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(conn.last_metrics_log_emit_at)
         self.assertIn("metrics", payload)
 
+    def test_metrics_snapshot_alerts_on_sustained_file_fallback_ratio(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.transport_health = {
+            "handoff_stats": {
+                "dict_attempts": 30,
+                "dict_successes": 20,
+                "dict_failures": 10,
+                "file_fallback_attempts": 12,
+                "file_fallback_successes": 10,
+                "file_fallback_failures": 2,
+                "last_handoff_mode": "file_ref",
+            }
+        }
+        metrics = conn.metrics_snapshot()
+        alerts = {item.get("code") for item in metrics.get("alerts", [])}
+        self.assertIn("ALERT_TRANSPORT_FILE_FALLBACK", alerts)
+        rolling = metrics.get("rolling_windows", {})
+        self.assertEqual(rolling.get("transport_total_handoff_successes"), 30)
+        self.assertAlmostEqual(
+            float(rolling.get("transport_file_fallback_ratio", 0.0)),
+            10.0 / 30.0,
+            places=6,
+        )
+
+    def test_metrics_snapshot_no_file_fallback_alert_before_min_successes(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.transport_health = {
+            "handoff_stats": {
+                "dict_successes": 2,
+                "file_fallback_successes": 3,
+            }
+        }
+        metrics = conn.metrics_snapshot()
+        alerts = {item.get("code") for item in metrics.get("alerts", [])}
+        self.assertNotIn("ALERT_TRANSPORT_FILE_FALLBACK", alerts)
+        self.assertEqual(metrics["transport_handoff"]["total_successes"], 5)
+
+
+class ServerLockTests(unittest.TestCase):
+    def test_server_instance_lock_writes_metadata_and_releases_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "server.lock"
+            lock = _ServerInstanceLock(lock_path)
+            lock.acquire()
+            try:
+                self.assertTrue(lock_path.exists())
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload.get("pid"), os.getpid())
+                self.assertEqual(payload.get("lock_path"), str(lock_path))
+                self.assertIn("hostname", payload)
+                self.assertIn("acquired_at_epoch", payload)
+            finally:
+                lock.release()
+            self.assertFalse(lock_path.exists())
+
+    def test_server_instance_lock_reports_live_holder_on_lock_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "server.lock"
+            lock_path.write_text(json.dumps({"pid": 43210}), encoding="utf-8")
+            lock = _ServerInstanceLock(lock_path)
+
+            def _raise_blocking(_fd, _flags):
+                raise BlockingIOError("synthetic lock conflict")
+
+            fake_fcntl = SimpleNamespace(
+                LOCK_EX=1,
+                LOCK_NB=2,
+                LOCK_UN=8,
+                flock=_raise_blocking,
+            )
+
+            with patch.object(server_module, "fcntl", fake_fcntl):
+                with patch.object(_ServerInstanceLock, "_pid_alive", return_value=True):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        lock.acquire()
+
+            self.assertIn("already running", str(ctx.exception))
+
+
+class BridgeSLOTests(unittest.TestCase):
+    def test_get_bridge_slo_report_with_series(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        now = time.time()
+        conn._latency_samples.clear()
+        conn._latency_samples.extend(
+            [
+                {
+                    "duration_ms": 40.0,
+                    "queue_wait_ms": 2.0,
+                    "timestamp": now - 40.0,
+                    "action": "health_ping",
+                    "state": "succeeded",
+                },
+                {
+                    "duration_ms": 75.0,
+                    "queue_wait_ms": 4.0,
+                    "timestamp": now - 20.0,
+                    "action": "add_object",
+                    "state": "failed",
+                    "code": ERROR_INTERNAL,
+                },
+                {
+                    "duration_ms": 65.0,
+                    "queue_wait_ms": 3.0,
+                    "timestamp": now - 5.0,
+                    "action": "add_object",
+                    "state": "timeout",
+                    "code": ERROR_BRIDGE_TIMEOUT,
+                },
+            ]
+        )
+        ctx = SimpleNamespace(
+            request_context=SimpleNamespace(lifespan_context={"maxmsp": conn})
+        )
+        report = get_bridge_slo_report(
+            ctx,
+            window_seconds=120.0,
+            include_series=True,
+            max_points=12,
+        )
+        self.assertEqual(report["request_count"], 3)
+        self.assertEqual(report["failure_count"], 2)
+        self.assertGreater(report["rates"]["failure_rate"], 0.0)
+        self.assertIn("series", report)
+        self.assertGreaterEqual(len(report["series"]), 1)
+        self.assertIn(report["status"], {"pass", "warn", "fail"})
+
+    def test_get_bridge_slo_report_without_bridge(self):
+        ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context={}))
+        report = get_bridge_slo_report(ctx)
+        self.assertFalse(report["success"])
+        self.assertEqual(report["error"]["code"], "BRIDGE_UNAVAILABLE")
+
 
 class DryRunTests(unittest.IsolatedAsyncioTestCase):
     async def test_dry_run_validates_and_tracks_virtual_depth(self):
@@ -394,17 +760,18 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             return {"depth": 0, "path": [], "is_root": True}
 
         fake_conn.send_request = fake_send_request
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(
-                lifespan_context={"maxmsp": fake_conn}
-            )
-        )
+        ctx = _make_scoped_ctx(fake_conn)
         plan = [
             {"action": "enter_subpatcher", "params": {"varname": "p1"}},
             {"action": "add_max_object", "params": {"position": [0, 0], "obj_type": "+", "varname": "n1", "args": [0]}},
             {"action": "exit_subpatcher", "params": {}},
         ]
-        result = await dry_run_plan(ctx, plan)
+        result = await dry_run_plan(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            plan,
+        )
         self.assertFalse(result["valid"])
         self.assertEqual(result["ending_virtual_depth"], 0)
         self.assertGreaterEqual(len(result["errors"]), 1)
@@ -427,11 +794,7 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             return {}
 
         fake_conn.send_request = fake_send_request
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(
-                lifespan_context={"maxmsp": fake_conn}
-            )
-        )
+        ctx = _make_scoped_ctx(fake_conn)
 
         plan = [
             {
@@ -444,7 +807,13 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
         ]
-        result = await dry_run_plan(ctx, plan, engine="maxpy")
+        result = await dry_run_plan(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            plan,
+            engine="maxpy",
+        )
         self.assertFalse(result["valid"])
         self.assertEqual(result["engine"], "maxpy")
         self.assertGreaterEqual(len(result["errors"]), 1)
@@ -456,11 +825,11 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             return {"depth": 0, "path": [], "is_root": True}
 
         fake_conn.send_request = fake_send_request
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": fake_conn})
-        )
+        ctx = _make_scoped_ctx(fake_conn)
         result = await dry_run_plan(
             ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
             steps=[{"action": "totally_new_action", "params": {}}],
         )
         self.assertFalse(result["valid"])
@@ -473,11 +842,11 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             return {"depth": 0, "path": [], "is_root": True}
 
         fake_conn.send_request = fake_send_request
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": fake_conn})
-        )
+        ctx = _make_scoped_ctx(fake_conn)
         result = await dry_run_plan(
             ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
             steps=[{"action": "totally_new_action", "params": {}}],
             unknown_action_policy="warn",
         )
@@ -491,11 +860,11 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             return {"depth": 0, "path": [], "is_root": True}
 
         fake_conn.send_request = fake_send_request
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": fake_conn})
-        )
+        ctx = _make_scoped_ctx(fake_conn)
         result = await dry_run_plan(
             ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
             steps=["check_signal_safety", "exit_subpatcher"],
         )
         self.assertTrue(result["valid"])
@@ -544,14 +913,14 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
                 return {"success": True}
 
         bridge = FakeBridge()
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
-        )
+        ctx = _make_scoped_ctx(bridge)
         original_mode = server_module.MAXMCP_PREFLIGHT_MODE
         try:
             server_module.MAXMCP_PREFLIGHT_MODE = "auto"
             result = await add_max_object(
                 ctx,
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 position=[10, 20],
                 obj_type="newobj",
                 varname="compat_obj",
@@ -581,10 +950,12 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
                 return {}
 
         bridge = FakeBridge()
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
+        ctx = _make_scoped_ctx(bridge)
+        rect = await get_avoid_rect_position(
+            ctx,
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
         )
-        rect = await get_avoid_rect_position(ctx)
         self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
         self.assertEqual(bridge.preflight_invalid_rects, 1)
 
@@ -607,14 +978,14 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
                 return {"success": True}
 
         bridge = FakeBridge()
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(lifespan_context={"maxmsp": bridge})
-        )
+        ctx = _make_scoped_ctx(bridge)
         original_mode = server_module.MAXMCP_PREFLIGHT_MODE
         try:
             server_module.MAXMCP_PREFLIGHT_MODE = "auto"
             result = await add_max_object(
                 ctx,
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 position=[10, 20],
                 obj_type="button",
                 varname="atomic_obj",
@@ -627,6 +998,349 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry[0] for entry in actions], ["add_object_with_preflight"])
         self.assertTrue(result["meta"]["preflight"]["atomic"])
         self.assertEqual(result["meta"]["preflight"]["reason"], "atomic_bridge_preflight")
+
+
+class PublishReadinessToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qa_audit_patch_reports_findings(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "p1",
+                                    "boxtext": "print debug_value",
+                                    "patching_rect": [10.5, 20, 80, 20],
+                                }
+                            },
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "audio_out",
+                                    "boxtext": "dac~",
+                                    "patching_rect": [120, 20, 60, 20],
+                                }
+                            },
+                            {
+                                "box": {
+                                    "maxclass": "comment",
+                                    "varname": "c1",
+                                    "text": "TODO remove debug",
+                                    "patching_rect": [10, 60, 120, 20],
+                                }
+                            },
+                        ],
+                        "lines": [
+                            {
+                                "patchline": {
+                                    "source": ["p1", 0],
+                                    "destination": ["audio_out", 0],
+                                    "midpoints": [40, 20, 100, 20],
+                                }
+                            }
+                        ],
+                    }
+                if action == "check_signal_safety":
+                    return {
+                        "safe": False,
+                        "warnings": [
+                            {
+                                "type": "FEEDBACK_LOOP",
+                                "message": "Potentially dangerous feedback loop detected",
+                                "objects": ["p1", "audio_out"],
+                            }
+                        ],
+                    }
+                return {}
+
+        ctx = _make_scoped_ctx(FakeBridge())
+        result = await qa_audit_patch(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+        )
+        self.assertTrue(result["success"])
+        self.assertGreater(result["summary"]["critical_findings"], 0)
+        self.assertTrue(
+            any(finding.get("id") == "no_print_objects" for finding in result["findings"])
+        )
+        self.assertLess(result["score"]["overall"], 100.0)
+
+    async def test_validate_publish_readiness_passes_clean_patch(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "osc1",
+                                    "boxtext": "cycle~ 220",
+                                    "patching_rect": [10, 20, 80, 20],
+                                }
+                            }
+                        ],
+                        "lines": [],
+                    }
+                if action == "check_signal_safety":
+                    return {"safe": True, "warnings": []}
+                return {}
+
+        ctx = _make_scoped_ctx(FakeBridge())
+        result = await validate_publish_readiness(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            min_score=70.0,
+            require_extended_checks=False,
+            write_report=False,
+        )
+        self.assertTrue(result["success"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["report"]["gate_failures"], [])
+
+    async def test_validate_publish_readiness_fails_on_critical_findings(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "p1",
+                                    "boxtext": "print debug",
+                                    "patching_rect": [10, 20, 80, 20],
+                                }
+                            }
+                        ],
+                        "lines": [],
+                    }
+                if action == "check_signal_safety":
+                    return {
+                        "safe": False,
+                        "warnings": [
+                            {
+                                "type": "UNSAFE_FEEDBACK",
+                                "message": "comb~ feedback >= 1.0 will cause runaway gain",
+                            }
+                        ],
+                    }
+                return {}
+
+        ctx = _make_scoped_ctx(FakeBridge())
+        result = await validate_publish_readiness(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            min_score=95.0,
+            require_extended_checks=False,
+            write_report=False,
+        )
+        self.assertTrue(result["success"])
+        self.assertFalse(result["ready"])
+        self.assertGreater(len(result["report"]["gate_failures"]), 0)
+
+    async def test_validate_publish_readiness_fails_when_extended_check_fails(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "osc1",
+                                    "boxtext": "cycle~ 220",
+                                    "patching_rect": [10, 20, 80, 20],
+                                }
+                            }
+                        ],
+                        "lines": [],
+                    }
+                if action == "check_signal_safety":
+                    return {"safe": True, "warnings": []}
+                return {}
+
+        ctx = _make_scoped_ctx(FakeBridge())
+        with patch.object(
+            server_module,
+            "_run_maxpylang_check_extended_from_topology",
+            return_value={
+                "enabled": True,
+                "available": True,
+                "passed": False,
+                "failures": ["synthetic failure"],
+                "warnings": [],
+                "metrics": {},
+                "command": ["maxpylang"],
+                "input_path": "/tmp/synthetic.maxpat",
+            },
+        ):
+            result = await validate_publish_readiness(
+                ctx,
+                TEST_PROJECT_ID,
+                TEST_WORKSPACE_ID,
+                min_score=70.0,
+                require_extended_checks=True,
+                write_report=False,
+            )
+        self.assertTrue(result["success"])
+        self.assertFalse(result["ready"])
+        self.assertTrue(
+            any(item.get("gate") == "extended_checks" for item in result["report"]["gate_failures"])
+        )
+        self.assertIn("extended_checks", result["report"])
+        self.assertIn("protocol_v3", result["report"])
+
+    async def test_validate_publish_readiness_chaos_gate_requires_report(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "osc1",
+                                    "boxtext": "cycle~ 220",
+                                    "patching_rect": [10, 20, 80, 20],
+                                }
+                            }
+                        ],
+                        "lines": [],
+                    }
+                if action == "check_signal_safety":
+                    return {"safe": True, "warnings": []}
+                return {}
+
+        ctx = _make_scoped_ctx(FakeBridge())
+        result = await validate_publish_readiness(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            min_score=70.0,
+            require_extended_checks=False,
+            require_chaos_gate=True,
+            chaos_report_path="",
+            write_report=False,
+        )
+        self.assertTrue(result["success"])
+        self.assertFalse(result["ready"])
+        self.assertTrue(any(item.get("gate") == "chaos_gate" for item in result["report"]["gate_failures"]))
+        self.assertEqual(result["report"]["chaos_gate"]["required"], True)
+        self.assertEqual(result["report"]["chaos_gate"]["executed"], False)
+
+    async def test_validate_publish_readiness_accepts_valid_chaos_report(self):
+        class FakeBridge:
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout
+                _ = idempotency_key
+                action = payload.get("action")
+                if action == "get_objects_in_patch":
+                    return {
+                        "boxes": [
+                            {
+                                "box": {
+                                    "maxclass": "newobj",
+                                    "varname": "osc1",
+                                    "boxtext": "cycle~ 220",
+                                    "patching_rect": [10, 20, 80, 20],
+                                }
+                            }
+                        ],
+                        "lines": [],
+                    }
+                if action == "check_signal_safety":
+                    return {"safe": True, "warnings": []}
+                return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "chaos.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "summary": {"passed": True, "failures": []},
+                        "aggregate_slo": {"passed": True},
+                        "scenario_results": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = _make_scoped_ctx(FakeBridge())
+            result = await validate_publish_readiness(
+                ctx,
+                TEST_PROJECT_ID,
+                TEST_WORKSPACE_ID,
+                min_score=70.0,
+                require_extended_checks=False,
+                require_chaos_gate=True,
+                chaos_report_path=str(report_path),
+                write_report=False,
+            )
+        self.assertTrue(result["success"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["report"]["chaos_gate"]["required"], True)
+        self.assertEqual(result["report"]["chaos_gate"]["executed"], True)
+        self.assertEqual(result["report"]["chaos_gate"]["passed"], True)
+
+    def test_diff_patch_summary_internal_renderer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            before_path = tmp_path / "before.maxpat"
+            after_path = tmp_path / "after.maxpat"
+            before_path.write_text(
+                json.dumps(
+                    {
+                        "patcher": {
+                            "boxes": [{"box": {"maxclass": "newobj", "varname": "a"}}],
+                            "lines": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            after_path.write_text(
+                json.dumps(
+                    {
+                        "patcher": {
+                            "boxes": [{"box": {"maxclass": "newobj", "varname": "b"}}],
+                            "lines": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            diff = diff_patch_summary(
+                None,
+                before_path=str(before_path),
+                after_path=str(after_path),
+                prefer_maxdiff=False,
+                max_output_lines=120,
+            )
+            self.assertTrue(diff["success"])
+            self.assertGreater(diff["summary"]["changed_lines"], 0)
+            self.assertEqual(diff["summary"]["before_backend"], "internal")
+            self.assertIn("@@", diff["diff_preview"])
 
 
 class MaxPyCatalogTests(unittest.TestCase):
@@ -658,6 +1372,13 @@ class MaxPyCatalogTests(unittest.TestCase):
 
 
 class HygieneInventoryTests(unittest.TestCase):
+    def test_parse_elapsed_seconds_supports_etime_format(self):
+        self.assertEqual(MaxHygieneManager._parse_elapsed_seconds("59"), 59)
+        self.assertEqual(MaxHygieneManager._parse_elapsed_seconds("01:05"), 65)
+        self.assertEqual(MaxHygieneManager._parse_elapsed_seconds("02:03:04"), 7384)
+        self.assertEqual(MaxHygieneManager._parse_elapsed_seconds("1-00:00:01"), 86401)
+        self.assertIsNone(MaxHygieneManager._parse_elapsed_seconds("bad"))
+
     def test_inventory_exposes_scan_diagnostics(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         conn.sio = SimpleNamespace(connected=True)
@@ -694,14 +1415,82 @@ class HygieneInventoryTests(unittest.TestCase):
 
 
 class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collect_status_applies_backoff_after_transport_failure(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        runtime = MaxRuntimeManager(conn)
+        runtime.health_check_cooldown_seconds = 0.5
+        runtime.failure_backoff_max_seconds = 1.0
+        calls = {"health_ping": 0, "workspace_status": 0}
+
+        async def fake_send_request(payload, timeout=2.0, **_kwargs):
+            action = payload.get("action")
+            if action == "health_ping":
+                calls["health_ping"] += 1
+                raise MaxMCPError(
+                    "TRANSPORT_PROTOCOL_ERROR",
+                    "Failed to hand off request through dictionary transport.",
+                    recoverable=True,
+                    details={"required_transport": TRANSPORT_DICT_REF},
+                )
+            if action == "workspace_status":
+                calls["workspace_status"] += 1
+                return {"success": True}
+            return {"success": True}
+
+        conn.send_request = fake_send_request  # type: ignore[method-assign]
+        first = await runtime.collect_status(check_bridge=True)
+        self.assertFalse(first["bridge_healthy"])
+        self.assertIn("bridge_probe_backoff_seconds", first)
+        self.assertEqual(calls["workspace_status"], 0)
+
+        second = await runtime.collect_status(check_bridge=True)
+        self.assertFalse(second["bridge_healthy"])
+        self.assertTrue(second.get("bridge_probe_skipped"))
+        self.assertEqual(calls["health_ping"], 1)
+        self.assertEqual(calls["workspace_status"], 0)
+
+    async def test_ensure_runtime_ready_requires_healthy_bridge(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        runtime = MaxRuntimeManager(conn)
+        runtime.require_healthy_ready = True
+        runtime._resolve_host_patch = lambda: Path(__file__)
+        runtime._ensure_node_dependencies_sync = lambda: {"ready": True}
+        runtime._apply_target_to_bridge = lambda: asyncio.sleep(0, result={"success": True})
+        runtime._write_state = lambda _status: None
+
+        async def fake_start_server():
+            return True
+
+        conn.start_server = fake_start_server  # type: ignore[method-assign]
+
+        async def fake_send_request(payload, timeout=2.0, **_kwargs):
+            action = payload.get("action")
+            if action == "health_ping":
+                raise MaxMCPError(
+                    "TRANSPORT_PROTOCOL_ERROR",
+                    "Failed to hand off request through dictionary transport.",
+                    recoverable=True,
+                    details={"required_transport": TRANSPORT_DICT_REF},
+                )
+            if action == "workspace_status":
+                return {"success": True}
+            if action == "set_workspace_target":
+                return {"success": True}
+            return {"success": True}
+
+        conn.send_request = fake_send_request  # type: ignore[method-assign]
+        status = await runtime.ensure_runtime_ready()
+        self.assertFalse(status["ready"])
+        self.assertIn("dictionary transport", status["error"].lower())
+
     async def test_runtime_target_switch_without_bridge_connection(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         runtime = MaxRuntimeManager(conn)
         result = await runtime.set_active_target("scratch")
-        self.assertTrue(result["success"])
-        self.assertEqual(result["active_target"], "scratch")
-        self.assertFalse(result["apply_result"]["applied"])
-        self.assertEqual(result["apply_result"]["reason"], "bridge_disconnected")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"]["code"], ERROR_PRECONDITION)
 
     async def test_runtime_twin_detects_drift_and_auto_resync(self):
         topo_a = {
@@ -765,6 +1554,7 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
 
         bridge = FakeBridge()
         runtime = MaxRuntimeManager(bridge)
+        _seed_workspace(runtime)
         ckpt = await runtime.create_checkpoint(label="test")
         self.assertTrue(ckpt["success"])
         restored = await runtime.restore_checkpoint(ckpt["checkpoint_id"])
@@ -785,49 +1575,11 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error"]["code"], ERROR_PRECONDITION)
 
-    async def test_workspace_target_switch_persists_and_hydrates_workspace_files(self):
-        active_topology = {
-            "boxes": [
-                {
-                    "box": {
-                        "varname": "active_osc",
-                        "maxclass": "newobj",
-                        "patching_rect": [10.0, 10.0, 90.0, 32.0],
-                        "numinlets": 2,
-                        "numoutlets": 1,
-                        "boxtext": "cycle~ 440",
-                        "attributes": {"comment": "active"},
-                    }
-                }
-            ],
-            "lines": [],
-        }
-        scratch_topology = {
-            "boxes": [
-                {
-                    "box": {
-                        "varname": "scratch_gain",
-                        "maxclass": "newobj",
-                        "patching_rect": [20.0, 20.0, 100.0, 42.0],
-                        "numinlets": 2,
-                        "numoutlets": 1,
-                        "boxtext": "gain~",
-                        "attributes": {"comment": "scratch"},
-                    }
-                }
-            ],
-            "lines": [],
-        }
-
+    async def test_workspace_target_switch_accepts_scoped_target(self):
         class FakeBridge:
             def __init__(self):
                 self.sio = SimpleNamespace(connected=True)
-                self.current_target = "active"
-                self.topologies = {
-                    "active": json.loads(json.dumps(active_topology)),
-                    "scratch": {"boxes": [], "lines": []},
-                    "host": {"boxes": [], "lines": []},
-                }
+                self.current_target = "host"
 
             async def send_request(
                 self,
@@ -840,44 +1592,24 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
                 if action == "set_workspace_target":
                     self.current_target = payload.get("target_id", "host")
                     return {"success": True, "target_id": self.current_target}
-                if action == "get_objects_in_patch":
-                    return json.loads(
-                        json.dumps(self.topologies.get(self.current_target, {"boxes": [], "lines": []}))
-                    )
-                if action == "apply_topology_snapshot":
-                    snapshot = json.loads(json.dumps(payload.get("snapshot", {"boxes": [], "lines": []})))
-                    if self.current_target in {"active", "scratch"}:
-                        self.topologies[self.current_target] = snapshot
-                    return {"success": True}
-                if action == "get_patcher_context":
-                    return {"depth": 0, "path": [], "is_root": True}
                 return {"success": True}
 
         bridge = FakeBridge()
         runtime = MaxRuntimeManager(bridge)
+        runtime.register_project(
+            project_id=TEST_PROJECT_ID,
+            create_default_workspace=False,
+        )
+        runtime.create_workspace(
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
+        )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            runtime.session_dir = tmp_path
-            runtime.session_active_patch = tmp_path / "active.maxpat"
-            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
-            runtime.checkpoints_file = tmp_path / "checkpoints.json"
-            runtime._ensure_session_patches_sync()
-
-            switch_one = await runtime.set_active_target("scratch")
-            self.assertTrue(switch_one["success"])
-            active_payload = json.loads(runtime.session_active_patch.read_text())
-            active_from_file = runtime._extract_topology_from_payload(active_payload)
-            self.assertEqual(active_from_file["boxes"][0]["box"]["varname"], "active_osc")
-
-            bridge.topologies["scratch"] = json.loads(json.dumps(scratch_topology))
-            switch_two = await runtime.set_active_target("active")
-            self.assertTrue(switch_two["success"])
-            scratch_payload = json.loads(runtime.session_scratch_patch.read_text())
-            scratch_from_file = runtime._extract_topology_from_payload(scratch_payload)
-            self.assertEqual(scratch_from_file["boxes"][0]["box"]["varname"], "scratch_gain")
-            self.assertEqual(bridge.current_target, "active")
-            self.assertEqual(bridge.topologies["active"]["boxes"][0]["box"]["varname"], "active_osc")
+        switch_result = await runtime.set_active_target(TEST_SCOPE)
+        self.assertTrue(switch_result["success"])
+        self.assertEqual(switch_result["target_id"], TEST_SCOPE)
+        self.assertEqual(runtime.active_target, TEST_SCOPE)
+        self.assertEqual(bridge.current_target, TEST_SCOPE)
 
     async def test_checkpoint_journal_roundtrip(self):
         topology = {
@@ -899,6 +1631,7 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
 
         bridge = FakeBridge()
         runtime = MaxRuntimeManager(bridge)
+        _seed_workspace(runtime)
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -975,7 +1708,6 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.sio = SimpleNamespace(connected=True)
             self.current_target = "active"
             self.progressive_calls = 0
-            self.export_calls = 0
             self.strict_capability_gating = False
             self.capabilities = {
                 "supported_actions": [
@@ -984,13 +1716,12 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     "get_patcher_context",
                     "apply_topology_snapshot",
                     "apply_topology_snapshot_progressive",
-                    "export_amxd",
-                    "validate_amxd_open",
                 ]
             }
             self.topologies = {
                 "active": {"boxes": [], "lines": []},
                 "scratch": {"boxes": [], "lines": []},
+                TEST_SCOPE: {"boxes": [], "lines": []},
             }
 
         async def send_request(
@@ -1035,27 +1766,6 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     "skipped_lines": 0,
                     "chunks_processed": 1,
                 }
-            if action == "export_amxd":
-                output_path = Path(payload.get("output_path", ""))
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                ptch_payload = b"mx@c{}"
-                payload_bytes = (
-                    b"ampf"
-                    + (4).to_bytes(4, "little", signed=False)
-                    + b"aaaa"
-                    + b"meta"
-                    + (4).to_bytes(4, "little", signed=False)
-                    + (7).to_bytes(4, "little", signed=False)
-                    + b"ptch"
-                    + len(ptch_payload).to_bytes(4, "little", signed=False)
-                    + ptch_payload
-                )
-                output_path.write_bytes(payload_bytes)
-                self.export_calls += 1
-                return {"success": True, "output_path": str(output_path)}
-            if action == "validate_amxd_open":
-                target = Path(payload.get("path", ""))
-                return {"success": target.exists(), "path": str(target)}
             if action == "health_ping":
                 return {"ok": True}
             if action == "workspace_status":
@@ -1096,19 +1806,13 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(strict["success"])
             self.assertEqual(strict["error"]["code"], "VALIDATION_ERROR")
 
-    async def test_load_patch_from_path_replace_and_host_guard(self):
+    async def test_import_patch_replace(self):
         bridge = self.FakeBridge()
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            runtime.session_dir = tmp_path
-            runtime.session_active_patch = tmp_path / "active.maxpat"
-            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
-            runtime.checkpoints_file = tmp_path / "checkpoints.json"
-            runtime._ensure_session_patches_sync()
-
             source_path = tmp_path / "source.maxpat"
             source_payload = {
                 "patcher": {
@@ -1126,35 +1830,23 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             }
             source_path.write_text(json.dumps(source_payload))
 
-            host_reject = await runtime.load_patch_from_path(
-                str(source_path),
-                target="host",
-                create_checkpoint_before_load=False,
-            )
-            self.assertFalse(host_reject["success"])
-
-            loaded = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            loaded = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 mode="replace",
                 create_checkpoint_before_load=False,
             )
             self.assertTrue(loaded["success"])
-            self.assertEqual(bridge.topologies["active"]["boxes"][0]["box"]["varname"], "osc1")
+            self.assertEqual(bridge.topologies[TEST_SCOPE]["boxes"][0]["box"]["varname"], "osc1")
 
-    async def test_load_patch_from_path_remaps_line_refs_from_box_ids(self):
+    async def test_import_patch_remaps_line_refs_from_box_ids(self):
         bridge = self.FakeBridge()
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            runtime.session_dir = tmp_path
-            runtime.session_active_patch = tmp_path / "active.maxpat"
-            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
-            runtime.checkpoints_file = tmp_path / "checkpoints.json"
-            runtime._ensure_session_patches_sync()
-
             source_path = tmp_path / "id_refs.maxpat"
             source_payload = {
                 "patcher": {
@@ -1169,28 +1861,29 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             }
             source_path.write_text(json.dumps(source_payload))
 
-            loaded = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            loaded = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 mode="replace",
                 create_checkpoint_before_load=False,
             )
             self.assertTrue(loaded["success"])
             self.assertEqual(loaded["import_summary"]["generated_varnames"], 2)
             self.assertGreaterEqual(loaded["import_summary"]["line_ref_id_mappings"], 2)
-            self.assertEqual(len(bridge.topologies["active"]["lines"]), 1)
-            line = bridge.topologies["active"]["lines"][0]["patchline"]
+            self.assertEqual(len(bridge.topologies[TEST_SCOPE]["lines"]), 1)
+            line = bridge.topologies[TEST_SCOPE]["lines"][0]["patchline"]
             valid_vars = {
                 row["box"]["varname"]
-                for row in bridge.topologies["active"]["boxes"]
+                for row in bridge.topologies[TEST_SCOPE]["boxes"]
                 if isinstance(row, dict) and isinstance(row.get("box"), dict)
             }
             self.assertIn(line["source"][0], valid_vars)
             self.assertIn(line["destination"][0], valid_vars)
 
-    async def test_load_patch_from_path_merge_and_fail_if_not_empty(self):
+    async def test_import_patch_merge_and_fail_if_not_empty(self):
         bridge = self.FakeBridge()
-        bridge.topologies["active"] = {
+        bridge.topologies[TEST_SCOPE] = {
             "boxes": [{"box": {"maxclass": "newobj", "varname": "foo"}}],
             "lines": [],
         }
@@ -1199,12 +1892,6 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            runtime.session_dir = tmp_path
-            runtime.session_active_patch = tmp_path / "active.maxpat"
-            runtime.session_scratch_patch = tmp_path / "scratch.maxpat"
-            runtime.checkpoints_file = tmp_path / "checkpoints.json"
-            runtime._ensure_session_patches_sync()
-
             source_path = tmp_path / "merge.maxpat"
             source_path.write_text(
                 json.dumps(
@@ -1217,49 +1904,63 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            fail_nonempty = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            fail_nonempty = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 mode="fail_if_not_empty",
                 create_checkpoint_before_load=False,
             )
             self.assertFalse(fail_nonempty["success"])
             self.assertEqual(fail_nonempty["error"]["code"], "PRECONDITION_FAILED")
 
-            merged = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            merged = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 mode="merge",
                 auto_rename_collisions=True,
                 create_checkpoint_before_load=False,
             )
             self.assertTrue(merged["success"])
             self.assertEqual(merged["import_summary"]["collisions_count"], 1)
-            self.assertEqual(len(bridge.topologies["active"]["boxes"]), 2)
+            self.assertEqual(len(bridge.topologies[TEST_SCOPE]["boxes"]), 2)
             remap = merged["import_summary"]["varname_remap"]
             self.assertIn("foo", remap)
             self.assertNotEqual(remap["foo"], "foo")
 
-    async def test_save_patch_to_path_writes_payload(self):
+    async def test_export_workspace_writes_payload(self):
         bridge = self.FakeBridge()
-        bridge.topologies["active"] = {
+        bridge.topologies[TEST_SCOPE] = {
             "boxes": [{"box": {"maxclass": "newobj", "varname": "out1"}}],
             "lines": [],
         }
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+        runtime.register_project(
+            project_id=TEST_PROJECT_ID,
+            create_default_workspace=False,
+        )
+        runtime.create_workspace(
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             output = tmp_path / "export.maxpat"
-            saved = await runtime.save_patch_to_path(str(output), target="active")
+            saved = await runtime.export_workspace(
+                path=str(output),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
+            )
             self.assertTrue(saved["success"])
             self.assertTrue(output.exists())
             payload = json.loads(output.read_text())
             self.assertIn("patcher", payload)
             self.assertEqual(payload["patcher"]["boxes"][0]["box"]["varname"], "out1")
 
-    async def test_load_patch_from_path_uses_progressive_apply_in_auto_mode(self):
+    async def test_import_patch_uses_progressive_apply_in_auto_mode(self):
         bridge = self.FakeBridge()
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
@@ -1277,9 +1978,10 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             )
-            loaded = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            loaded = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 apply_mode="auto",
                 create_checkpoint_before_load=False,
             )
@@ -1287,7 +1989,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loaded["import_summary"]["apply_mode_selected"], "progressive")
             self.assertEqual(bridge.progressive_calls, 1)
 
-    async def test_load_patch_from_path_retries_progressive_timeout(self):
+    async def test_import_patch_retries_progressive_timeout(self):
         class FlakyProgressiveBridge(self.FakeBridge):
             def __init__(self):
                 super().__init__()
@@ -1334,9 +2036,10 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             )
-            loaded = await runtime.load_patch_from_path(
-                str(source_path),
-                target="active",
+            loaded = await runtime.import_patch(
+                path=str(source_path),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 apply_mode="progressive",
                 apply_retry_count=1,
                 apply_retry_backoff_seconds=0.0,
@@ -1346,45 +2049,87 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loaded["apply_result"]["attempt"], 2)
             self.assertEqual(len(loaded["apply_meta"]["attempts_failed"]), 1)
 
-    async def test_export_amxd_writes_and_validates_container(self):
-        bridge = self.FakeBridge()
-        runtime = MaxRuntimeManager(bridge)
-        runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+    async def test_progressive_apply_uses_remaining_timeout_budget(self):
+        class BudgetBridge(self.FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.progressive_timeout_args = []
+                self._progressive_calls = 0
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            destination = tmp_path / "device.amxd"
-            exported = await runtime.export_amxd(
-                path=str(destination),
-                target="active",
-                validation_mode="format_only",
+            async def send_request(
+                self,
+                payload,
+                timeout=2.0,
+                idempotency_key=None,
+                include_envelope=False,
+            ):
+                if payload.get("action") == "apply_topology_snapshot_progressive":
+                    _ = idempotency_key
+                    _ = include_envelope
+                    self._progressive_calls += 1
+                    self.progressive_timeout_args.append(float(timeout))
+                    await asyncio.sleep(0.05)
+                    if self._progressive_calls == 1:
+                        return {"done": False, "state": {"cursor": 1}}
+                    return {"done": True, "success": True, "chunks_processed": 2}
+                return await super().send_request(
+                    payload,
+                    timeout=timeout,
+                    idempotency_key=idempotency_key,
+                    include_envelope=include_envelope,
+                )
+
+        bridge = BudgetBridge()
+        runtime = MaxRuntimeManager(bridge)
+
+        result = await runtime._apply_topology_snapshot_progressive(
+            {"boxes": [{"box": {"maxclass": "newobj", "varname": "a"}}], "lines": []},
+            timeout_seconds=0.20,
+            chunk_size=1,
+        )
+        self.assertTrue(result.get("done"))
+        self.assertEqual(len(bridge.progressive_timeout_args), 2)
+        self.assertLess(
+            bridge.progressive_timeout_args[1],
+            bridge.progressive_timeout_args[0],
+        )
+
+    async def test_progressive_apply_enforces_total_timeout_budget(self):
+        class SlowBridge(self.FakeBridge):
+            async def send_request(
+                self,
+                payload,
+                timeout=2.0,
+                idempotency_key=None,
+                include_envelope=False,
+            ):
+                if payload.get("action") == "apply_topology_snapshot_progressive":
+                    _ = timeout
+                    _ = idempotency_key
+                    _ = include_envelope
+                    await asyncio.sleep(0.035)
+                    return {"done": False, "state": {"cursor": 1}}
+                return await super().send_request(
+                    payload,
+                    timeout=timeout,
+                    idempotency_key=idempotency_key,
+                    include_envelope=include_envelope,
+                )
+
+        bridge = SlowBridge()
+        runtime = MaxRuntimeManager(bridge)
+
+        with self.assertRaises(MaxMCPError) as ctx:
+            await runtime._apply_topology_snapshot_progressive(
+                {"boxes": [{"box": {"maxclass": "newobj", "varname": "a"}}], "lines": []},
+                timeout_seconds=0.06,
+                chunk_size=1,
             )
-            self.assertTrue(exported["success"])
-            self.assertTrue(destination.exists())
-            self.assertEqual(exported["format_validation"]["magic"], "ampf")
-            self.assertIn("ptch", exported["format_validation"]["chunk_ids"])
-            self.assertEqual(bridge.export_calls, 1)
+        self.assertEqual(ctx.exception.code, ERROR_BRIDGE_TIMEOUT)
+        self.assertIn("timeout budget", ctx.exception.message.lower())
+        self.assertIn("elapsed_seconds", ctx.exception.details)
 
-    async def test_export_amxd_rejects_non_amxd_extension(self):
-        bridge = self.FakeBridge()
-        runtime = MaxRuntimeManager(bridge)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            destination = tmp_path / "device.maxpat"
-            exported = await runtime.export_amxd(path=str(destination), target="active")
-            self.assertFalse(exported["success"])
-            self.assertEqual(exported["error"]["code"], ERROR_VALIDATION)
-
-    async def test_validate_amxd_file_sync_rejects_invalid_magic(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            invalid = tmp_path / "invalid.amxd"
-            invalid.write_bytes(b"not-a-valid-amxd")
-            with self.assertRaises(MaxMCPError):
-                MaxRuntimeManager._validate_amxd_file_sync(invalid)
-
-    async def test_load_patch_from_path_capability_gating_preflight(self):
+    async def test_import_patch_capability_gating_preflight(self):
         bridge = self.FakeBridge()
         bridge.strict_capability_gating = True
         bridge.capabilities = {"supported_actions": ["get_objects_in_patch"]}
@@ -1404,9 +2149,10 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             )
-            result = await runtime.load_patch_from_path(
-                str(source),
-                target="active",
+            result = await runtime.import_patch(
+                path=str(source),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 apply_mode="single",
                 create_checkpoint_before_load=False,
             )
@@ -1414,7 +2160,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["error"]["code"], ERROR_PRECONDITION)
             self.assertIn("missing_actions", result["error"]["details"])
 
-    async def test_load_patch_from_path_overloaded_apply_returns_structured_error(self):
+    async def test_import_patch_overloaded_apply_returns_structured_error(self):
         class OverloadedBridge(self.FakeBridge):
             async def send_request(
                 self,
@@ -1455,18 +2201,19 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
             )
-            result = await runtime.load_patch_from_path(
-                str(source),
-                target="active",
+            result = await runtime.import_patch(
+                path=str(source),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 apply_mode="single",
                 create_checkpoint_before_load=False,
             )
             self.assertFalse(result["success"])
             self.assertEqual(result["error"]["code"], ERROR_OVERLOADED)
             self.assertEqual(result["error"]["details"]["action"], "apply_topology_snapshot")
-            self.assertEqual(result["error"]["details"]["operation"], "load_patch_from_path")
+            self.assertEqual(result["error"]["details"]["operation"], "import_patch")
 
-    async def test_save_patch_to_path_unauthorized_returns_structured_error(self):
+    async def test_export_workspace_unauthorized_returns_structured_error(self):
         class UnauthorizedBridge(self.FakeBridge):
             async def send_request(
                 self,
@@ -1492,16 +2239,28 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
         bridge = UnauthorizedBridge()
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
+        runtime.register_project(
+            project_id=TEST_PROJECT_ID,
+            create_default_workspace=False,
+        )
+        runtime.create_workspace(
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "export.maxpat"
-            result = await runtime.save_patch_to_path(str(output), target="active")
+            result = await runtime.export_workspace(
+                path=str(output),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
+            )
             self.assertFalse(result["success"])
             self.assertEqual(result["error"]["code"], ERROR_UNAUTHORIZED)
             self.assertEqual(result["error"]["details"]["action"], "get_objects_in_patch")
-            self.assertEqual(result["error"]["details"]["operation"], "save_patch_to_path")
+            self.assertEqual(result["error"]["details"]["operation"], "export_workspace")
 
-    async def test_load_patch_from_path_rejects_disallowed_read_root(self):
+    async def test_import_patch_rejects_disallowed_read_root(self):
         bridge = self.FakeBridge()
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
@@ -1527,24 +2286,33 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            result = await runtime.load_patch_from_path(
-                str(source),
-                target="active",
+            result = await runtime.import_patch(
+                path=str(source),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
                 create_checkpoint_before_load=False,
             )
             self.assertFalse(result["success"])
             self.assertEqual(result["error"]["code"], ERROR_PRECONDITION)
             self.assertEqual(result["error"]["details"]["purpose"], "patch_read")
 
-    async def test_save_patch_to_path_rejects_disallowed_write_root(self):
+    async def test_export_workspace_rejects_disallowed_write_root(self):
         bridge = self.FakeBridge()
-        bridge.topologies["active"] = {
+        bridge.topologies[TEST_SCOPE] = {
             "boxes": [{"box": {"maxclass": "newobj", "varname": "out1"}}],
             "lines": [],
         }
         runtime = MaxRuntimeManager(bridge)
         runtime.ensure_runtime_ready = lambda: asyncio.sleep(0, result={"ready": True})
         runtime.enforce_patch_roots = True
+        runtime.register_project(
+            project_id=TEST_PROJECT_ID,
+            create_default_workspace=False,
+        )
+        runtime.create_workspace(
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1555,7 +2323,11 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
             runtime.allowed_patch_roots = [allowed.resolve()]
 
             output = blocked / "export.maxpat"
-            result = await runtime.save_patch_to_path(str(output), target="active")
+            result = await runtime.export_workspace(
+                path=str(output),
+                project_id=TEST_PROJECT_ID,
+                workspace_id=TEST_WORKSPACE_ID,
+            )
             self.assertFalse(result["success"])
             self.assertEqual(result["error"]["code"], ERROR_PRECONDITION)
             self.assertEqual(result["error"]["details"]["purpose"], "patch_write")
@@ -1634,11 +2406,8 @@ class TransactionExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         bridge = FakeBridge()
         runtime = MaxRuntimeManager(bridge)
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(
-                lifespan_context={"maxmsp": bridge, "runtime": runtime}
-            )
-        )
+        _seed_workspace(runtime)
+        ctx = _make_scoped_ctx(bridge, runtime=runtime)
         steps = [
             {
                 "action": "add_max_object",
@@ -1656,6 +2425,8 @@ class TransactionExecutionTests(unittest.IsolatedAsyncioTestCase):
         ]
         result = await run_patch_transaction(
             ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
             steps=steps,
             dry_run_engine="maxpy",
             rollback_on_error=True,
@@ -1666,7 +2437,7 @@ class TransactionExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["rollback"]["success"])
         self.assertEqual(bridge.applied_snapshot, {"boxes": [], "lines": []})
 
-    async def test_transaction_blocked_on_host_target(self):
+    async def test_transaction_requires_existing_workspace_scope(self):
         class FakeBridge:
             def __init__(self):
                 self.sio = SimpleNamespace(connected=True)
@@ -1678,19 +2449,19 @@ class TransactionExecutionTests(unittest.IsolatedAsyncioTestCase):
                 idempotency_key=None,
                 include_envelope=False,
             ):
-                raise AssertionError("transaction should fail before bridge calls in host mode")
+                raise AssertionError("transaction should fail before any bridge calls")
 
         bridge = FakeBridge()
         runtime = MaxRuntimeManager(bridge)
-        runtime.active_target = "host"
-        ctx = SimpleNamespace(
-            request_context=SimpleNamespace(
-                lifespan_context={"maxmsp": bridge, "runtime": runtime}
-            )
+        ctx = _make_scoped_ctx(bridge, runtime=runtime)
+        result = await run_patch_transaction(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            steps=[],
         )
-        result = await run_patch_transaction(ctx, steps=[])
         self.assertFalse(result["success"])
-        self.assertEqual(result.get("code"), ERROR_PRECONDITION)
+        self.assertEqual(result["error"]["code"], ERROR_VALIDATION)
 
 
 if __name__ == "__main__":
