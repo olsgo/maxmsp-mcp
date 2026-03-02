@@ -41,6 +41,8 @@ async def _run(timeout_ready: float) -> int:
                 "ready": status.get("ready"),
                 "bridge_connected": status.get("bridge_connected"),
                 "bridge_healthy": status.get("bridge_healthy"),
+                "bridge_ping_error": status.get("bridge_ping_error"),
+                "transport_health": status.get("transport_health"),
                 "max_app_exists": status.get("max_app_exists"),
                 "host_patch_exists": status.get("host_patch_exists"),
                 "node_modules_ready": status.get("node_modules_ready"),
@@ -52,6 +54,11 @@ async def _run(timeout_ready: float) -> int:
             return 2
 
         started_at = time.monotonic()
+        fatal_markers = (
+            "Failed to hand off request through dictionary transport.",
+            "Dictionary request transport is currently unhealthy.",
+            "Dictionary request transport is required but unavailable",
+        )
         while time.monotonic() - started_at < timeout_ready:
             health = await runtime.collect_status(check_bridge=True)
             if health.get("bridge_connected") and health.get("bridge_healthy"):
@@ -65,6 +72,17 @@ async def _run(timeout_ready: float) -> int:
                     },
                 )
                 break
+            ping_error = str(health.get("bridge_ping_error") or "")
+            if any(marker in ping_error for marker in fatal_markers):
+                _print_step(
+                    "bridge_status",
+                    {
+                        "error": "bridge transport unhealthy",
+                        "bridge_ping_error": ping_error,
+                        "transport_health": health.get("transport_health"),
+                    },
+                )
+                return 3
             await asyncio.sleep(0.5)
         else:
             _print_step("bridge_status", {"error": "bridge health check timed out"})

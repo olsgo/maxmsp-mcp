@@ -3,12 +3,16 @@ from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
 from collections import OrderedDict, deque, defaultdict
 from pathlib import Path
-from difflib import get_close_matches
+from difflib import get_close_matches, unified_diff
 import asyncio
 import subprocess
 import socketio
+import socket
+import re
 import signal
 import shutil
+import shlex
+import tempfile
 try:
     import aiohttp
 except Exception:  # pragma: no cover - optional dependency guard
@@ -22,6 +26,12 @@ import os
 import json
 import hashlib
 import math
+from datetime import datetime, timezone
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 SOCKETIO_SERVER_URL = os.environ.get("SOCKETIO_SERVER_URL", "http://127.0.0.1")
 SOCKETIO_SERVER_PORT = os.environ.get("SOCKETIO_SERVER_PORT", "5002")
@@ -43,6 +53,8 @@ MAXMCP_NPM_PROJECT_DIR = Path(os.path.join(current_dir, "MaxMSP_Agent"))
 MAXMCP_NPM_SENTINEL = MAXMCP_NPM_PROJECT_DIR / "node_modules" / "socket.io"
 PROTECTED_VARNAME_PREFIX = "__maxmcp_bridge_"
 PROTOCOL_VERSION = "2.0"
+BRIDGE_PROTO = os.environ.get("MAXMCP_BRIDGE_PROTO", "maxmcp-4").strip() or "maxmcp-4"
+TRANSPORT_DICT_REF = "dict_ref"
 MAXMCP_HEARTBEAT_INTERVAL_SECONDS = float(
     os.environ.get("MAXMCP_HEARTBEAT_INTERVAL_SECONDS", "10")
 )
@@ -65,6 +77,27 @@ MAXPYLANG_ROOT = Path(
 )
 MAXPYLANG_TEMPLATE_PATH = MAXPYLANG_ROOT / "data" / "PATCH_TEMPLATES" / "empty_template.json"
 MAXMCP_CHECKPOINT_MAX = int(os.environ.get("MAXMCP_CHECKPOINT_MAX", "20"))
+MAXMCP_MAXDEVTOOLS_ROOT = Path(
+    os.path.expanduser(
+        os.environ.get("MAXMCP_MAXDEVTOOLS_ROOT", "/Users/gjb/Projects/_max/maxdevtools")
+    )
+)
+MAXMCP_QA_REPORTS_DIR = Path(
+    os.path.expanduser(
+        os.environ.get(
+            "MAXMCP_QA_REPORTS_DIR",
+            os.path.join(current_dir, "target", "qa_reports"),
+        )
+    )
+)
+MAXMCP_SERVER_LOCK_PATH = Path(
+    os.path.expanduser(
+        os.environ.get(
+            "MAXMCP_SERVER_LOCK_PATH",
+            os.path.join(current_dir, "target", "maxmcp", "server.lock"),
+        )
+    )
+)
 
 ERROR_BRIDGE_UNAVAILABLE = "BRIDGE_UNAVAILABLE"
 ERROR_BRIDGE_TIMEOUT = "BRIDGE_TIMEOUT"
@@ -76,6 +109,15 @@ ERROR_UNKNOWN_ACTION = "UNKNOWN_ACTION"
 ERROR_PRECONDITION = "PRECONDITION_FAILED"
 ERROR_OVERLOADED = "OVERLOADED"
 ERROR_UNAUTHORIZED = "UNAUTHORIZED"
+ERROR_PROTO_V3_MISSING_FIELD = "PROTO_V3_MISSING_FIELD"
+ERROR_PROTO_V3_INVALID_TYPE = "PROTO_V3_INVALID_TYPE"
+ERROR_PROTO_V3_UNSUPPORTED_VERSION = "PROTO_V3_UNSUPPORTED_VERSION"
+BRIDGE_NODE_HELLO_EVENT = "bridge_node_hello"
+TRANSPORT_HANDOFF_FAILURE_MARKERS = (
+    "failed to hand off request through dictionary transport",
+    "dictionary request transport is currently unhealthy",
+    "dictionary request transport is required but unavailable",
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -88,16 +130,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
 MAXMCP_MANAGED_MODE = _env_bool("MAXMCP_MANAGED_MODE", True)
 MAXMCP_NPM_AUTO_INSTALL = _env_bool("MAXMCP_NPM_AUTO_INSTALL", True)
 MAXMCP_TWIN_AUTO_SYNC = _env_bool("MAXMCP_TWIN_AUTO_SYNC", True)
+MAXMCP_STRICT_V3 = _env_bool("MAXMCP_STRICT_V3", True)
 MAXMCP_STRICT_V2_ENFORCEMENT = _env_bool("MAXMCP_STRICT_V2_ENFORCEMENT", True)
 MAXMCP_STRICT_CAPABILITY_GATING = _env_bool("MAXMCP_STRICT_CAPABILITY_GATING", True)
+MAXMCP_REQUIRE_HEALTHY_READY = _env_bool("MAXMCP_REQUIRE_HEALTHY_READY", True)
 MAXMCP_REQUIRE_HANDSHAKE_AUTH = _env_bool("MAXMCP_REQUIRE_HANDSHAKE_AUTH", True)
 MAXMCP_AUTH_TOKEN_FILE = Path(
     os.path.expanduser(
         os.environ.get("MAXMCP_AUTH_TOKEN_FILE", "~/.maxmsp-mcp/auth_token")
     )
 )
-MAXMCP_MUTATION_MAX_INFLIGHT = int(os.environ.get("MAXMCP_MUTATION_MAX_INFLIGHT", "4"))
-MAXMCP_MUTATION_MAX_QUEUE = int(os.environ.get("MAXMCP_MUTATION_MAX_QUEUE", "64"))
+MAXMCP_MUTATION_MAX_INFLIGHT = int(os.environ.get("MAXMCP_MUTATION_MAX_INFLIGHT", "2"))
+MAXMCP_MUTATION_MAX_QUEUE = int(os.environ.get("MAXMCP_MUTATION_MAX_QUEUE", "32"))
 MAXMCP_MUTATION_QUEUE_WAIT_TIMEOUT_SECONDS = float(
     os.environ.get("MAXMCP_MUTATION_QUEUE_WAIT_TIMEOUT_SECONDS", "15")
 )
@@ -109,6 +153,12 @@ MAXMCP_METRICS_LOG_INTERVAL_SECONDS = float(
 MAXMCP_ALERT_FAILURE_RATE = float(os.environ.get("MAXMCP_ALERT_FAILURE_RATE", "0.10"))
 MAXMCP_ALERT_P95_MS = float(os.environ.get("MAXMCP_ALERT_P95_MS", "1500"))
 MAXMCP_ALERT_QUEUE_DEPTH = float(os.environ.get("MAXMCP_ALERT_QUEUE_DEPTH", "0.80"))
+MAXMCP_ALERT_FILE_FALLBACK_RATIO = float(
+    os.environ.get("MAXMCP_ALERT_FILE_FALLBACK_RATIO", "0.25")
+)
+MAXMCP_ALERT_FILE_FALLBACK_MIN_SUCCESSES = int(
+    os.environ.get("MAXMCP_ALERT_FILE_FALLBACK_MIN_SUCCESSES", "20")
+)
 MAXMCP_ALERT_WINDOW_SECONDS = float(os.environ.get("MAXMCP_ALERT_WINDOW_SECONDS", "300"))
 MAXMCP_ENFORCE_PATCH_ROOTS = _env_bool("MAXMCP_ENFORCE_PATCH_ROOTS", False)
 MAXMCP_ALLOWED_PATCH_ROOTS_RAW = os.environ.get("MAXMCP_ALLOWED_PATCH_ROOTS", "").strip()
@@ -125,6 +175,15 @@ MAXMCP_WORKSPACE_CAPTURE_RETRIES = int(
 MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS = float(
     os.environ.get("MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS", "0.5")
 )
+MAXMCP_HEALTH_CHECK_COOLDOWN_SECONDS = float(
+    os.environ.get("MAXMCP_HEALTH_CHECK_COOLDOWN_SECONDS", "2.0")
+)
+MAXMCP_FAILURE_BACKOFF_MAX_SECONDS = float(
+    os.environ.get("MAXMCP_FAILURE_BACKOFF_MAX_SECONDS", "30.0")
+)
+MAXMCP_TRANSPORT_FAILURE_CLEAR_CAPS_THRESHOLD = int(
+    os.environ.get("MAXMCP_TRANSPORT_FAILURE_CLEAR_CAPS_THRESHOLD", "2")
+)
 MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS = float(
     os.environ.get("MAXMCP_IMPORT_APPLY_TIMEOUT_SECONDS", "25")
 )
@@ -137,12 +196,24 @@ MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS = float(
 MAXMCP_IMPORT_APPLY_CHUNK_SIZE = int(
     os.environ.get("MAXMCP_IMPORT_APPLY_CHUNK_SIZE", "64")
 )
+MAXMCP_MAXPYLANG_CHECK_EXTENDED_TIMEOUT_SECONDS = float(
+    os.environ.get("MAXMCP_MAXPYLANG_CHECK_EXTENDED_TIMEOUT_SECONDS", "25")
+)
+MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD = os.environ.get(
+    "MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD",
+    "",
+).strip()
 if MAXMCP_PREFLIGHT_MODE not in {"auto", "manual", "session"}:
     logging.warning(
         "Invalid MAXMCP_PREFLIGHT_MODE '%s'; falling back to 'auto'.",
         MAXMCP_PREFLIGHT_MODE,
     )
     MAXMCP_PREFLIGHT_MODE = "auto"
+if not MAXMCP_STRICT_V3 or not MAXMCP_STRICT_V2_ENFORCEMENT:
+    logging.warning(
+        "Protocol strict mode hard-cutover is active. "
+        "MAXMCP_STRICT_V3/MAXMCP_STRICT_V2_ENFORCEMENT disabling is ignored."
+    )
 MAXMCP_HYGIENE_AUTO_CLEANUP = _env_bool("MAXMCP_HYGIENE_AUTO_CLEANUP", True)
 MAXMCP_HYGIENE_SCOPE = os.environ.get("MAXMCP_HYGIENE_SCOPE", "all_max_instances").strip()
 MAXMCP_HYGIENE_MODE = os.environ.get("MAXMCP_HYGIENE_MODE", "aggressive").strip()
@@ -183,6 +254,109 @@ MAXMCP_AUTH_TOKEN, MAXMCP_AUTH_TOKEN_SOURCE = _resolve_auth_token_from_sources(
     os.environ.get("MAXMCP_AUTH_TOKEN", ""),
     MAXMCP_AUTH_TOKEN_FILE,
 )
+
+
+class _ServerInstanceLock:
+    """Single-instance process lock for the MCP server."""
+
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self._handle: Any | None = None
+        self._acquired = False
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except Exception:
+            return False
+
+    def _read_existing_payload(self) -> dict:
+        try:
+            text = self.lock_path.read_text(encoding="utf-8")
+        except Exception:
+            return {}
+        if not text.strip():
+            return {}
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+    def acquire(self) -> None:
+        if self._acquired:
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    payload = self._read_existing_payload()
+                    holder_pid = payload.get("pid")
+                    if isinstance(holder_pid, int) and self._pid_alive(holder_pid):
+                        raise RuntimeError(
+                            "maxmsp-mcp server is already running "
+                            f"(pid={holder_pid}) and holds lock {self.lock_path}"
+                        ) from exc
+                    raise RuntimeError(
+                        f"Unable to acquire server lock at {self.lock_path}"
+                    ) from exc
+
+            payload = {
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "acquired_at_epoch": round(time.time(), 3),
+                "lock_path": str(self.lock_path),
+            }
+            handle.seek(0)
+            handle.truncate()
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            self._handle = handle
+            self._acquired = True
+        except Exception:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            raise
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            self._acquired = False
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+        self._acquired = False
+        try:
+            self.lock_path.unlink()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
 
 
 def _parse_path_roots(raw: str) -> list[Path]:
@@ -474,7 +648,6 @@ MUTATING_BRIDGE_ACTIONS = {
     "set_workspace_target",
     "apply_topology_snapshot",
     "apply_topology_snapshot_progressive",
-    "export_amxd",
 }
 BULK_BRIDGE_ACTIONS = {
     "get_objects_in_patch",
@@ -554,6 +727,9 @@ class MaxMSPConnection:
         self._idempotent_results: OrderedDict[str, Any] = OrderedDict()
         self.max_idempotency_cache_size = MAXMCP_IDEMPOTENCY_CACHE_SIZE
         self.protocol_version = PROTOCOL_VERSION
+        self.bridge_proto = BRIDGE_PROTO
+        self.supported_transports: list[str] = [TRANSPORT_DICT_REF]
+        self.request_transport = self._select_request_transport(self.supported_transports)
         self.capabilities: dict = {}
 
         self.connected_at: float | None = None
@@ -575,6 +751,7 @@ class MaxMSPConnection:
         self.heartbeat_interval_seconds = MAXMCP_HEARTBEAT_INTERVAL_SECONDS
         self.stale_threshold_seconds = MAXMCP_STALE_THRESHOLD_SECONDS
         self.strict_v2_enforcement = MAXMCP_STRICT_V2_ENFORCEMENT
+        self.strict_v3_enforcement = True
         self.strict_capability_gating = MAXMCP_STRICT_CAPABILITY_GATING
         self.auth_token = MAXMCP_AUTH_TOKEN
         self.auth_token_source = MAXMCP_AUTH_TOKEN_SOURCE
@@ -613,6 +790,16 @@ class MaxMSPConnection:
         self.newobj_compat_rewrites = 0
         self.workspace_capture_timeouts = 0
         self.workspace_capture_retries = 0
+        self.transport_failure_streak = 0
+        self.last_transport_failure_at: float | None = None
+        self.last_transport_failure_message: str | None = None
+        self.last_transport_failure_details: dict[str, Any] = {}
+        self.transport_health: dict[str, Any] = {}
+        self.bridge_build_id: str | None = None
+        self.node_bridge_build_id: str | None = None
+        self.node_hello_seen = False
+        self.node_hello_at: float | None = None
+        self.node_hello_payload: dict[str, Any] = {}
 
         @self.sio.on("response", namespace=self.namespace)
         async def _on_response(data):
@@ -622,6 +809,10 @@ class MaxMSPConnection:
             if fut and not fut.done():
                 fut.set_result(envelope)
 
+        @self.sio.on(BRIDGE_NODE_HELLO_EVENT, namespace=self.namespace)
+        async def _on_bridge_node_hello(data):
+            self._record_node_hello(data)
+
     def _normalize_response(self, payload: Any) -> dict:
         if not isinstance(payload, dict):
             return {
@@ -629,41 +820,337 @@ class MaxMSPConnection:
                 "request_id": None,
                 "state": "failed",
                 "error": {
-                    "code": ERROR_INTERNAL,
-                    "message": "Bridge returned non-dict response payload.",
+                    "code": ERROR_PROTO_V3_INVALID_TYPE,
+                    "message": "Bridge response payload must be an object.",
                     "recoverable": False,
-                    "details": {"payload_type": str(type(payload))},
+                    "details": {
+                        "field": "response",
+                        "expected_type": "object",
+                        "received_type": str(type(payload)),
+                    },
+                },
+                "results": None,
+            }
+        missing_fields = [
+            field
+            for field in ("protocol_version", "request_id", "state")
+            if field not in payload
+        ]
+        if missing_fields:
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": payload.get("request_id"),
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_MISSING_FIELD,
+                    "message": "Bridge response envelope is missing required fields.",
+                    "recoverable": False,
+                    "details": {
+                        "missing_fields": missing_fields,
+                        "received_keys": sorted(payload.keys()),
+                    },
                 },
                 "results": None,
             }
 
-        if "state" not in payload or "protocol_version" not in payload:
-            if self.strict_v2_enforcement:
-                return {
-                    "protocol_version": self.protocol_version,
-                    "request_id": payload.get("request_id"),
-                    "state": "failed",
-                    "error": {
-                        "code": ERROR_PRECONDITION,
-                        "message": (
-                            "Legacy bridge response envelope rejected. "
-                            "Bridge must emit protocol v2 envelopes."
-                        ),
-                        "recoverable": False,
-                        "details": {"received_keys": sorted(payload.keys())},
-                    },
-                }
+        protocol_version = payload.get("protocol_version")
+        if not isinstance(protocol_version, str):
             return {
                 "protocol_version": self.protocol_version,
                 "request_id": payload.get("request_id"),
-                "state": "succeeded",
-                "results": payload.get("results"),
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_INVALID_TYPE,
+                    "message": "Bridge response protocol_version must be a string.",
+                    "recoverable": False,
+                    "details": {
+                        "field": "protocol_version",
+                        "expected_type": "string",
+                        "received_type": str(type(protocol_version)),
+                    },
+                },
+                "results": None,
+            }
+        if protocol_version != self.protocol_version:
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": payload.get("request_id"),
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_UNSUPPORTED_VERSION,
+                    "message": "Unsupported bridge protocol_version in response.",
+                    "recoverable": False,
+                    "details": {
+                        "received_protocol_version": protocol_version,
+                        "expected_protocol_version": self.protocol_version,
+                    },
+                },
+                "results": None,
             }
 
+        request_id = payload.get("request_id")
+        if request_id is not None and not isinstance(request_id, str):
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": None,
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_INVALID_TYPE,
+                    "message": "Bridge response request_id must be a string or null.",
+                    "recoverable": False,
+                    "details": {
+                        "field": "request_id",
+                        "expected_type": "string|null",
+                        "received_type": str(type(request_id)),
+                    },
+                },
+                "results": None,
+            }
+
+        state = payload.get("state")
+        if not isinstance(state, str):
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": request_id,
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_INVALID_TYPE,
+                    "message": "Bridge response state must be a string.",
+                    "recoverable": False,
+                    "details": {
+                        "field": "state",
+                        "expected_type": "string",
+                        "received_type": str(type(state)),
+                    },
+                },
+                "results": None,
+            }
+        if state not in {"succeeded", "failed"}:
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": request_id,
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_INVALID_TYPE,
+                    "message": "Bridge response state is invalid.",
+                    "recoverable": False,
+                    "details": {
+                        "field": "state",
+                        "allowed_values": ["succeeded", "failed"],
+                        "received_value": state,
+                    },
+                },
+                "results": None,
+            }
+
+        bridge_proto = payload.get("bridge_proto")
+        if bridge_proto is not None and str(bridge_proto).strip() != self.bridge_proto:
+            return {
+                "protocol_version": self.protocol_version,
+                "request_id": request_id,
+                "state": "failed",
+                "error": {
+                    "code": ERROR_PROTO_V3_UNSUPPORTED_VERSION,
+                    "message": "Unsupported bridge_proto in response envelope.",
+                    "recoverable": False,
+                    "details": {
+                        "received_bridge_proto": str(bridge_proto),
+                        "expected_bridge_proto": self.bridge_proto,
+                    },
+                },
+                "results": None,
+            }
+
+        return dict(payload)
+
+    def _record_node_hello(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
         normalized = dict(payload)
-        normalized.setdefault("protocol_version", self.protocol_version)
-        normalized.setdefault("state", "succeeded")
+        self.node_hello_payload = normalized
+        self.node_hello_seen = True
+        self.node_hello_at = time.time()
+        build_id = str(normalized.get("node_bridge_build_id") or "").strip()
+        self.node_bridge_build_id = build_id or None
+        if isinstance(normalized.get("transport_health"), dict):
+            self.transport_health = dict(normalized.get("transport_health"))
+
+    def _validate_bridge_proto_capabilities(self, caps: dict) -> dict:
+        if not isinstance(caps, dict):
+            return {
+                "valid": False,
+                "received_bridge_proto": None,
+                "expected_bridge_proto": self.bridge_proto,
+                "reason": "non_dict_capabilities",
+            }
+        received = str(caps.get("bridge_proto") or "").strip() or None
+        if received is None:
+            return {
+                "valid": False,
+                "received_bridge_proto": None,
+                "expected_bridge_proto": self.bridge_proto,
+                "reason": "missing_bridge_proto",
+            }
+        if received != self.bridge_proto:
+            return {
+                "valid": False,
+                "received_bridge_proto": received,
+                "expected_bridge_proto": self.bridge_proto,
+                "reason": "bridge_proto_mismatch",
+            }
+        return {
+            "valid": True,
+            "received_bridge_proto": received,
+            "expected_bridge_proto": self.bridge_proto,
+            "reason": "ok",
+        }
+
+    @staticmethod
+    def _normalize_transport_name(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    def _extract_supported_transports(self, caps: dict) -> list[str]:
+        if not isinstance(caps, dict):
+            return []
+        raw = caps.get("supported_transports")
+        if not isinstance(raw, list):
+            return [TRANSPORT_DICT_REF]
+        normalized: list[str] = []
+        for item in raw:
+            name = self._normalize_transport_name(item)
+            if not name:
+                continue
+            if name not in normalized:
+                normalized.append(name)
         return normalized
+
+    def _select_request_transport(self, supported: list[str]) -> str:
+        if TRANSPORT_DICT_REF in supported:
+            return TRANSPORT_DICT_REF
+        return TRANSPORT_DICT_REF
+
+    def _enforce_transport_contract(self) -> None:
+        if not isinstance(self.capabilities, dict):
+            return
+        supported = self.capabilities.get("supported_transports")
+        if not isinstance(supported, list):
+            return
+        normalized: list[str] = []
+        for item in supported:
+            name = self._normalize_transport_name(item)
+            if name and name not in normalized:
+                normalized.append(name)
+        if normalized and TRANSPORT_DICT_REF not in normalized:
+            raise MaxMCPError(
+                ERROR_PRECONDITION,
+                "Bridge does not advertise required request transport 'dict_ref'.",
+                hint="Upgrade bridge runtime to dict_ref transport support.",
+                recoverable=False,
+                details={"supported_transports": normalized},
+            )
+
+    @staticmethod
+    def _is_dict_transport_failure(
+        code: str | None,
+        message: str | None,
+        details: dict | None,
+    ) -> bool:
+        normalized_code = str(code or "").strip()
+        normalized_message = str(message or "").lower()
+        normalized_details = details if isinstance(details, dict) else {}
+        if normalized_code not in {
+            "TRANSPORT_PROTOCOL_ERROR",
+            "TRANSPORT_CORRUPT_PAYLOAD",
+            "TRANSPORT_UNAVAILABLE",
+        }:
+            return False
+        if normalized_details.get("required_transport") == TRANSPORT_DICT_REF:
+            return True
+        if "dictionary transport" in normalized_message:
+            return True
+        if "dict request" in normalized_message or "dict response" in normalized_message:
+            return True
+        if "dict transport" in normalized_message:
+            return True
+        return False
+
+    def _record_transport_failure(
+        self,
+        *,
+        code: str | None,
+        message: str | None,
+        details: dict | None,
+    ) -> None:
+        self.transport_failure_streak += 1
+        self.last_transport_failure_at = time.time()
+        self.last_transport_failure_message = str(message or "")
+        self.last_connect_error = self.last_transport_failure_message
+        self.last_transport_failure_details = details if isinstance(details, dict) else {}
+        if (
+            self.transport_failure_streak
+            >= max(1, MAXMCP_TRANSPORT_FAILURE_CLEAR_CAPS_THRESHOLD)
+        ):
+            self.capabilities = {}
+            self.supported_transports = [TRANSPORT_DICT_REF]
+            self.request_transport = TRANSPORT_DICT_REF
+            self.bridge_build_id = None
+        if isinstance(self.last_transport_failure_details.get("transport_health"), dict):
+            self.transport_health = dict(self.last_transport_failure_details.get("transport_health"))
+
+    def _record_transport_success(self, *, details: dict | None = None) -> None:
+        self.transport_failure_streak = 0
+        self.last_transport_failure_at = None
+        self.last_transport_failure_message = None
+        self.last_transport_failure_details = {}
+        if isinstance(details, dict) and isinstance(details.get("transport_health"), dict):
+            self.transport_health = dict(details.get("transport_health"))
+
+    @staticmethod
+    def _extract_transport_handoff_metrics(bridge_reported: dict | None) -> dict:
+        source = bridge_reported if isinstance(bridge_reported, dict) else {}
+        raw = source.get("handoff_stats")
+        stats = raw if isinstance(raw, dict) else {}
+
+        def _as_int(value: Any) -> int:
+            try:
+                return max(0, int(value))
+            except Exception:
+                return 0
+
+        dict_attempts = _as_int(stats.get("dict_attempts"))
+        dict_successes = _as_int(stats.get("dict_successes"))
+        dict_failures = _as_int(stats.get("dict_failures"))
+        file_fallback_attempts = _as_int(stats.get("file_fallback_attempts"))
+        file_fallback_successes = _as_int(stats.get("file_fallback_successes"))
+        file_fallback_failures = _as_int(stats.get("file_fallback_failures"))
+        total_successes = dict_successes + file_fallback_successes
+        file_fallback_ratio = (
+            float(file_fallback_successes) / float(total_successes)
+            if total_successes > 0
+            else 0.0
+        )
+        return {
+            "dict_attempts": dict_attempts,
+            "dict_successes": dict_successes,
+            "dict_failures": dict_failures,
+            "file_fallback_attempts": file_fallback_attempts,
+            "file_fallback_successes": file_fallback_successes,
+            "file_fallback_failures": file_fallback_failures,
+            "total_successes": total_successes,
+            "file_fallback_ratio": round(file_fallback_ratio, 6),
+            "last_handoff_mode": str(stats.get("last_handoff_mode") or ""),
+        }
+
+    def transport_health_snapshot(self) -> dict:
+        handoff = self._extract_transport_handoff_metrics(self.transport_health)
+        return {
+            "failure_streak": self.transport_failure_streak,
+            "last_failure_at": self.last_transport_failure_at,
+            "last_failure_message": self.last_transport_failure_message,
+            "last_failure_details": self.last_transport_failure_details,
+            "bridge_reported": self.transport_health,
+            "handoff": handoff,
+        }
 
     def _is_mutating_action(self, action: str | None) -> bool:
         return isinstance(action, str) and action in MUTATING_BRIDGE_ACTIONS
@@ -787,6 +1274,7 @@ class MaxMSPConnection:
         p95_latency_ms = self._percentile(durations, 0.95)
         queue_capacity = max(1, self.mutation_max_queue)
         queue_depth_ratio = self._queued_mutation_requests / queue_capacity
+        handoff = self._extract_transport_handoff_metrics(self.transport_health)
 
         alerts: list[dict] = []
         if request_count and failure_rate >= self.alert_failure_rate:
@@ -833,6 +1321,24 @@ class MaxMSPConnection:
                 }
             )
 
+        if (
+            handoff["total_successes"] >= max(1, MAXMCP_ALERT_FILE_FALLBACK_MIN_SUCCESSES)
+            and handoff["file_fallback_ratio"] >= MAXMCP_ALERT_FILE_FALLBACK_RATIO
+        ):
+            alerts.append(
+                {
+                    "code": "ALERT_TRANSPORT_FILE_FALLBACK",
+                    "severity": "warn",
+                    "message": "File fallback ratio exceeded threshold.",
+                    "current": handoff["file_fallback_ratio"],
+                    "threshold": MAXMCP_ALERT_FILE_FALLBACK_RATIO,
+                    "guidance": (
+                        "Inspect dict transport health; sustained file fallback usually means "
+                        "dictionary handoff degradation."
+                    ),
+                }
+            )
+
         rolling = {
             "window_seconds": self.alert_window_seconds,
             "request_count": request_count,
@@ -840,6 +1346,8 @@ class MaxMSPConnection:
             "failure_rate": round(failure_rate, 4),
             "p95_latency_ms": p95_latency_ms,
             "queue_depth_ratio": round(queue_depth_ratio, 4),
+            "transport_file_fallback_ratio": handoff["file_fallback_ratio"],
+            "transport_total_handoff_successes": handoff["total_successes"],
         }
         return alerts, rolling
 
@@ -995,6 +1503,14 @@ class MaxMSPConnection:
     ) -> dict:
         request_id = str(uuid.uuid4())
         action = payload.get("action")
+        requested_transport = self._normalize_transport_name(payload.get("transport"))
+        selected_transport = self.request_transport
+        if requested_transport == TRANSPORT_DICT_REF:
+            selected_transport = (
+                requested_transport
+                if requested_transport in self.supported_transports
+                else self.request_transport
+            )
         action_payload = payload.get("payload")
         if action_payload is None:
             action_payload = {
@@ -1005,25 +1521,25 @@ class MaxMSPConnection:
                     "action",
                     "request_id",
                     "protocol_version",
+                    "bridge_proto",
                     "state",
                     "idempotency_key",
+                    "transport",
+                    "dict_ref",
                     "timestamp_ms",
                 }
             }
 
         envelope = {
             "protocol_version": self.protocol_version,
+            "bridge_proto": self.bridge_proto,
             "request_id": request_id,
             "state": "requested",
             "action": action,
             "payload": action_payload,
+            "transport": selected_transport,
             "timestamp_ms": int(time.time() * 1000),
         }
-        # Mirror payload fields at top-level for compatibility with legacy Max handlers.
-        if isinstance(action_payload, dict):
-            for k, v in action_payload.items():
-                if k not in envelope:
-                    envelope[k] = v
         if idempotency_key:
             envelope["idempotency_key"] = idempotency_key
         return envelope
@@ -1125,6 +1641,9 @@ class MaxMSPConnection:
             if timeout is not None
             else self._default_timeout_for_action(action)
         )
+        timeout_seconds = max(0.001, timeout_seconds)
+        request_deadline = time.monotonic() + timeout_seconds
+        remaining_timeout_seconds = timeout_seconds
         queue_wait_seconds = 0.0
         acquired_mutation_slot = False
         request_id: str | None = None
@@ -1134,12 +1653,25 @@ class MaxMSPConnection:
 
         await self.ensure_connected()
         if (
+            MAXMCP_REQUIRE_HEALTHY_READY
+            and isinstance(action, str)
+            and action not in UNGATED_ACTIONS
+            and self.transport_failure_streak > 0
+        ):
+            raise MaxMCPError(
+                ERROR_PRECONDITION,
+                "Bridge transport is unhealthy; refusing non-health request until recovery.",
+                recoverable=True,
+                details=self.transport_health_snapshot(),
+            )
+        if (
             self.strict_capability_gating
             and isinstance(action, str)
             and action not in UNGATED_ACTIONS
             and not self.capabilities
         ):
             await self.refresh_capabilities()
+        self._enforce_transport_contract()
         self._enforce_capabilities(action)
 
         if idempotency_key and idempotency_key in self._idempotent_results:
@@ -1167,6 +1699,13 @@ class MaxMSPConnection:
 
         envelope = self._build_request_envelope(payload, idempotency_key=idempotency_key)
         request_id = envelope["request_id"]
+        envelope_chars = 0
+        try:
+            envelope_chars = len(
+                json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+            )
+        except Exception:
+            envelope_chars = 0
         if self.auth_token:
             envelope["auth_token"] = self.auth_token
             envelope["auth"] = {"token": self.auth_token}
@@ -1177,9 +1716,12 @@ class MaxMSPConnection:
         started_at = time.perf_counter()
 
         try:
+            remaining_timeout_seconds = request_deadline - time.monotonic()
+            if remaining_timeout_seconds <= 0.0:
+                raise asyncio.TimeoutError()
             await self.sio.emit("request", envelope, namespace=self.namespace)
             logging.info("Request to MaxMSP: %s", self._redact_sensitive(envelope))
-            response_envelope = await asyncio.wait_for(future, timeout_seconds)
+            response_envelope = await asyncio.wait_for(future, remaining_timeout_seconds)
             self.last_response_at = time.time()
             state = response_envelope.get("state", "succeeded")
             duration_ms = (time.perf_counter() - started_at) * 1000.0
@@ -1191,6 +1733,14 @@ class MaxMSPConnection:
                     self.action_failure_counts[action] += 1
                 err = response_envelope.get("error") or {}
                 err_code = err.get("code", ERROR_INTERNAL)
+                err_message = err.get("message", "Bridge request failed.")
+                err_details = err.get("details") if isinstance(err.get("details"), dict) else {}
+                if self._is_dict_transport_failure(err_code, err_message, err_details):
+                    self._record_transport_failure(
+                        code=err_code,
+                        message=err_message,
+                        details=err_details,
+                    )
                 self._latency_samples.append(
                     {
                         "duration_ms": round(duration_ms, 3),
@@ -1204,22 +1754,23 @@ class MaxMSPConnection:
                 self._push_event(
                     level="error",
                     code=err_code,
-                    message=err.get("message", "Bridge request failed."),
+                    message=err_message,
                     action=action if isinstance(action, str) else None,
                     request_id=request_id,
-                    details=err.get("details") if isinstance(err.get("details"), dict) else {},
+                    details=err_details,
                 )
                 raise MaxMCPError(
                     err_code,
-                    err.get("message", "Bridge request failed."),
+                    err_message,
                     hint=err.get("hint"),
                     recoverable=bool(err.get("recoverable", True)),
-                    details=err.get("details") if isinstance(err.get("details"), dict) else {},
+                    details=err_details,
                 )
 
             self.total_successes += 1
             self.consecutive_failures = 0
             self.last_successful_request_at = time.time()
+            self._record_transport_success()
             self._latency_samples.append(
                 {
                     "duration_ms": round(duration_ms, 3),
@@ -1275,15 +1826,38 @@ class MaxMSPConnection:
             self._push_event(
                 level="warn",
                 code=ERROR_BRIDGE_TIMEOUT,
-                message=f"No response received in {timeout_seconds} seconds.",
+                message=(
+                    "No response received before timeout budget expired "
+                    f"(timeout={timeout_seconds:.3f}s, queue_wait={queue_wait_seconds:.3f}s, "
+                    f"dispatch_budget={max(0.0, remaining_timeout_seconds):.3f}s)."
+                ),
                 action=action if isinstance(action, str) else None,
                 request_id=request_id,
+                details={
+                    "payload_chars": envelope_chars,
+                    "timeout_seconds_requested": round(timeout_seconds, 6),
+                    "timeout_seconds_dispatch_budget": round(
+                        max(0.0, remaining_timeout_seconds), 6
+                    ),
+                    "queue_wait_ms": round(queue_wait_seconds * 1000.0, 3),
+                },
             )
             raise MaxMCPError(
                 ERROR_BRIDGE_TIMEOUT,
-                f"No response received in {timeout_seconds} seconds.",
+                (
+                    "No response received before timeout budget expired "
+                    f"(timeout={timeout_seconds:.3f}s, queue_wait={queue_wait_seconds:.3f}s, "
+                    f"dispatch_budget={max(0.0, remaining_timeout_seconds):.3f}s)."
+                ),
                 hint="Check bridge health and retry with a higher timeout for large patches.",
                 recoverable=True,
+                details={
+                    "timeout_seconds_requested": round(timeout_seconds, 6),
+                    "timeout_seconds_dispatch_budget": round(
+                        max(0.0, remaining_timeout_seconds), 6
+                    ),
+                    "queue_wait_ms": round(queue_wait_seconds * 1000.0, 3),
+                },
             )
         except MaxMCPError:
             raise
@@ -1321,6 +1895,9 @@ class MaxMSPConnection:
         try:
             # Connect to the server
             full_url = f"{self.server_url}:{self.server_port}"
+            self.node_hello_seen = False
+            self.node_hello_at = None
+            self.node_hello_payload = {}
             connect_kwargs: dict[str, Any] = {"namespaces": [self.namespace]}
             if self.auth_token:
                 connect_kwargs["auth"] = {"token": self.auth_token}
@@ -1344,23 +1921,51 @@ class MaxMSPConnection:
             await self.sio.disconnect()
 
     async def refresh_capabilities(self) -> dict:
-        try:
-            caps = await self.send_request({"action": "capabilities"}, timeout=2.0)
-            if isinstance(caps, dict):
-                caps.setdefault("maxpy_catalog", {})
-                if isinstance(caps["maxpy_catalog"], dict):
-                    caps["maxpy_catalog"].update(
-                        {
-                            "available": maxpy_catalog.available,
-                            "schema_hash": maxpy_catalog.schema_hash,
-                            "object_count": maxpy_catalog.count,
-                            "packages": maxpy_catalog.packages,
-                        }
-                    )
-                self.capabilities = caps
-                return caps
-        except Exception as e:
-            self.last_connect_error = str(e)
+        attempted_transports: list[str] = []
+        for transport in [TRANSPORT_DICT_REF]:
+            normalized = self._normalize_transport_name(transport)
+            if normalized in attempted_transports:
+                continue
+            attempted_transports.append(normalized)
+            try:
+                caps = await self.send_request(
+                    {"action": "capabilities", "transport": normalized},
+                    timeout=2.0,
+                )
+            except Exception as e:
+                self.last_connect_error = str(e)
+                continue
+
+            if not isinstance(caps, dict):
+                self.last_connect_error = (
+                    "Invalid capabilities payload type: "
+                    f"{type(caps).__name__}"
+                )
+                continue
+
+            bridge_proto_validation = self._validate_bridge_proto_capabilities(caps)
+            caps["bridge_proto_validation"] = bridge_proto_validation
+            supported_transports = self._extract_supported_transports(caps)
+            self.supported_transports = supported_transports
+            self.request_transport = self._select_request_transport(supported_transports)
+            caps["supported_transports"] = supported_transports
+            caps["selected_request_transport"] = self.request_transport
+            self.bridge_build_id = str(caps.get("bridge_build_id") or "").strip() or None
+            if isinstance(caps.get("transport_health"), dict):
+                self.transport_health = dict(caps.get("transport_health"))
+            caps.setdefault("maxpy_catalog", {})
+            if isinstance(caps["maxpy_catalog"], dict):
+                caps["maxpy_catalog"].update(
+                    {
+                        "available": maxpy_catalog.available,
+                        "schema_hash": maxpy_catalog.schema_hash,
+                        "object_count": maxpy_catalog.count,
+                        "packages": maxpy_catalog.packages,
+                    }
+                )
+            self.capabilities = caps
+            self._record_transport_success(details={"transport_health": self.transport_health})
+            return caps
         return {}
 
     async def ping_bridge(self, timeout: float = 2.0) -> dict:
@@ -1385,8 +1990,17 @@ class MaxMSPConnection:
 
         return {
             "protocol_version": self.protocol_version,
+            "bridge_proto": self.bridge_proto,
+            "bridge_build_id": self.bridge_build_id,
+            "node_bridge_build_id": self.node_bridge_build_id,
+            "node_hello_seen": self.node_hello_seen,
+            "node_hello_at": self.node_hello_at,
+            "node_hello_payload": self.node_hello_payload,
+            "request_transport": self.request_transport,
+            "supported_transports": list(self.supported_transports),
             "connected": bool(self.sio.connected),
             "endpoint": self.endpoint,
+            "server_lock_path": str(MAXMCP_SERVER_LOCK_PATH),
             "stale": stale,
             "response_age_seconds": response_age,
             "request_age_seconds": request_age,
@@ -1423,6 +2037,7 @@ class MaxMSPConnection:
                 "source": self.auth_token_source,
                 "token_file": str(self.auth_token_file),
             },
+            "transport_health": self.transport_health_snapshot(),
             "capabilities": self.capabilities,
         }
 
@@ -1506,6 +2121,7 @@ class MaxMSPConnection:
                 "timeouts": self.workspace_capture_timeouts,
                 "retry_attempts": self.workspace_capture_retries,
             },
+            "transport_handoff": self._extract_transport_handoff_metrics(self.transport_health),
             "actions": action_stats,
             "last_log_emit_at": self.last_metrics_log_emit_at,
         }
@@ -1516,6 +2132,214 @@ class MaxMSPConnection:
             bounded = max(1, int(event_limit))
             snapshot["recent_events"] = list(self._event_log)[-bounded:]
         return snapshot
+
+    def slo_report(
+        self,
+        *,
+        window_seconds: float | None = None,
+        include_series: bool = False,
+        max_points: int = 120,
+    ) -> dict:
+        """Return SLO-focused reliability report derived from rolling bridge samples."""
+        now = time.time()
+        bounded_window = max(30.0, float(window_seconds or self.alert_window_seconds))
+        threshold = now - bounded_window
+        bounded_points = max(4, min(int(max_points), 1000))
+        samples = [
+            sample
+            for sample in self._latency_samples
+            if isinstance(sample, dict) and float(sample.get("timestamp", 0.0)) >= threshold
+        ]
+        durations = [
+            float(sample.get("duration_ms", 0.0))
+            for sample in samples
+            if isinstance(sample.get("duration_ms"), (int, float))
+        ]
+        queue_waits = [
+            float(sample.get("queue_wait_ms", 0.0))
+            for sample in samples
+            if isinstance(sample.get("queue_wait_ms"), (int, float))
+        ]
+
+        request_count = len(samples)
+        success_count = 0
+        failure_count = 0
+        timeout_count = 0
+        action_counts: dict[str, dict[str, int]] = {}
+        for sample in samples:
+            state = str(sample.get("state", "") or "")
+            action = str(sample.get("action", "unknown") or "unknown")
+            row = action_counts.setdefault(
+                action,
+                {"requests": 0, "succeeded": 0, "failed": 0, "timeouts": 0},
+            )
+            row["requests"] += 1
+            if state == "succeeded":
+                success_count += 1
+                row["succeeded"] += 1
+            elif state == "timeout":
+                timeout_count += 1
+                failure_count += 1
+                row["timeouts"] += 1
+                row["failed"] += 1
+            elif state == "failed":
+                failure_count += 1
+                row["failed"] += 1
+
+        failure_rate = (failure_count / request_count) if request_count else 0.0
+        timeout_rate = (timeout_count / request_count) if request_count else 0.0
+        p95_latency = self._percentile(durations, 0.95)
+        p99_latency = self._percentile(durations, 0.99)
+        p95_queue_wait = self._percentile(queue_waits, 0.95)
+        queue_capacity = max(1, self.mutation_max_queue)
+        queue_depth_ratio = self._queued_mutation_requests / queue_capacity
+        handoff = self._extract_transport_handoff_metrics(self.transport_health)
+
+        burn_rate = (
+            failure_rate / max(0.000001, float(self.alert_failure_rate))
+            if request_count
+            else 0.0
+        )
+        budget_remaining = max(0.0, 1.0 - burn_rate)
+        objectives = {
+            "failure_rate_max": float(self.alert_failure_rate),
+            "p95_latency_ms_max": float(self.alert_p95_ms),
+            "queue_depth_ratio_max": float(self.alert_queue_depth),
+            "file_fallback_ratio_max": float(MAXMCP_ALERT_FILE_FALLBACK_RATIO),
+        }
+        objective_breaches: list[dict] = []
+        if request_count and failure_rate >= objectives["failure_rate_max"]:
+            objective_breaches.append(
+                {
+                    "objective": "failure_rate_max",
+                    "current": round(failure_rate, 6),
+                    "threshold": objectives["failure_rate_max"],
+                }
+            )
+        if p95_latency is not None and float(p95_latency) >= objectives["p95_latency_ms_max"]:
+            objective_breaches.append(
+                {
+                    "objective": "p95_latency_ms_max",
+                    "current": round(float(p95_latency), 3),
+                    "threshold": objectives["p95_latency_ms_max"],
+                }
+            )
+        if queue_depth_ratio >= objectives["queue_depth_ratio_max"]:
+            objective_breaches.append(
+                {
+                    "objective": "queue_depth_ratio_max",
+                    "current": round(queue_depth_ratio, 6),
+                    "threshold": objectives["queue_depth_ratio_max"],
+                }
+            )
+        if (
+            handoff["total_successes"] >= max(1, MAXMCP_ALERT_FILE_FALLBACK_MIN_SUCCESSES)
+            and handoff["file_fallback_ratio"] >= objectives["file_fallback_ratio_max"]
+        ):
+            objective_breaches.append(
+                {
+                    "objective": "file_fallback_ratio_max",
+                    "current": handoff["file_fallback_ratio"],
+                    "threshold": objectives["file_fallback_ratio_max"],
+                }
+            )
+
+        status = "pass"
+        if objective_breaches:
+            status = "fail"
+        elif request_count == 0:
+            status = "no_data"
+        elif burn_rate >= 0.7:
+            status = "warn"
+
+        report = {
+            "window_seconds": bounded_window,
+            "window_start_epoch": threshold,
+            "window_end_epoch": now,
+            "status": status,
+            "request_count": request_count,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "timeout_count": timeout_count,
+            "rates": {
+                "failure_rate": round(failure_rate, 6),
+                "timeout_rate": round(timeout_rate, 6),
+            },
+            "latency_ms": {
+                "p50": self._percentile(durations, 0.50),
+                "p95": p95_latency,
+                "p99": p99_latency,
+                "max": max(durations) if durations else None,
+            },
+            "queue_wait_ms": {
+                "p50": self._percentile(queue_waits, 0.50),
+                "p95": p95_queue_wait,
+                "p99": self._percentile(queue_waits, 0.99),
+                "max": max(queue_waits) if queue_waits else None,
+            },
+            "queue_depth_ratio": round(queue_depth_ratio, 6),
+            "error_budget": {
+                "burn_rate": round(burn_rate, 6),
+                "remaining_ratio": round(budget_remaining, 6),
+            },
+            "objectives": objectives,
+            "objective_breaches": objective_breaches,
+            "actions": action_counts,
+            "transport_health": self.transport_health_snapshot(),
+            "transport_handoff": handoff,
+        }
+
+        if include_series:
+            bucket_width = max(1.0, bounded_window / float(bounded_points))
+            buckets: dict[int, dict[str, Any]] = {}
+            for sample in samples:
+                timestamp = float(sample.get("timestamp", 0.0))
+                idx = int(max(0.0, (timestamp - threshold)) // bucket_width)
+                row = buckets.setdefault(
+                    idx,
+                    {
+                        "timestamps": [],
+                        "durations": [],
+                        "queue_waits": [],
+                        "requests": 0,
+                        "failures": 0,
+                    },
+                )
+                row["timestamps"].append(timestamp)
+                row["requests"] += 1
+                duration = sample.get("duration_ms")
+                if isinstance(duration, (int, float)):
+                    row["durations"].append(float(duration))
+                wait = sample.get("queue_wait_ms")
+                if isinstance(wait, (int, float)):
+                    row["queue_waits"].append(float(wait))
+                if str(sample.get("state", "")) in {"failed", "timeout"}:
+                    row["failures"] += 1
+
+            series: list[dict[str, Any]] = []
+            for idx in sorted(buckets.keys()):
+                bucket = buckets[idx]
+                durations_bucket = bucket["durations"]
+                waits_bucket = bucket["queue_waits"]
+                series.append(
+                    {
+                        "bucket_index": idx,
+                        "timestamp_start_epoch": threshold + (idx * bucket_width),
+                        "timestamp_end_epoch": threshold + ((idx + 1) * bucket_width),
+                        "requests": bucket["requests"],
+                        "failures": bucket["failures"],
+                        "failure_rate": (
+                            round(bucket["failures"] / bucket["requests"], 6)
+                            if bucket["requests"]
+                            else 0.0
+                        ),
+                        "p95_latency_ms": self._percentile(durations_bucket, 0.95),
+                        "p95_queue_wait_ms": self._percentile(waits_bucket, 0.95),
+                    }
+                )
+            report["series"] = series
+
+        return report
 
 
 class MaxRuntimeManager:
@@ -1591,6 +2415,19 @@ class MaxRuntimeManager:
             float(MAXMCP_IMPORT_APPLY_RETRY_BACKOFF_SECONDS),
         )
         self.import_apply_chunk_size = max(1, int(MAXMCP_IMPORT_APPLY_CHUNK_SIZE))
+        self.require_healthy_ready = MAXMCP_REQUIRE_HEALTHY_READY
+        self.health_check_cooldown_seconds = max(
+            0.1,
+            float(MAXMCP_HEALTH_CHECK_COOLDOWN_SECONDS),
+        )
+        self.failure_backoff_max_seconds = max(
+            self.health_check_cooldown_seconds,
+            float(MAXMCP_FAILURE_BACKOFF_MAX_SECONDS),
+        )
+        self._next_bridge_probe_at = 0.0
+        self._bridge_probe_failures = 0
+        self._last_bridge_probe_error = ""
+        self.last_recovery_mode: str | None = None
 
     @staticmethod
     def _canonical_topology(topology: dict) -> dict:
@@ -1962,16 +2799,42 @@ class MaxRuntimeManager:
         line_count = len(topology.get("lines", [])) if isinstance(topology, dict) else 0
         total_ops = box_count + line_count
         max_chunks = max(8, int(math.ceil((max(1, total_ops)) / float(safe_chunk_size))) + 16)
+        safe_timeout_seconds = max(0.05, float(timeout_seconds))
+        started_at = time.monotonic()
+        deadline = started_at + safe_timeout_seconds
 
         state: dict | None = None
         for chunk_idx in range(1, max_chunks + 1):
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0.0:
+                raise MaxMCPError(
+                    ERROR_BRIDGE_TIMEOUT,
+                    (
+                        "Progressive topology apply exceeded total timeout budget "
+                        f"({safe_timeout_seconds:.3f}s)."
+                    ),
+                    hint=(
+                        "Increase apply_timeout_seconds, reduce topology size, "
+                        "or raise apply_chunk_size."
+                    ),
+                    recoverable=True,
+                    details={
+                        "chunk_index": chunk_idx,
+                        "total_operations": total_ops,
+                        "chunk_size": safe_chunk_size,
+                        "max_chunks": max_chunks,
+                        "timeout_seconds": safe_timeout_seconds,
+                        "elapsed_seconds": max(0.0, time.monotonic() - started_at),
+                    },
+                )
+            per_chunk_timeout = max(0.001, min(safe_timeout_seconds, remaining_timeout))
             payload: dict[str, Any] = {
                 "action": "apply_topology_snapshot_progressive",
                 "snapshot": topology,
                 "chunk_size": safe_chunk_size,
             }
             if state is not None:
-                payload["state"] = state
+                payload["progress_state"] = state
 
             chunk_idempotency = None
             if idempotency_key:
@@ -1979,7 +2842,7 @@ class MaxRuntimeManager:
 
             response = await self.maxmsp.send_request(
                 payload,
-                timeout=timeout_seconds,
+                timeout=per_chunk_timeout,
                 idempotency_key=chunk_idempotency,
             )
             if not isinstance(response, dict):
@@ -1996,6 +2859,11 @@ class MaxRuntimeManager:
                 final.setdefault("chunks_processed", chunk_idx)
                 final.setdefault("apply_mode", "progressive")
                 final.setdefault("chunk_size", safe_chunk_size)
+                final.setdefault(
+                    "elapsed_seconds",
+                    max(0.0, time.monotonic() - started_at),
+                )
+                final.setdefault("timeout_seconds", safe_timeout_seconds)
                 return final
 
             state_raw = response.get("state")
@@ -2017,6 +2885,8 @@ class MaxRuntimeManager:
                 "total_operations": total_ops,
                 "chunk_size": safe_chunk_size,
                 "max_chunks": max_chunks,
+                "timeout_seconds": safe_timeout_seconds,
+                "elapsed_seconds": max(0.0, time.monotonic() - started_at),
             },
         )
 
@@ -2467,6 +3337,33 @@ class MaxRuntimeManager:
     def _workspace_target_id(project_id: str, workspace_id: str) -> str:
         return f"{project_id}:{workspace_id}"
 
+    def _split_workspace_target_id(self, target_id: str) -> tuple[str | None, str | None]:
+        raw = str(target_id or "").strip().lower()
+        if ":" not in raw:
+            return None, None
+        raw_project, raw_workspace = raw.split(":", 1)
+        try:
+            project_id = self._normalize_scope_identifier(raw_project, field_name="project_id")
+            workspace_id = self._normalize_scope_identifier(raw_workspace, field_name="workspace_id")
+        except MaxMCPError:
+            return None, None
+        return project_id, workspace_id
+
+    def _workspace_entry_for_target(self, target_id: str) -> dict | None:
+        project_id, workspace_id = self._split_workspace_target_id(target_id)
+        if not project_id or not workspace_id:
+            return None
+        project = self.projects.get(project_id)
+        if not isinstance(project, dict):
+            return None
+        workspaces = project.get("workspaces", {})
+        if not isinstance(workspaces, dict):
+            return None
+        entry = workspaces.get(workspace_id)
+        if not isinstance(entry, dict):
+            return None
+        return entry
+
     def _workspace_varname_for_scope(self, project_id: str, workspace_id: str) -> str:
         base = f"{PROTECTED_VARNAME_PREFIX}ws_{project_id}_{workspace_id}"
         if len(base) <= 96:
@@ -2571,6 +3468,7 @@ class MaxRuntimeManager:
                         "updated_at": entry.get("updated_at"),
                         "last_topology_hash": entry.get("last_topology_hash"),
                         "persist_path": entry.get("persist_path"),
+                        "source_patch_path": entry.get("source_patch_path"),
                         "selected": (
                             self.active_project_id == pid
                             and self.active_workspace_id == workspace_id
@@ -2603,6 +3501,7 @@ class MaxRuntimeManager:
                 "updated_at": now,
                 "last_topology_hash": None,
                 "persist_path": None,
+                "source_patch_path": None,
             }
         else:
             entry = workspaces[wid]
@@ -2823,141 +3722,6 @@ class MaxRuntimeManager:
             )
         self._validate_patch_path_policy(resolved, purpose="patch_read")
         return resolved
-
-    def _resolve_amxd_source_path(self, path: str) -> Path:
-        raw = (path or "").strip()
-        if not raw:
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                "AMXD path must be a non-empty string.",
-                recoverable=False,
-            )
-        resolved = Path(raw).expanduser()
-        if not resolved.is_absolute():
-            resolved = (Path.cwd() / resolved).resolve()
-        else:
-            resolved = resolved.resolve()
-        if not resolved.exists() or not resolved.is_file():
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"AMXD path does not exist: {resolved}",
-                recoverable=True,
-            )
-        if resolved.suffix.lower() != ".amxd":
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"Unsupported AMXD extension '{resolved.suffix}'. Expected .amxd.",
-                recoverable=True,
-            )
-        self._validate_patch_path_policy(resolved, purpose="patch_read")
-        return resolved
-
-    def _resolve_amxd_destination_path(self, path: str) -> Path:
-        raw = (path or "").strip()
-        if not raw:
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                "AMXD destination path must be a non-empty string.",
-                recoverable=False,
-            )
-        destination = Path(raw).expanduser()
-        if not destination.is_absolute():
-            destination = (Path.cwd() / destination).resolve()
-        else:
-            destination = destination.resolve()
-        if destination.suffix.lower() != ".amxd":
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"Unsupported destination extension '{destination.suffix}'. Expected .amxd.",
-                recoverable=True,
-            )
-        if destination.exists() and destination.is_dir():
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"Destination is a directory: {destination}",
-                recoverable=True,
-            )
-        self._validate_patch_path_policy(destination, purpose="patch_write")
-        return destination
-
-    @staticmethod
-    def _validate_amxd_file_sync(path: Path) -> dict:
-        data = path.read_bytes()
-        if len(data) < 24:
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"AMXD file too small to be valid: {path}",
-                recoverable=True,
-                details={"size_bytes": len(data)},
-            )
-        if data[0:4] != b"ampf":
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                f"AMXD magic mismatch for {path}.",
-                recoverable=True,
-                details={"magic_hex": data[0:4].hex()},
-            )
-
-        version = int.from_bytes(data[4:8], byteorder="little", signed=False)
-        container_tag = data[8:12].decode("ascii", errors="replace")
-        offset = 12
-        chunks: list[dict[str, Any]] = []
-        while offset + 8 <= len(data):
-            chunk_id = data[offset : offset + 4].decode("ascii", errors="replace")
-            chunk_size = int.from_bytes(data[offset + 4 : offset + 8], byteorder="little", signed=False)
-            data_offset = offset + 8
-            chunk_end = data_offset + chunk_size
-            if chunk_end > len(data):
-                raise MaxMCPError(
-                    ERROR_VALIDATION,
-                    f"AMXD chunk '{chunk_id}' overflows file bounds.",
-                    recoverable=True,
-                    details={
-                        "chunk_id": chunk_id,
-                        "chunk_size": chunk_size,
-                        "offset": offset,
-                        "file_size": len(data),
-                    },
-                )
-            chunks.append(
-                {
-                    "id": chunk_id,
-                    "size": chunk_size,
-                    "offset": data_offset,
-                }
-            )
-            offset = chunk_end
-
-        if offset != len(data):
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                "AMXD chunk parsing ended before file end.",
-                recoverable=True,
-                details={"parsed_offset": offset, "file_size": len(data)},
-            )
-
-        chunk_ids = [chunk["id"] for chunk in chunks]
-        if "meta" not in chunk_ids or "ptch" not in chunk_ids:
-            raise MaxMCPError(
-                ERROR_VALIDATION,
-                "AMXD file is missing required meta/ptch chunks.",
-                recoverable=True,
-                details={"chunk_ids": chunk_ids},
-            )
-
-        ptch_chunk = next(chunk for chunk in chunks if chunk["id"] == "ptch")
-        ptch_header = data[ptch_chunk["offset"] : ptch_chunk["offset"] + min(4, ptch_chunk["size"])]
-        return {
-            "path": str(path),
-            "size_bytes": len(data),
-            "magic": "ampf",
-            "version": version,
-            "container_tag": container_tag,
-            "chunk_count": len(chunks),
-            "chunk_ids": chunk_ids,
-            "ptch_prefix_hex": ptch_header.hex(),
-            "ptch_size": ptch_chunk["size"],
-        }
 
     @staticmethod
     def _extract_topology_with_format(payload: Any) -> tuple[str, dict] | None:
@@ -3741,6 +4505,7 @@ class MaxRuntimeManager:
         workspace = workspaces.get(wid) if isinstance(workspaces, dict) else None
         if isinstance(workspace, dict):
             workspace["last_topology_hash"] = final_hash
+            workspace["source_patch_path"] = str(resolved_path)
             workspace["updated_at"] = time.time()
 
         return {
@@ -4395,6 +5160,11 @@ class MaxRuntimeManager:
         twin_sync = await self.sync_patch_twin(reason=f"load_patch_from_path:{mode_normalized}")
         post_load_drift = await self.check_patch_drift(auto_resync=False)
         final_hash, final_objects, final_connections = self._topology_hash(final_topology)
+        workspace_entry = self._workspace_entry_for_target(target_id)
+        if isinstance(workspace_entry, dict):
+            workspace_entry["last_topology_hash"] = final_hash
+            workspace_entry["source_patch_path"] = str(resolved_path)
+            workspace_entry["updated_at"] = time.time()
 
         return {
             "success": True,
@@ -4610,256 +5380,6 @@ class MaxRuntimeManager:
             "switch_result": switch_result,
         }
 
-    async def export_amxd(
-        self,
-        path: str,
-        *,
-        target: str = "",
-        overwrite: bool = False,
-        device_type: str = "midi_effect",
-        validation_mode: str = "format_only",
-        probe_open: bool = False,
-        idempotency_key: str = "",
-    ) -> dict:
-        target_id = (target or self.active_target).strip().lower()
-        if not target_id or target_id == "host":
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_PRECONDITION,
-                    "message": "target must be a selected workspace target '<project_id>:<workspace_id>'.",
-                    "recoverable": False,
-                    "details": {"target": target},
-                },
-            }
-        if ":" not in target_id:
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_PRECONDITION,
-                    "message": (
-                        "Legacy target names are removed for AMXD export. "
-                        "Use '<project_id>:<workspace_id>'."
-                    ),
-                    "recoverable": False,
-                    "details": {"target": target},
-                },
-            }
-
-        mode = (validation_mode or "format_only").strip().lower()
-        if mode not in {"format_only", "open_if_available", "strict_open", "none"}:
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_VALIDATION,
-                    "message": (
-                        "validation_mode must be one of: "
-                        "format_only, open_if_available, strict_open, none."
-                    ),
-                    "recoverable": True,
-                    "details": {"validation_mode": validation_mode},
-                },
-            }
-
-        try:
-            destination = self._resolve_amxd_destination_path(path)
-        except MaxMCPError as e:
-            return {"success": False, "error": e.to_dict()}
-        except Exception as e:
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_INTERNAL,
-                    "message": str(e),
-                    "recoverable": True,
-                    "details": {"path": path},
-                },
-            }
-
-        if destination.exists() and not overwrite:
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_PRECONDITION,
-                    "message": f"Destination already exists: {destination}",
-                    "hint": "Set overwrite=True to replace existing file.",
-                    "recoverable": True,
-                    "details": {},
-                },
-            }
-
-        try:
-            readiness = await self.ensure_runtime_ready()
-        except Exception as e:
-            return self._operation_error(
-                operation="export_amxd",
-                action="ensure_runtime_ready",
-                error=e,
-                details={"target": target_id, "path": str(destination)},
-            )
-        if not readiness.get("ready"):
-            return {
-                "success": False,
-                "error": {
-                    "code": ERROR_BRIDGE_UNAVAILABLE,
-                    "message": readiness.get("error", "Bridge runtime is not ready."),
-                    "recoverable": True,
-                    "details": readiness,
-                },
-            }
-
-        required_actions = {"set_workspace_target", "export_amxd"}
-        if mode == "strict_open":
-            required_actions.add("validate_amxd_open")
-        capability_error = self._check_required_capabilities(
-            required_actions=required_actions,
-            operation="export_amxd",
-        )
-        if capability_error:
-            return capability_error
-
-        switch_result = None
-        if self.active_target != target_id:
-            try:
-                switch_result = await self.set_active_target(target_id)
-            except Exception as e:
-                return self._operation_error(
-                    operation="export_amxd",
-                    action="set_workspace_target",
-                    error=e,
-                    details={"target": target_id, "path": str(destination)},
-                )
-            if not switch_result.get("success"):
-                return {
-                    "success": False,
-                    "error": {
-                        "code": ERROR_PRECONDITION,
-                        "message": "Failed to switch target workspace before AMXD export.",
-                        "recoverable": False,
-                        "details": switch_result,
-                    },
-                }
-
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            return self._operation_error(
-                operation="export_amxd",
-                action="mkdir",
-                error=e,
-                details={"target": target_id, "path": str(destination)},
-            )
-
-        try:
-            bridge_result = await self.maxmsp.send_request(
-                {
-                    "action": "export_amxd",
-                    "output_path": str(destination),
-                    "device_type": device_type or "",
-                },
-                timeout=45.0,
-                idempotency_key=idempotency_key or None,
-            )
-        except Exception as e:
-            return self._operation_error(
-                operation="export_amxd",
-                action="export_amxd",
-                error=e,
-                details={"target": target_id, "path": str(destination)},
-            )
-
-        format_validation = None
-        if mode in {"format_only", "open_if_available", "strict_open"}:
-            try:
-                format_validation = await asyncio.to_thread(
-                    self._validate_amxd_file_sync,
-                    destination,
-                )
-            except Exception as e:
-                if isinstance(e, MaxMCPError):
-                    return {"success": False, "error": e.to_dict()}
-                return self._operation_error(
-                    operation="export_amxd",
-                    action="validate_amxd_format",
-                    error=e,
-                    details={"target": target_id, "path": str(destination)},
-                )
-
-        open_validation = None
-        if mode in {"open_if_available", "strict_open"}:
-            open_probe_supported = self._bridge_action_supported("validate_amxd_open")
-            if mode == "strict_open" and open_probe_supported is not True:
-                return {
-                    "success": False,
-                    "error": {
-                        "code": ERROR_PRECONDITION,
-                        "message": "Bridge does not advertise validate_amxd_open.",
-                        "hint": "Use validation_mode='format_only' or upgrade bridge capabilities.",
-                        "recoverable": False,
-                        "details": {"validation_mode": mode},
-                    },
-                }
-            if open_probe_supported:
-                try:
-                    open_validation = await self.maxmsp.send_request(
-                        {
-                            "action": "validate_amxd_open",
-                            "path": str(destination),
-                            "probe_open": bool(probe_open),
-                        },
-                        timeout=15.0,
-                    )
-                except Exception as e:
-                    if mode == "strict_open":
-                        return self._operation_error(
-                            operation="export_amxd",
-                            action="validate_amxd_open",
-                            error=e,
-                            details={"target": target_id, "path": str(destination)},
-                        )
-                    open_validation = {
-                        "success": False,
-                        "error": str(e),
-                        "skipped": False,
-                    }
-            else:
-                open_validation = {
-                    "success": False,
-                    "skipped": True,
-                    "reason": "validate_amxd_open not advertised by bridge",
-                }
-            if (
-                mode == "strict_open"
-                and isinstance(open_validation, dict)
-                and open_validation.get("success") is False
-            ):
-                return {
-                    "success": False,
-                    "error": {
-                        "code": ERROR_PRECONDITION,
-                        "message": "Strict AMXD open validation failed.",
-                        "recoverable": False,
-                        "details": {"open_validation": open_validation},
-                    },
-                }
-
-        file_size = destination.stat().st_size if destination.exists() else 0
-        project_id, workspace_id = target_id.split(":", 1)
-        return {
-            "success": True,
-            "target": target_id,
-            "project_id": project_id,
-            "workspace_id": workspace_id,
-            "path": str(destination),
-            "overwrite": overwrite,
-            "file_size": file_size,
-            "validation_mode": mode,
-            "bridge_result": bridge_result,
-            "format_validation": format_validation,
-            "open_validation": open_validation,
-            "switch_result": switch_result,
-        }
-
     def _workspace_varname_for_target(self, target: str) -> str | None:
         if target == "host":
             return None
@@ -5028,6 +5548,96 @@ class MaxRuntimeManager:
             await asyncio.sleep(0.5)
         return False
 
+    async def _wait_for_node_hello(self, timeout_seconds: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        while time.monotonic() < deadline:
+            if self.maxmsp.node_hello_seen:
+                return True
+            await asyncio.sleep(0.1)
+        return bool(self.maxmsp.node_hello_seen)
+
+    @staticmethod
+    def _is_transport_handoff_failure_status(status: dict) -> bool:
+        if not isinstance(status, dict):
+            return False
+        message = str(
+            status.get("bridge_ping_error")
+            or status.get("error")
+            or ""
+        ).strip().lower()
+        if any(marker in message for marker in TRANSPORT_HANDOFF_FAILURE_MARKERS):
+            return True
+        transport_health = status.get("transport_health")
+        if isinstance(transport_health, dict):
+            last_failure_details = transport_health.get("last_failure_details")
+            if isinstance(last_failure_details, dict):
+                if last_failure_details.get("required_transport") == TRANSPORT_DICT_REF:
+                    return True
+                detail_message = str(last_failure_details.get("message") or "").lower()
+                if any(marker in detail_message for marker in TRANSPORT_HANDOFF_FAILURE_MARKERS):
+                    return True
+            last_failure_message = str(transport_health.get("last_failure_message") or "").lower()
+            if any(marker in last_failure_message for marker in TRANSPORT_HANDOFF_FAILURE_MARKERS):
+                return True
+        return False
+
+    async def _recover_managed_bridge_runtime(
+        self,
+        *,
+        host_patch: Path,
+        reason: str,
+    ) -> dict:
+        recovery = {
+            "attempted": True,
+            "mode": "managed_restart",
+            "reason": reason,
+            "cleanup": None,
+            "launch": None,
+            "bridge_wait_connected": False,
+            "node_hello_seen": False,
+            "error": None,
+        }
+
+        try:
+            if self.maxmsp.sio.connected:
+                await self.maxmsp.disconnect()
+        except Exception as e:
+            recovery["error"] = f"disconnect_failed: {e}"
+
+        try:
+            hygiene = self.hygiene_manager or MaxHygieneManager(self, self.maxmsp)
+            cleanup = await hygiene.close_max_system_sessions(
+                target="managed",
+                force=True,
+                dry_run=False,
+                max_count=0,
+            )
+            recovery["cleanup"] = cleanup
+        except Exception as e:
+            recovery["cleanup"] = {"success": False, "error": str(e)}
+
+        launch = await asyncio.to_thread(self._launch_max_sync, host_patch)
+        recovery["launch"] = launch
+        if launch.get("error"):
+            recovery["error"] = launch.get("error")
+            return recovery
+
+        connected = await self._wait_for_bridge(timeout_seconds=20.0)
+        recovery["bridge_wait_connected"] = bool(connected)
+        if not connected:
+            recovery["error"] = "bridge reconnect timed out after managed restart"
+            return recovery
+
+        # Reset health probe cooldown after managed runtime restart.
+        self._next_bridge_probe_at = 0.0
+        self._bridge_probe_failures = 0
+        self._last_bridge_probe_error = ""
+        node_hello_seen = await self._wait_for_node_hello(timeout_seconds=5.0)
+        recovery["node_hello_seen"] = bool(node_hello_seen)
+        if not node_hello_seen:
+            recovery["error"] = "node bridge hello was not observed after managed restart"
+        return recovery
+
     async def collect_status(self, check_bridge: bool = True) -> dict:
         host_patch = self._resolve_host_patch()
         status = {
@@ -5054,29 +5664,61 @@ class MaxRuntimeManager:
             "twin": self._twin_status_payload(),
             "project_count": len(self.projects),
             "projects": self.list_projects(),
+            "bridge_build_id": self.maxmsp.bridge_build_id,
+            "node_bridge_build_id": self.maxmsp.node_bridge_build_id,
+            "node_hello_seen": self.maxmsp.node_hello_seen,
+            "node_hello_at": self.maxmsp.node_hello_at,
+            "node_hello_payload": self.maxmsp.node_hello_payload,
+            "last_recovery_mode": self.last_recovery_mode,
         }
         if self.hygiene_manager is not None:
             status["hygiene_policy"] = self.hygiene_manager.policy_snapshot()
             status["hygiene_last_run_at"] = self.hygiene_manager.last_run_at
             status["hygiene_last_summary"] = self.hygiene_manager.last_summary
+        status["transport_health"] = self.maxmsp.transport_health_snapshot()
         if check_bridge and self.maxmsp.sio.connected:
+            now_monotonic = time.monotonic()
+            if now_monotonic < self._next_bridge_probe_at:
+                retry_in = max(0.0, self._next_bridge_probe_at - now_monotonic)
+                status["bridge_healthy"] = False
+                status["bridge_probe_skipped"] = True
+                status["bridge_probe_retry_in_seconds"] = round(retry_in, 3)
+                status["bridge_ping_error"] = (
+                    self._last_bridge_probe_error
+                    or "Bridge health probe is in cooldown after repeated failures."
+                )
+                return status
             try:
                 ping = await self.maxmsp.send_request({"action": "health_ping"}, timeout=2.0)
                 status["bridge_healthy"] = bool(
                     ping == "pong" or (isinstance(ping, dict) and ping.get("ok"))
                 )
                 status["bridge_ping"] = ping
+                self._bridge_probe_failures = 0
+                self._next_bridge_probe_at = 0.0
+                self._last_bridge_probe_error = ""
             except Exception as e:
                 status["bridge_healthy"] = False
                 status["bridge_ping_error"] = str(e)
-            try:
-                workspace_status = await self.maxmsp.send_request(
-                    {"action": "workspace_status"},
-                    timeout=2.0,
+                self._bridge_probe_failures += 1
+                self._last_bridge_probe_error = str(e)
+                backoff = min(
+                    self.failure_backoff_max_seconds,
+                    self.health_check_cooldown_seconds * (2 ** max(0, self._bridge_probe_failures - 1)),
                 )
-                status["workspace_status"] = workspace_status
-            except Exception as e:
-                status["workspace_status_error"] = str(e)
+                self._next_bridge_probe_at = now_monotonic + backoff
+                status["bridge_probe_backoff_seconds"] = round(backoff, 3)
+                return status
+            if status.get("bridge_healthy"):
+                try:
+                    workspace_status = await self.maxmsp.send_request(
+                        {"action": "workspace_status"},
+                        timeout=2.0,
+                    )
+                    status["workspace_status"] = workspace_status
+                except Exception as e:
+                    status["workspace_status_error"] = str(e)
+                    status["bridge_healthy"] = False
         return status
 
     async def ensure_runtime_ready(self) -> dict:
@@ -5127,10 +5769,99 @@ class MaxRuntimeManager:
                     workspace_apply_error = str(e)
 
             status = await self.collect_status(check_bridge=True)
-            status["ready"] = bool(status.get("bridge_connected"))
+            status["node_hello_required"] = bool(self.managed_mode)
+            status["node_hello_ready"] = bool(
+                self.maxmsp.node_hello_seen if self.managed_mode else True
+            )
+            if self.require_healthy_ready:
+                status["ready"] = bool(
+                    status.get("bridge_connected")
+                    and status.get("bridge_healthy")
+                    and status.get("node_hello_ready")
+                )
+            else:
+                status["ready"] = bool(
+                    status.get("bridge_connected")
+                    and status.get("node_hello_ready")
+                )
             status["checkpoint_journal"] = checkpoint_journal
+            recovery_attempt = {
+                "attempted": False,
+                "mode": None,
+                "reconnected": False,
+                "error": None,
+            }
+            if (
+                self.require_healthy_ready
+                and status.get("bridge_connected")
+                and not status.get("bridge_healthy")
+            ):
+                recovery_attempt["attempted"] = True
+                recovery_attempt["mode"] = "socket_reconnect"
+                try:
+                    await self.maxmsp.disconnect()
+                    reconnected = await self.maxmsp.start_server()
+                    recovery_attempt["reconnected"] = bool(reconnected)
+                    if reconnected:
+                        status_after_reconnect = await self.collect_status(check_bridge=True)
+                        status.update(status_after_reconnect)
+                        status["node_hello_required"] = bool(self.managed_mode)
+                        status["node_hello_ready"] = bool(
+                            self.maxmsp.node_hello_seen if self.managed_mode else True
+                        )
+                        status["ready"] = bool(
+                            status.get("bridge_connected")
+                            and status.get("bridge_healthy")
+                            and status.get("node_hello_ready")
+                        )
+                except Exception as e:
+                    recovery_attempt["error"] = str(e)
+            if (
+                self.require_healthy_ready
+                and status.get("bridge_connected")
+                and not status.get("ready")
+                and self._is_transport_handoff_failure_status(status)
+            ):
+                managed_recovery = await self._recover_managed_bridge_runtime(
+                    host_patch=host_patch,
+                    reason=str(
+                        status.get("bridge_ping_error")
+                        or status.get("error")
+                        or "transport handoff failure"
+                    ),
+                )
+                recovery_attempt["attempted"] = True
+                recovery_attempt["mode"] = "managed_restart"
+                recovery_attempt["managed_restart"] = managed_recovery
+                if managed_recovery.get("error"):
+                    recovery_attempt["error"] = managed_recovery.get("error")
+                status_after_restart = await self.collect_status(check_bridge=True)
+                status.update(status_after_restart)
+                status["node_hello_required"] = bool(self.managed_mode)
+                status["node_hello_ready"] = bool(
+                    self.maxmsp.node_hello_seen if self.managed_mode else True
+                )
+                status["ready"] = bool(
+                    status.get("bridge_connected")
+                    and status.get("bridge_healthy")
+                    and status.get("node_hello_ready")
+                )
+            if recovery_attempt["attempted"]:
+                status["recovery_attempt"] = recovery_attempt
             if not status["ready"]:
-                status["error"] = self.maxmsp._offline_error_message()
+                if status.get("bridge_connected") and not status.get("bridge_healthy"):
+                    status["error"] = (
+                        status.get("bridge_ping_error")
+                        or status.get("workspace_status_error")
+                        or "Bridge is connected but unhealthy."
+                    )
+                elif status.get("bridge_connected") and not status.get("node_hello_ready"):
+                    status["error"] = (
+                        "Bridge connected but node runtime hello handshake is missing. "
+                        "Managed restart may be required."
+                    )
+                else:
+                    status["error"] = self.maxmsp._offline_error_message()
             if workspace_apply_error:
                 status["workspace_apply_error"] = workspace_apply_error
             if status["ready"]:
@@ -5314,7 +6045,47 @@ class MaxHygieneManager:
         return token.endswith("/max") or token == "max"
 
     @staticmethod
-    def _parse_process_rows(raw_stdout: str) -> list[dict]:
+    def _parse_elapsed_seconds(raw_value: str) -> int | None:
+        value = str(raw_value or "").strip()
+        if not value:
+            return None
+        if value.isdigit():
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        days = 0
+        time_part = value
+        if "-" in value:
+            day_part, remainder = value.split("-", 1)
+            if not day_part.isdigit():
+                return None
+            days = int(day_part)
+            time_part = remainder
+
+        pieces = time_part.split(":")
+        if not all(piece.isdigit() for piece in pieces):
+            return None
+        try:
+            if len(pieces) == 3:
+                hours = int(pieces[0])
+                minutes = int(pieces[1])
+                seconds = int(pieces[2])
+            elif len(pieces) == 2:
+                hours = 0
+                minutes = int(pieces[0])
+                seconds = int(pieces[1])
+            else:
+                return None
+        except Exception:
+            return None
+        if minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
+            return None
+        return (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+
+    @classmethod
+    def _parse_process_rows(cls, raw_stdout: str, elapsed_field: str) -> list[dict]:
         rows: list[dict] = []
         for raw in raw_stdout.splitlines():
             line = raw.strip()
@@ -5326,7 +6097,9 @@ class MaxHygieneManager:
             try:
                 pid = int(parts[0])
                 ppid = int(parts[1])
-                elapsed_seconds = int(parts[2])
+                elapsed_seconds = cls._parse_elapsed_seconds(parts[2])
+                if elapsed_seconds is None:
+                    continue
                 cpu_pct = float(parts[3])
                 rss_kb = int(parts[4])
             except Exception:
@@ -5339,13 +6112,21 @@ class MaxHygieneManager:
                     "cpu_pct": cpu_pct,
                     "rss_mb": round(rss_kb / 1024.0, 3),
                     "command": parts[5],
+                    "elapsed_field": elapsed_field,
                 }
             )
         return rows
 
-    def _run_process_scan_sync(self, command: list[str], method: str, timeout: float) -> tuple[list[dict], dict]:
+    def _run_process_scan_sync(
+        self,
+        command: list[str],
+        method: str,
+        timeout: float,
+        elapsed_field: str,
+    ) -> tuple[list[dict], dict]:
         diag = {
             "method": method,
+            "elapsed_field": elapsed_field,
             "available": False,
             "error": None,
             "row_count": 0,
@@ -5367,56 +6148,71 @@ class MaxHygieneManager:
             diag["error"] = (out.stderr or "").strip() or f"{method}_exit_{out.returncode}"
             return [], diag
 
-        rows = self._parse_process_rows(out.stdout)
+        rows = self._parse_process_rows(out.stdout, elapsed_field=elapsed_field)
         diag["available"] = True
         diag["row_count"] = len(rows)
         return rows, diag
 
     def _read_process_table_sync(self) -> tuple[list[dict], dict]:
         attempts: list[dict] = []
-        primary_rows, primary_diag = self._run_process_scan_sync(
-            ["ps", "-axo", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
-            method="ps_axo",
-            timeout=3.0,
-        )
-        attempts.append(primary_diag)
-        if primary_rows:
-            return (
-                primary_rows,
-                {
-                    "available": True,
-                    "method": "ps_axo",
-                    "fallback_used": False,
-                    "error": None,
-                    "attempts": attempts,
-                },
+        candidates = [
+            (
+                ["ps", "-axo", "pid=,ppid=,etime=,%cpu=,rss=,command="],
+                "ps_axo_etime",
+                "etime",
+            ),
+            (
+                ["ps", "-axo", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
+                "ps_axo_etimes",
+                "etimes",
+            ),
+            (
+                ["ps", "-Ac", "-o", "pid=,ppid=,etime=,%cpu=,rss=,command="],
+                "ps_Ac_etime",
+                "etime",
+            ),
+            (
+                ["ps", "-Ac", "-o", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
+                "ps_Ac_etimes",
+                "etimes",
+            ),
+        ]
+        first_error = None
+        winner_method = None
+        winner_elapsed_field = None
+        for idx, (command, method, elapsed_field) in enumerate(candidates):
+            rows, diag = self._run_process_scan_sync(
+                command,
+                method=method,
+                timeout=3.0,
+                elapsed_field=elapsed_field,
             )
-
-        fallback_rows, fallback_diag = self._run_process_scan_sync(
-            ["ps", "-Ac", "-o", "pid=,ppid=,etimes=,%cpu=,rss=,command="],
-            method="ps_Ac",
-            timeout=3.0,
-        )
-        attempts.append(fallback_diag)
-        if fallback_rows:
-            return (
-                fallback_rows,
-                {
-                    "available": True,
-                    "method": "ps_Ac",
-                    "fallback_used": True,
-                    "error": None,
-                    "attempts": attempts,
-                },
-            )
+            attempts.append(diag)
+            if rows:
+                winner_method = method
+                winner_elapsed_field = elapsed_field
+                return (
+                    rows,
+                    {
+                        "available": True,
+                        "method": winner_method,
+                        "elapsed_field": winner_elapsed_field,
+                        "fallback_used": idx > 0,
+                        "error": None,
+                        "attempts": attempts,
+                    },
+                )
+            if first_error is None:
+                first_error = diag.get("error")
 
         return (
             [],
             {
                 "available": False,
-                "method": "ps_axo",
-                "fallback_used": bool(primary_diag.get("available")),
-                "error": primary_diag.get("error") or fallback_diag.get("error"),
+                "method": "ps_axo_etime",
+                "elapsed_field": "etime",
+                "fallback_used": False,
+                "error": first_error or "process_scan_failed",
                 "attempts": attempts,
             },
         )
@@ -6461,6 +7257,28 @@ def get_bridge_metrics(
 
 
 @mcp.tool()
+def get_bridge_slo_report(
+    ctx: Context,
+    window_seconds: float = 300.0,
+    include_series: bool = False,
+    max_points: int = 120,
+) -> dict:
+    """Return SLO-focused reliability report and optional trend series."""
+    maxmsp = ctx.request_context.lifespan_context.get("maxmsp")
+    if maxmsp is None:
+        return _error_result(
+            ERROR_BRIDGE_UNAVAILABLE,
+            "Bridge connection is unavailable in this MCP lifespan context.",
+            recoverable=True,
+        )
+    return maxmsp.slo_report(
+        window_seconds=window_seconds,
+        include_series=include_series,
+        max_points=max_points,
+    )
+
+
+@mcp.tool()
 async def recover_bridge(ctx: Context) -> dict:
     """Reconnect or relaunch managed bridge runtime."""
     runtime = _get_runtime(ctx)
@@ -6798,34 +7616,6 @@ async def export_workspace(
         project_id=project_id,
         workspace_id=workspace_id,
         overwrite=overwrite,
-    )
-
-
-@mcp.tool()
-async def export_amxd(
-    ctx: Context,
-    path: str,
-    project_id: str,
-    workspace_id: str,
-    overwrite: bool = False,
-    device_type: str = "midi_effect",
-    validation_mode: str = "format_only",
-    probe_open: bool = False,
-    idempotency_key: str = "",
-) -> dict:
-    """Export the current managed workspace as a Max for Live `.amxd` file."""
-    runtime = _get_runtime(ctx)
-    if runtime is None:
-        return {"success": False, "error": "Runtime manager is unavailable."}
-    target = f"{project_id}:{workspace_id}"
-    return await runtime.export_amxd(
-        path=path,
-        target=target,
-        overwrite=overwrite,
-        device_type=device_type,
-        validation_mode=validation_mode,
-        probe_open=probe_open,
-        idempotency_key=idempotency_key,
     )
 
 
@@ -8192,6 +8982,920 @@ async def _bridge_supports_action(maxmsp: Any, action: str) -> bool:
     return False
 
 
+async def _workspace_bridge_call(
+    ctx: Context,
+    *,
+    project_id: str,
+    workspace_id: str,
+    payload: dict[str, Any],
+    create_if_missing: bool,
+    use_command: bool = False,
+    timeout: float | None = None,
+    idempotency_key: str = "",
+    list_wrap: bool = False,
+) -> Any:
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=create_if_missing,
+    )
+    if error:
+        return [error] if list_wrap else error
+    assert maxmsp is not None
+
+    if use_command:
+        response = await maxmsp.send_command(
+            payload,
+            idempotency_key=idempotency_key or None,
+        )
+    else:
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if idempotency_key:
+            kwargs["idempotency_key"] = idempotency_key
+        response = await maxmsp.send_request(payload, **kwargs)
+
+    return [response] if list_wrap else response
+
+
+QA_SEVERITY_WEIGHTS = {
+    "critical": 20,
+    "high": 12,
+    "medium": 6,
+    "low": 3,
+}
+MAXDIFF_SCRIPT_BY_SUFFIX = {
+    ".maxpat": Path("maxdiff") / "maxpat_textconv.py",
+    ".amxd": Path("maxdiff") / "amxd_textconv.py",
+    ".als": Path("maxdiff") / "als_textconv.py",
+}
+
+
+def _is_int_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value) and value.is_integer()
+    return False
+
+
+def _extract_topology_rows(topology: Any) -> tuple[list[dict], list[dict]]:
+    if not isinstance(topology, dict):
+        return [], []
+    boxes = topology.get("boxes", [])
+    lines = topology.get("lines", [])
+    if not isinstance(boxes, list):
+        boxes = []
+    if not isinstance(lines, list):
+        lines = []
+    normalized_boxes = [row for row in boxes if isinstance(row, dict)]
+    normalized_lines = [row for row in lines if isinstance(row, dict)]
+    return normalized_boxes, normalized_lines
+
+
+def _extract_box_from_row(row: dict) -> dict:
+    box = row.get("box", {})
+    if isinstance(box, dict):
+        return box
+    return {}
+
+
+def _box_text(box: dict) -> str:
+    for key in ("boxtext", "text"):
+        value = box.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _box_tokens(box: dict) -> list[str]:
+    text = _box_text(box)
+    return [token for token in text.split() if token]
+
+
+def _primary_object_name(box: dict) -> str:
+    maxclass = str(box.get("maxclass", "") or "").strip()
+    tokens = _box_tokens(box)
+    if maxclass and maxclass not in {"newobj", "message", "comment"}:
+        return maxclass
+    if tokens:
+        return tokens[0]
+    return maxclass
+
+
+def _box_position(box: dict) -> tuple[Any, Any]:
+    rect = box.get("patching_rect")
+    if isinstance(rect, (list, tuple)) and len(rect) >= 2:
+        return rect[0], rect[1]
+    return None, None
+
+
+def _qa_finding(
+    *,
+    finding_id: str,
+    severity: str,
+    category: str,
+    message: str,
+    recommendation: str,
+    evidence: Any = None,
+) -> dict:
+    return {
+        "id": finding_id,
+        "severity": severity,
+        "category": category,
+        "message": message,
+        "recommendation": recommendation,
+        "evidence": evidence,
+    }
+
+
+def _qa_check(
+    *,
+    check_id: str,
+    category: str,
+    passed: bool,
+    severity_if_failed: str = "low",
+    message: str = "",
+    evidence: Any = None,
+) -> dict:
+    return {
+        "id": check_id,
+        "category": category,
+        "passed": bool(passed),
+        "severity_if_failed": severity_if_failed,
+        "message": message,
+        "evidence": evidence,
+    }
+
+
+def _collect_patch_audit(
+    topology: Any,
+    *,
+    signal_safety: Any = None,
+    signal_safety_error: dict | None = None,
+) -> dict:
+    boxes, lines = _extract_topology_rows(topology)
+    findings: list[dict] = []
+    checks: list[dict] = []
+
+    summary = {
+        "object_count": len(boxes),
+        "connection_count": len(lines),
+        "signal_object_count": 0,
+        "control_object_count": 0,
+        "maxclass_counts": {},
+        "objects_without_varname": 0,
+    }
+
+    for row in boxes:
+        box = _extract_box_from_row(row)
+        maxclass = str(box.get("maxclass", "unknown") or "unknown")
+        summary["maxclass_counts"][maxclass] = summary["maxclass_counts"].get(maxclass, 0) + 1
+        if maxclass.endswith("~"):
+            summary["signal_object_count"] += 1
+        else:
+            summary["control_object_count"] += 1
+        if not str(box.get("varname", "") or "").strip():
+            summary["objects_without_varname"] += 1
+
+    print_objects: list[dict] = []
+    io_debug_objects: list[dict] = []
+    todo_comments: list[dict] = []
+    non_integer_positions: list[dict] = []
+    segmented_lines: list[dict] = []
+    missing_varnames: list[dict] = []
+    non_local_names: list[dict] = []
+    live_ui_without_varname: list[dict] = []
+    auto_indexed_names: list[dict] = []
+    shared_name_owners = {"s", "send", "r", "receive", "coll", "buffer~", "v", "value"}
+
+    for index, row in enumerate(boxes, start=1):
+        box = _extract_box_from_row(row)
+        maxclass = str(box.get("maxclass", "") or "")
+        varname = str(box.get("varname", "") or "")
+        object_name = _primary_object_name(box)
+        tokens = _box_tokens(box)
+        text = _box_text(box)
+
+        if object_name in {"print", "print~"} or maxclass in {"print", "print~"}:
+            print_objects.append({"index": index, "varname": varname, "object": object_name})
+
+        if object_name in {"dac~", "adc~", "ezdac~", "ezadc~"}:
+            io_debug_objects.append({"index": index, "varname": varname, "object": object_name})
+
+        if maxclass == "comment" and "todo" in text.lower():
+            todo_comments.append({"index": index, "varname": varname, "text": text})
+
+        x, y = _box_position(box)
+        if x is not None and y is not None and (not _is_int_like(x) or not _is_int_like(y)):
+            non_integer_positions.append({"index": index, "varname": varname, "x": x, "y": y})
+
+        if maxclass not in {"comment"} and not varname:
+            missing_varnames.append({"index": index, "object": object_name})
+
+        if object_name in shared_name_owners:
+            name_token = ""
+            if maxclass == "newobj":
+                if len(tokens) >= 2:
+                    name_token = tokens[1]
+            elif tokens:
+                if tokens[0] == object_name and len(tokens) >= 2:
+                    name_token = tokens[1]
+                else:
+                    name_token = tokens[0]
+            if (
+                name_token
+                and not name_token.startswith("---")
+                and not name_token.startswith("#0")
+                and not name_token.startswith("@")
+            ):
+                non_local_names.append(
+                    {
+                        "index": index,
+                        "varname": varname,
+                        "object": object_name,
+                        "name": name_token,
+                    }
+                )
+
+        if maxclass.startswith("live.") and not varname:
+            live_ui_without_varname.append({"index": index, "object": maxclass, "text": text})
+
+        if re.search(r"\[\d+\]$", varname):
+            auto_indexed_names.append({"index": index, "varname": varname})
+
+    for index, row in enumerate(lines, start=1):
+        patchline = row.get("patchline", {})
+        if not isinstance(patchline, dict):
+            continue
+        midpoints = patchline.get("midpoints")
+        if isinstance(midpoints, list) and len(midpoints) >= 2:
+            segmented_lines.append(
+                {
+                    "index": index,
+                    "source": patchline.get("source"),
+                    "destination": patchline.get("destination"),
+                    "midpoints": midpoints,
+                }
+            )
+
+    checks.append(
+        _qa_check(
+            check_id="no_print_objects",
+            category="robustness",
+            passed=len(print_objects) == 0,
+            severity_if_failed="high",
+            message="Patch should not contain print objects in release builds.",
+            evidence=print_objects[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="no_debug_io_objects",
+            category="robustness",
+            passed=len(io_debug_objects) == 0,
+            severity_if_failed="high",
+            message="Devices should not include direct dac~/adc~ debug I/O in production patches.",
+            evidence=io_debug_objects[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="no_todo_comments",
+            category="patch_formatting",
+            passed=len(todo_comments) == 0,
+            severity_if_failed="medium",
+            message="Release patches should not contain TODO comments.",
+            evidence=todo_comments[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="integer_object_positions",
+            category="patch_formatting",
+            passed=len(non_integer_positions) == 0,
+            severity_if_failed="low",
+            message="Object positions should use integer coordinates.",
+            evidence=non_integer_positions[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="minimal_segmented_patchcords",
+            category="patch_formatting",
+            passed=len(segmented_lines) == 0,
+            severity_if_failed="low",
+            message="Segmented patch cords should be used sparingly.",
+            evidence=segmented_lines[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="local_scope_names",
+            category="robustness",
+            passed=len(non_local_names) == 0,
+            severity_if_failed="medium",
+            message="send/receive/coll/buffer names should be device-local with --- or #0 prefixes.",
+            evidence=non_local_names[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="live_ui_has_stable_varname",
+            category="parameters",
+            passed=len(live_ui_without_varname) == 0,
+            severity_if_failed="medium",
+            message="live.* UI objects should have stable scripting names where possible.",
+            evidence=live_ui_without_varname[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="no_auto_indexed_parameter_names",
+            category="parameters",
+            passed=len(auto_indexed_names) == 0,
+            severity_if_failed="medium",
+            message="Auto-indexed names like [1] should be resolved before release.",
+            evidence=auto_indexed_names[:25],
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="object_count_budget",
+            category="robustness",
+            passed=summary["object_count"] <= 80,
+            severity_if_failed="low",
+            message="Large root patchers should be encapsulated for readability and maintenance.",
+            evidence={"object_count": summary["object_count"], "budget": 80},
+        )
+    )
+    checks.append(
+        _qa_check(
+            check_id="objects_have_varnames",
+            category="patch_formatting",
+            passed=len(missing_varnames) == 0,
+            severity_if_failed="low",
+            message="Objects should have varnames for deterministic automation and refactoring.",
+            evidence=missing_varnames[:25],
+        )
+    )
+
+    if isinstance(signal_safety, dict):
+        raw_warnings = signal_safety.get("warnings", [])
+        warnings = raw_warnings if isinstance(raw_warnings, list) else []
+        safe = bool(signal_safety.get("safe", len(warnings) == 0))
+        checks.append(
+            _qa_check(
+                check_id="signal_safety_safe",
+                category="signal_safety",
+                passed=safe and len(warnings) == 0,
+                severity_if_failed="critical",
+                message="Signal safety checks should pass without dangerous feedback/gain patterns.",
+                evidence=warnings[:25],
+            )
+        )
+    else:
+        warnings = []
+        safe = None
+        checks.append(
+            _qa_check(
+                check_id="signal_safety_available",
+                category="signal_safety",
+                passed=False,
+                severity_if_failed="low",
+                message="Signal safety scan could not be completed.",
+                evidence=signal_safety_error or {},
+            )
+        )
+
+    for check in checks:
+        if check["passed"]:
+            continue
+        check_id = str(check["id"])
+        severity = str(check["severity_if_failed"])
+        category = str(check["category"])
+        message = str(check["message"])
+        recommendation = ""
+        if check_id == "no_print_objects":
+            recommendation = "Remove print/print~ objects or gate them behind a development-only path."
+        elif check_id == "no_debug_io_objects":
+            recommendation = "Replace adc~/dac~ debugging paths with plugin~/plugout~ flow for release."
+        elif check_id == "no_todo_comments":
+            recommendation = "Resolve TODO comments or remove stale notes before release."
+        elif check_id == "integer_object_positions":
+            recommendation = "Re-align objects to integer coordinates for clean diffs and patch readability."
+        elif check_id == "minimal_segmented_patchcords":
+            recommendation = "Reduce segmented cords unless needed for long-distance/backward connections."
+        elif check_id == "local_scope_names":
+            recommendation = "Prefix shared names with --- (or #0) to prevent cross-device collisions."
+        elif check_id == "live_ui_has_stable_varname":
+            recommendation = "Assign stable scripting names to live.* UI parameters."
+        elif check_id == "no_auto_indexed_parameter_names":
+            recommendation = "Rename auto-indexed parameters in View > Parameters to stable names."
+        elif check_id == "object_count_budget":
+            recommendation = "Encapsulate or split root-level functionality into subpatchers/abstractions."
+        elif check_id == "objects_have_varnames":
+            recommendation = "Add deterministic varnames to objects used for scripting or maintenance."
+        elif check_id == "signal_safety_safe":
+            recommendation = "Fix feedback/gain issues and add limiter stages before DAC paths."
+        else:
+            recommendation = "Review this check and address the reported evidence."
+        findings.append(
+            _qa_finding(
+                finding_id=check_id,
+                severity=severity,
+                category=category,
+                message=message,
+                recommendation=recommendation,
+                evidence=check.get("evidence"),
+            )
+        )
+
+    if isinstance(signal_safety, dict):
+        warnings = signal_safety.get("warnings", [])
+        if isinstance(warnings, list):
+            for index, warning in enumerate(warnings, start=1):
+                if not isinstance(warning, dict):
+                    continue
+                warning_type = str(warning.get("type", "SIGNAL_WARNING")).upper()
+                severity = "high"
+                recommendation = "Inspect and resolve signal-path warning."
+                if warning_type in {"FEEDBACK_LOOP", "UNSAFE_FEEDBACK"}:
+                    severity = "critical"
+                    recommendation = "Break unsafe feedback loop or stabilize it with explicit delay/attenuation."
+                elif warning_type in {"HIGH_GAIN", "NO_LIMITER"}:
+                    severity = "medium"
+                    recommendation = "Lower gain and/or add limiter/saturation before output."
+                findings.append(
+                    _qa_finding(
+                        finding_id=f"signal_warning_{index}",
+                        severity=severity,
+                        category="signal_safety",
+                        message=str(warning.get("message", "Signal safety warning reported.")),
+                        recommendation=recommendation,
+                        evidence=warning,
+                    )
+                )
+
+    category_totals: dict[str, dict] = {}
+    for check in checks:
+        category = str(check["category"])
+        row = category_totals.setdefault(
+            category,
+            {
+                "checks": 0,
+                "checks_passed": 0,
+                "checks_failed": 0,
+                "findings": 0,
+            },
+        )
+        row["checks"] += 1
+        if check["passed"]:
+            row["checks_passed"] += 1
+        else:
+            row["checks_failed"] += 1
+
+    deductions: list[dict] = []
+    for finding in findings:
+        severity = str(finding.get("severity", "low")).lower()
+        deduction = QA_SEVERITY_WEIGHTS.get(severity, QA_SEVERITY_WEIGHTS["low"])
+        deductions.append(
+            {
+                "finding_id": finding.get("id"),
+                "severity": severity,
+                "points": deduction,
+            }
+        )
+        category = str(finding.get("category", "uncategorized"))
+        row = category_totals.setdefault(
+            category,
+            {
+                "checks": 0,
+                "checks_passed": 0,
+                "checks_failed": 0,
+                "findings": 0,
+            },
+        )
+        row["findings"] += 1
+
+    total_deductions = sum(item["points"] for item in deductions)
+    overall_score = max(0.0, 100.0 - float(total_deductions))
+    critical_count = sum(1 for finding in findings if finding.get("severity") == "critical")
+    high_count = sum(1 for finding in findings if finding.get("severity") == "high")
+    medium_count = sum(1 for finding in findings if finding.get("severity") == "medium")
+    low_count = sum(1 for finding in findings if finding.get("severity") == "low")
+    strict_passed = critical_count == 0 and overall_score >= 80.0
+
+    signal_safety_payload = {
+        "available": isinstance(signal_safety, dict),
+        "safe": safe,
+        "warning_count": len(warnings) if isinstance(warnings, list) else 0,
+        "warnings": warnings if isinstance(warnings, list) else [],
+    }
+    if signal_safety_error:
+        signal_safety_payload["error"] = signal_safety_error
+
+    return {
+        "score": {
+            "overall": round(overall_score, 2),
+            "max": 100.0,
+            "deductions": deductions,
+            "total_deductions": total_deductions,
+        },
+        "summary": {
+            **summary,
+            "checks_total": len(checks),
+            "checks_failed": sum(1 for check in checks if not check["passed"]),
+            "findings_total": len(findings),
+            "critical_findings": critical_count,
+            "high_findings": high_count,
+            "medium_findings": medium_count,
+            "low_findings": low_count,
+        },
+        "categories": category_totals,
+        "checks": checks,
+        "findings": findings,
+        "signal_safety": signal_safety_payload,
+        "strict_passed": strict_passed,
+    }
+
+
+def _maxdiff_script_for_path(path: Path) -> Path | None:
+    rel = MAXDIFF_SCRIPT_BY_SUFFIX.get(path.suffix.lower())
+    if rel is None:
+        return None
+    candidate = (MAXMCP_MAXDEVTOOLS_ROOT / rel).resolve()
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _render_text_for_diff(path: Path, *, prefer_maxdiff: bool) -> tuple[str, str, list[str]]:
+    warnings: list[str] = []
+    if prefer_maxdiff:
+        script = _maxdiff_script_for_path(path)
+        if script is not None:
+            try:
+                proc = subprocess.run(
+                    ["python3", str(script), str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return proc.stdout, "maxdiff", warnings
+                stderr = proc.stderr.strip()
+                warnings.append(
+                    f"maxdiff exited non-zero for {path.name}: "
+                    f"code={proc.returncode} stderr={stderr[:240]}"
+                )
+            except Exception as exc:
+                warnings.append(f"maxdiff failed for {path.name}: {exc}")
+        else:
+            warnings.append(
+                "maxdiff not available for this extension or MAXMCP_MAXDEVTOOLS_ROOT is missing."
+            )
+
+    suffix = path.suffix.lower()
+    raw = path.read_bytes()
+    if suffix in {".amxd", ".als"}:
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        return f"<binary:{suffix} size={len(raw)} sha256={digest}>", "internal", warnings
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        return f"<binary size={len(raw)} sha256={digest}>", "internal", warnings
+
+    if suffix in {".maxpat", ".json"}:
+        try:
+            payload = json.loads(text)
+            normalized = json.dumps(payload, indent=2, sort_keys=True)
+            return normalized, "internal", warnings
+        except Exception:
+            return text, "internal", warnings
+
+    return text, "internal", warnings
+
+
+def _write_publish_report(label: str, payload: dict) -> dict:
+    safe_label = re.sub(r"[^a-zA-Z0-9_.-]+", "_", label).strip("_") or "publish_readiness"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_dir = MAXMCP_QA_REPORTS_DIR
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"{safe_label}_{timestamp}.json"
+
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    signature = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    envelope = {
+        "schema_version": "maxmcp.publish_readiness.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "signature": signature,
+        "report": payload,
+    }
+    report_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+    return {
+        "path": str(report_path),
+        "signature": signature,
+        "size_bytes": report_path.stat().st_size,
+    }
+
+
+def _parse_json_object_text(raw: str) -> tuple[dict | None, str | None]:
+    text = str(raw or "").strip()
+    if not text:
+        return None, "empty output"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, str(exc)
+    if not isinstance(parsed, dict):
+        return None, "JSON payload is not an object"
+    return parsed, None
+
+
+def _resolve_maxpylang_extended_command(input_path: Path) -> list[str] | None:
+    override = MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD.strip()
+    if override:
+        tokens = shlex.split(override)
+        if not tokens:
+            return None
+        rendered: list[str] = []
+        placeholder_used = False
+        for token in tokens:
+            if "{input_path}" in token:
+                rendered.append(token.replace("{input_path}", str(input_path)))
+                placeholder_used = True
+            else:
+                rendered.append(token)
+        if not placeholder_used:
+            rendered.extend(["--in", str(input_path)])
+        return rendered
+
+    maxpylang_bin = shutil.which("maxpylang")
+    if not maxpylang_bin:
+        return None
+    return [
+        maxpylang_bin,
+        "--json",
+        "--strict",
+        "check",
+        "--unknown",
+        "--js",
+        "--abstractions",
+        "--in",
+        str(input_path),
+    ]
+
+
+def _run_maxpylang_check_extended_from_topology(
+    topology: Any,
+    *,
+    timeout_seconds: float,
+) -> dict:
+    bounded_timeout = max(
+        1.0,
+        min(float(timeout_seconds), 120.0),
+    )
+    report: dict[str, Any] = {
+        "enabled": True,
+        "available": True,
+        "passed": False,
+        "failures": [],
+        "warnings": [],
+        "metrics": {},
+        "command": [],
+        "input_path": "",
+    }
+    if not isinstance(topology, dict):
+        report["available"] = False
+        report["failures"] = ["topology payload is unavailable for extended validation."]
+        report["metrics"] = {"timeout_seconds": bounded_timeout}
+        return report
+
+    patcher_payload = topology.get("patcher") if "patcher" in topology else topology
+    if not isinstance(patcher_payload, dict):
+        report["available"] = False
+        report["failures"] = ["topology payload is not a valid patcher object."]
+        report["metrics"] = {"timeout_seconds": bounded_timeout}
+        return report
+
+    staging_dir = MAXMCP_QA_REPORTS_DIR / "extended_check_inputs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    input_path = staging_dir / f"extended_check_{timestamp}_{uuid.uuid4().hex[:8]}.maxpat"
+    input_path.write_text(
+        json.dumps({"patcher": patcher_payload}, indent=2),
+        encoding="utf-8",
+    )
+    report["input_path"] = str(input_path)
+
+    cmd = _resolve_maxpylang_extended_command(input_path)
+    if cmd is None:
+        report["available"] = False
+        report["failures"] = [
+            "Unable to locate maxpylang executable. "
+            "Set MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD to configure the command."
+        ]
+        report["metrics"] = {"timeout_seconds": bounded_timeout}
+        return report
+
+    report["command"] = cmd
+    started_at = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=bounded_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        report["available"] = True
+        report["passed"] = False
+        report["failures"] = [f"maxpylang_check_extended timed out after {bounded_timeout:.1f}s."]
+        report["metrics"] = {
+            "timeout_seconds": bounded_timeout,
+            "duration_seconds": round(time.perf_counter() - started_at, 3),
+            "exit_code": None,
+        }
+        return report
+    except Exception as exc:
+        report["available"] = False
+        report["passed"] = False
+        report["failures"] = [f"maxpylang_check_extended execution failed: {exc}"]
+        report["metrics"] = {
+            "timeout_seconds": bounded_timeout,
+            "duration_seconds": round(time.perf_counter() - started_at, 3),
+            "exit_code": None,
+        }
+        return report
+
+    parsed, parse_error = _parse_json_object_text(proc.stdout or "")
+    report["metrics"] = {
+        "timeout_seconds": bounded_timeout,
+        "duration_seconds": round(time.perf_counter() - started_at, 3),
+        "exit_code": int(proc.returncode),
+        "stdout_chars": len(proc.stdout or ""),
+        "stderr_chars": len(proc.stderr or ""),
+    }
+    if parsed is None:
+        report["passed"] = False
+        report["failures"] = [
+            (
+                "maxpylang_check_extended did not emit valid JSON output"
+                + (f": {parse_error}" if parse_error else ".")
+            )
+        ]
+        stderr_excerpt = (proc.stderr or "").strip()
+        if stderr_excerpt:
+            report["warnings"].append(stderr_excerpt[:240])
+        return report
+
+    warnings = parsed.get("warnings")
+    errors = parsed.get("errors")
+    report["warnings"] = list(warnings) if isinstance(warnings, list) else []
+    reported_failures = list(errors) if isinstance(errors, list) else []
+    if not reported_failures and proc.returncode != 0:
+        stderr_excerpt = (proc.stderr or "").strip()
+        if stderr_excerpt:
+            reported_failures.append(stderr_excerpt[:240])
+        else:
+            reported_failures.append("maxpylang_check_extended exited non-zero.")
+
+    changes = parsed.get("changes") if isinstance(parsed.get("changes"), dict) else {}
+    report["metrics"].update(
+        {
+            "unknowns": int(changes.get("unknowns", 0) or 0),
+            "js_unlinked": int(changes.get("js_unlinked", 0) or 0),
+            "abstractions": int(changes.get("abstractions", 0) or 0),
+        }
+    )
+    report["raw"] = {
+        "ok": bool(parsed.get("ok", False)),
+        "schema": parsed.get("schema"),
+        "message": parsed.get("message"),
+    }
+    report["passed"] = bool(parsed.get("ok", False)) and proc.returncode == 0
+    report["failures"] = reported_failures
+    return report
+
+
+def _evaluate_chaos_gate(
+    chaos_report_path: str,
+    *,
+    require_chaos_gate: bool,
+) -> tuple[dict, list[dict], list[dict]]:
+    payload: dict[str, Any] = {
+        "required": bool(require_chaos_gate),
+        "executed": False,
+        "passed": None,
+        "failures": [],
+        "warnings": [],
+        "report_path": "",
+    }
+    gate_failures: list[dict] = []
+    gate_warnings: list[dict] = []
+
+    report_path_raw = str(chaos_report_path or "").strip()
+    if not report_path_raw:
+        if require_chaos_gate:
+            payload["passed"] = False
+            payload["failures"] = ["Chaos gate is required but no report path was provided."]
+            gate_failures.append(
+                {
+                    "gate": "chaos_gate",
+                    "message": "Chaos gate is required but no report path was provided.",
+                    "details": {},
+                }
+            )
+        return payload, gate_failures, gate_warnings
+
+    report_path = Path(report_path_raw).expanduser()
+    if not report_path.is_absolute():
+        report_path = (Path.cwd() / report_path).resolve()
+    else:
+        report_path = report_path.resolve()
+    payload["report_path"] = str(report_path)
+
+    if not report_path.exists() or not report_path.is_file():
+        payload["passed"] = False
+        payload["failures"] = [f"Chaos report path does not exist: {report_path}"]
+        gate_failures.append(
+            {
+                "gate": "chaos_gate",
+                "message": "Chaos report path does not exist.",
+                "details": {"path": str(report_path)},
+            }
+        )
+        return payload, gate_failures, gate_warnings
+
+    try:
+        parsed = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        payload["passed"] = False
+        payload["failures"] = [f"Failed to parse chaos report JSON: {exc}"]
+        gate_failures.append(
+            {
+                "gate": "chaos_gate",
+                "message": "Failed to parse chaos report JSON.",
+                "details": {"path": str(report_path), "error": str(exc)},
+            }
+        )
+        return payload, gate_failures, gate_warnings
+
+    if not isinstance(parsed, dict):
+        payload["passed"] = False
+        payload["failures"] = ["Chaos report payload is not a JSON object."]
+        gate_failures.append(
+            {
+                "gate": "chaos_gate",
+                "message": "Chaos report payload is not a JSON object.",
+                "details": {"path": str(report_path)},
+            }
+        )
+        return payload, gate_failures, gate_warnings
+
+    payload["executed"] = True
+    summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+    aggregate = parsed.get("aggregate_slo") if isinstance(parsed.get("aggregate_slo"), dict) else {}
+    scenarios = parsed.get("scenario_results") if isinstance(parsed.get("scenario_results"), list) else []
+    passed = bool(parsed.get("ok", summary.get("passed", False)))
+    payload["passed"] = passed
+    payload["summary"] = {
+        "scenario_count": len(scenarios),
+        "summary": summary,
+        "aggregate_slo": aggregate,
+    }
+    failures = summary.get("failures")
+    if isinstance(failures, list):
+        payload["failures"] = [str(item) for item in failures]
+    if not passed:
+        gate_failures.append(
+            {
+                "gate": "chaos_gate",
+                "message": "Chaos gate did not pass.",
+                "details": {"path": str(report_path), "summary": summary},
+            }
+        )
+    return payload, gate_failures, gate_warnings
+
+
+def _safe_runtime_from_ctx(ctx: Context | None) -> MaxRuntimeManager | None:
+    if ctx is None:
+        return None
+    try:
+        return _get_runtime(ctx)
+    except Exception:
+        return None
+
+
 def _validate_add_max_object_payload(
     *,
     obj_type: str,
@@ -8535,19 +10239,14 @@ async def remove_max_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "remove_object", "varname": varname},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "remove_object", "varname": varname}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8575,25 +10274,20 @@ async def connect_max_objects(
     if _is_protected_varname(dst_varname):
         return _protected_varname_error(dst_varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "connect_objects",
+            "src_varname": src_varname,
+            "outlet_idx": outlet_idx,
+            "dst_varname": dst_varname,
+            "inlet_idx": inlet_idx,
+        },
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "connect_objects",
-        "src_varname": src_varname,
-        "outlet_idx": outlet_idx,
-        "dst_varname": dst_varname,
-        "inlet_idx": inlet_idx,
-    }
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8621,25 +10315,20 @@ async def disconnect_max_objects(
     if _is_protected_varname(dst_varname):
         return _protected_varname_error(dst_varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "disconnect_objects",
+            "src_varname": src_varname,
+            "outlet_idx": outlet_idx,
+            "dst_varname": dst_varname,
+            "inlet_idx": inlet_idx,
+        },
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "disconnect_objects",
-        "src_varname": src_varname,
-        "outlet_idx": outlet_idx,
-        "dst_varname": dst_varname,
-        "inlet_idx": inlet_idx,
-    }
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8663,24 +10352,19 @@ async def set_object_attribute(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "set_object_attribute",
+            "varname": varname,
+            "attr_name": attr_name,
+            "attr_value": attr_value,
+        },
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "set_object_attribute",
-        "varname": varname,
-        "attr_name": attr_name,
-        "attr_value": attr_value,
-    }
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8719,19 +10403,14 @@ async def set_message_text(
                 "Set not_line_msg=True if this message is not for line~/line.",
             )
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "set_message_text", "varname": varname, "new_text": text_list},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "set_message_text", "varname": varname, "new_text": text_list}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8751,19 +10430,14 @@ async def send_bang_to_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "send_bang_to_object", "varname": varname},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "send_bang_to_object", "varname": varname}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8792,19 +10466,14 @@ async def send_messages_to_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "send_message_to_object", "varname": varname, "message": message},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "send_message_to_object", "varname": varname, "message": message}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -8828,19 +10497,14 @@ async def set_number(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "set_number", "varname": varname, "num": num},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "set_number", "varname": varname, "num": num}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9037,19 +10701,15 @@ async def get_objects_in_patch(
     Returns:
         list: A list of objects and patch cords.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "get_objects_in_patch"},
         create_if_missing=False,
+        timeout=5.0,
+        list_wrap=True,
     )
-    if error:
-        return [error]
-    assert maxmsp is not None
-    payload = {"action": "get_objects_in_patch"}
-    response = await maxmsp.send_request(payload, timeout=5.0)
-
-    return [response]
 
 
 @mcp.tool()
@@ -9065,19 +10725,15 @@ async def get_objects_in_selected(
     Returns:
         list: A list of objects and patch cords.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "get_objects_in_selected"},
         create_if_missing=False,
+        timeout=5.0,
+        list_wrap=True,
     )
-    if error:
-        return [error]
-    assert maxmsp is not None
-    payload = {"action": "get_objects_in_selected"}
-    response = await maxmsp.send_request(payload, timeout=5.0)
-
-    return [response]
 
 
 @mcp.tool()
@@ -9094,21 +10750,14 @@ async def get_object_attributes(
     Returns:
         list: A list of attributes name and attributes values.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "get_object_attributes", "varname": varname},
         create_if_missing=False,
+        list_wrap=True,
     )
-    if error:
-        return [error]
-    assert maxmsp is not None
-    payload = {"action": "get_object_attributes"}
-    kwargs = {"varname": varname}
-    payload.update(kwargs)
-    response = await maxmsp.send_request(payload)
-
-    return [response]
 
 
 @mcp.tool()
@@ -9133,8 +10782,7 @@ async def get_avoid_rect_position(
     if error:
         return error
     assert maxmsp is not None
-    payload = {"action": "get_avoid_rect_position"}
-    response = await maxmsp.send_request(payload)
+    response = await maxmsp.send_request({"action": "get_avoid_rect_position"})
     avoid_rect, valid = _normalize_avoid_rect_payload(response)
     try:
         maxmsp._preflight_last_at = time.monotonic()
@@ -9200,6 +10848,486 @@ async def get_patch_context(
     return response
 
 
+@mcp.tool()
+async def qa_audit_patch(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    include_topology: bool = False,
+    strict: bool = False,
+) -> dict:
+    """Run a standards-oriented QA audit for the current workspace patch."""
+    _runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
+
+    try:
+        topology = await maxmsp.send_request({"action": "get_objects_in_patch"}, timeout=8.0)
+    except MaxMCPError as exc:
+        return {"success": False, "error": exc.to_dict()}
+    except Exception as exc:
+        return _error_result(
+            ERROR_INTERNAL,
+            f"Failed to read patch topology for QA audit: {exc}",
+            recoverable=True,
+        )
+
+    signal_safety = None
+    signal_safety_error = None
+    try:
+        signal_safety = await maxmsp.send_request({"action": "check_signal_safety"}, timeout=6.0)
+        if (
+            isinstance(signal_safety, dict)
+            and signal_safety.get("success") is False
+            and isinstance(signal_safety.get("error"), dict)
+        ):
+            signal_safety_error = signal_safety.get("error")
+            signal_safety = None
+    except MaxMCPError as exc:
+        signal_safety_error = exc.to_dict()
+    except Exception as exc:
+        signal_safety_error = {
+            "code": ERROR_INTERNAL,
+            "message": str(exc),
+            "recoverable": True,
+            "details": {},
+        }
+
+    audit = _collect_patch_audit(
+        topology,
+        signal_safety=signal_safety,
+        signal_safety_error=signal_safety_error,
+    )
+    response = {
+        "success": True,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        **audit,
+    }
+    if include_topology:
+        response["topology"] = topology
+
+    if strict and not audit.get("strict_passed", False):
+        return {
+            "success": False,
+            "error": {
+                "code": ERROR_PRECONDITION,
+                "message": "QA strict mode failed.",
+                "recoverable": True,
+                "details": {
+                    "project_id": project_id,
+                    "workspace_id": workspace_id,
+                    "score": audit.get("score", {}),
+                    "summary": audit.get("summary", {}),
+                },
+            },
+            "audit": response,
+        }
+
+    return response
+
+
+@mcp.tool()
+def diff_patch_summary(
+    ctx: Context,
+    before_path: str,
+    after_path: str,
+    context_lines: int = 3,
+    max_output_lines: int = 500,
+    prefer_maxdiff: bool = True,
+) -> dict:
+    """Create a readable unified diff summary between two patch files."""
+    runtime = _safe_runtime_from_ctx(ctx)
+    try:
+        if runtime is not None:
+            before_resolved = runtime._resolve_patch_path(before_path)
+            after_resolved = runtime._resolve_patch_path(after_path)
+            runtime._validate_patch_path_policy(before_resolved, purpose="patch_read")
+            runtime._validate_patch_path_policy(after_resolved, purpose="patch_read")
+        else:
+            before_resolved = Path(before_path).expanduser().resolve()
+            after_resolved = Path(after_path).expanduser().resolve()
+    except MaxMCPError as exc:
+        return {"success": False, "error": exc.to_dict()}
+    except Exception as exc:
+        return _error_result(
+            ERROR_VALIDATION,
+            f"Failed to resolve diff paths: {exc}",
+            recoverable=True,
+        )
+
+    if not before_resolved.exists():
+        return _error_result(
+            ERROR_VALIDATION,
+            f"Before path does not exist: {before_resolved}",
+            recoverable=True,
+        )
+    if not after_resolved.exists():
+        return _error_result(
+            ERROR_VALIDATION,
+            f"After path does not exist: {after_resolved}",
+            recoverable=True,
+        )
+    if not before_resolved.is_file() or not after_resolved.is_file():
+        return _error_result(
+            ERROR_VALIDATION,
+            "Both diff paths must point to files.",
+            recoverable=True,
+            details={"before_path": str(before_resolved), "after_path": str(after_resolved)},
+        )
+
+    bounded_context = max(0, min(int(context_lines), 20))
+    bounded_max_lines = max(20, min(int(max_output_lines), 4000))
+    before_text, before_backend, before_warnings = _render_text_for_diff(
+        before_resolved, prefer_maxdiff=prefer_maxdiff
+    )
+    after_text, after_backend, after_warnings = _render_text_for_diff(
+        after_resolved, prefer_maxdiff=prefer_maxdiff
+    )
+
+    before_lines = before_text.splitlines()
+    after_lines = after_text.splitlines()
+    diff_lines = list(
+        unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=before_resolved.name,
+            tofile=after_resolved.name,
+            n=bounded_context,
+            lineterm="",
+        )
+    )
+
+    added_lines = 0
+    removed_lines = 0
+    hunk_count = 0
+    for line in diff_lines:
+        if line.startswith("@@"):
+            hunk_count += 1
+            continue
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+"):
+            added_lines += 1
+        elif line.startswith("-"):
+            removed_lines += 1
+
+    truncated = len(diff_lines) > bounded_max_lines
+    preview_lines = diff_lines[:bounded_max_lines]
+    if truncated:
+        preview_lines.append("... diff truncated ...")
+
+    return {
+        "success": True,
+        "before_path": str(before_resolved),
+        "after_path": str(after_resolved),
+        "summary": {
+            "added_lines": added_lines,
+            "removed_lines": removed_lines,
+            "changed_lines": added_lines + removed_lines,
+            "hunks": hunk_count,
+            "context_lines": bounded_context,
+            "max_output_lines": bounded_max_lines,
+            "truncated": truncated,
+            "before_backend": before_backend,
+            "after_backend": after_backend,
+        },
+        "warnings": before_warnings + after_warnings,
+        "diff_preview": "\n".join(preview_lines),
+    }
+
+
+@mcp.tool()
+async def validate_publish_readiness(
+    ctx: Context,
+    project_id: str,
+    workspace_id: str,
+    min_score: float = 80.0,
+    require_signal_safe: bool = True,
+    require_in_sync_twin: bool = False,
+    require_extended_checks: bool = True,
+    extended_check_timeout_seconds: float = MAXMCP_MAXPYLANG_CHECK_EXTENDED_TIMEOUT_SECONDS,
+    require_chaos_gate: bool = False,
+    chaos_report_path: str = "",
+    before_path: str = "",
+    after_path: str = "",
+    max_changed_lines: int = 2000,
+    write_report: bool = True,
+    report_label: str = "publish_readiness",
+    include_topology_in_audit: bool = False,
+    prefer_maxdiff: bool = True,
+) -> dict:
+    """Aggregate QA checks into a release-readiness decision."""
+    runtime, maxmsp, error = await _activate_workspace_scope(
+        ctx,
+        project_id=project_id,
+        workspace_id=workspace_id,
+        create_if_missing=False,
+    )
+    if error:
+        return error
+    assert maxmsp is not None
+
+    try:
+        topology = await maxmsp.send_request({"action": "get_objects_in_patch"}, timeout=8.0)
+    except MaxMCPError as exc:
+        return {"success": False, "error": exc.to_dict()}
+    except Exception as exc:
+        return _error_result(
+            ERROR_INTERNAL,
+            f"Failed to read patch topology for readiness validation: {exc}",
+            recoverable=True,
+        )
+
+    signal_safety = None
+    signal_safety_error = None
+    try:
+        signal_safety = await maxmsp.send_request({"action": "check_signal_safety"}, timeout=6.0)
+        if (
+            isinstance(signal_safety, dict)
+            and signal_safety.get("success") is False
+            and isinstance(signal_safety.get("error"), dict)
+        ):
+            signal_safety_error = signal_safety.get("error")
+            signal_safety = None
+    except MaxMCPError as exc:
+        signal_safety_error = exc.to_dict()
+    except Exception as exc:
+        signal_safety_error = {
+            "code": ERROR_INTERNAL,
+            "message": str(exc),
+            "recoverable": True,
+            "details": {},
+        }
+
+    qa_audit = _collect_patch_audit(
+        topology,
+        signal_safety=signal_safety,
+        signal_safety_error=signal_safety_error,
+    )
+    if include_topology_in_audit:
+        qa_audit["topology"] = topology
+
+    bounded_min_score = max(0.0, min(float(min_score), 100.0))
+    gate_failures: list[dict] = []
+    gate_warnings: list[dict] = []
+    protocol_v3 = {"strict_only": True, "violations": []}
+    if not MAXMCP_STRICT_V3 or not MAXMCP_STRICT_V2_ENFORCEMENT:
+        protocol_v3["violations"].append(
+            "Legacy strict protocol toggles were disabled in env but are ignored after hard cutover."
+        )
+
+    extended_checks = _run_maxpylang_check_extended_from_topology(
+        topology,
+        timeout_seconds=extended_check_timeout_seconds,
+    )
+    if require_extended_checks and not extended_checks.get("passed", False):
+        gate_failures.append(
+            {
+                "gate": "extended_checks",
+                "message": "Extended MaxPyLang checks failed.",
+                "details": {
+                    "available": extended_checks.get("available", False),
+                    "failures": extended_checks.get("failures", []),
+                    "warnings": extended_checks.get("warnings", []),
+                    "input_path": extended_checks.get("input_path", ""),
+                },
+            }
+        )
+    elif not extended_checks.get("passed", False):
+        gate_warnings.append(
+            {
+                "gate": "extended_checks",
+                "message": "Extended MaxPyLang checks did not pass, but gate is not required.",
+                "details": {
+                    "failures": extended_checks.get("failures", []),
+                    "input_path": extended_checks.get("input_path", ""),
+                },
+            }
+        )
+
+    chaos_gate, chaos_failures, chaos_warnings = _evaluate_chaos_gate(
+        chaos_report_path,
+        require_chaos_gate=require_chaos_gate,
+    )
+    gate_failures.extend(chaos_failures)
+    gate_warnings.extend(chaos_warnings)
+
+    if qa_audit["score"]["overall"] < bounded_min_score:
+        gate_failures.append(
+            {
+                "gate": "min_score",
+                "message": (
+                    f"QA score {qa_audit['score']['overall']} is below minimum {bounded_min_score}."
+                ),
+                "details": {
+                    "score": qa_audit["score"]["overall"],
+                    "minimum": bounded_min_score,
+                },
+            }
+        )
+    if qa_audit["summary"]["critical_findings"] > 0:
+        gate_failures.append(
+            {
+                "gate": "no_critical_findings",
+                "message": "Critical QA findings were detected.",
+                "details": {"critical_findings": qa_audit["summary"]["critical_findings"]},
+            }
+        )
+
+    signal_payload = qa_audit.get("signal_safety", {})
+    if require_signal_safe:
+        if not signal_payload.get("available", False):
+            gate_failures.append(
+                {
+                    "gate": "signal_safety_available",
+                    "message": "Signal safety report is required but unavailable.",
+                    "details": signal_payload.get("error", {}),
+                }
+            )
+        elif not signal_payload.get("safe", False):
+            gate_failures.append(
+                {
+                    "gate": "signal_safety_safe",
+                    "message": "Signal safety warnings were reported.",
+                    "details": {"warning_count": signal_payload.get("warning_count", 0)},
+                }
+            )
+
+    drift = None
+    if require_in_sync_twin:
+        if runtime is None:
+            gate_failures.append(
+                {
+                    "gate": "twin_in_sync",
+                    "message": "Runtime manager unavailable for twin drift check.",
+                    "details": {},
+                }
+            )
+        else:
+            drift = await runtime.check_patch_drift(auto_resync=False)
+            if not drift.get("success", False):
+                gate_failures.append(
+                    {
+                        "gate": "twin_in_sync",
+                        "message": "Twin drift check failed.",
+                        "details": drift.get("error", drift),
+                    }
+                )
+            elif not drift.get("in_sync", True):
+                gate_failures.append(
+                    {
+                        "gate": "twin_in_sync",
+                        "message": "Patch twin drift detected.",
+                        "details": {"baseline_hash": drift.get("baseline_hash"), "live_hash": drift.get("live_hash")},
+                    }
+                )
+
+    diff = None
+    has_before = bool(before_path.strip())
+    has_after = bool(after_path.strip())
+    if has_before != has_after:
+        gate_failures.append(
+            {
+                "gate": "diff_paths",
+                "message": "Both before_path and after_path must be provided together.",
+                "details": {"before_path": before_path, "after_path": after_path},
+            }
+        )
+    elif has_before and has_after:
+        diff = diff_patch_summary(
+            ctx,
+            before_path=before_path,
+            after_path=after_path,
+            context_lines=3,
+            max_output_lines=500,
+            prefer_maxdiff=prefer_maxdiff,
+        )
+        if not diff.get("success", False):
+            gate_failures.append(
+                {
+                    "gate": "diff_available",
+                    "message": "Failed to compute patch diff summary.",
+                    "details": diff.get("error", diff),
+                }
+            )
+        else:
+            changed = int(diff.get("summary", {}).get("changed_lines", 0))
+            if max_changed_lines >= 0 and changed > int(max_changed_lines):
+                gate_failures.append(
+                    {
+                        "gate": "diff_change_budget",
+                        "message": f"Changed lines {changed} exceed budget {int(max_changed_lines)}.",
+                        "details": {
+                            "changed_lines": changed,
+                            "max_changed_lines": int(max_changed_lines),
+                        },
+                    }
+                )
+            if diff.get("summary", {}).get("truncated"):
+                gate_warnings.append(
+                    {
+                        "gate": "diff_output_truncated",
+                        "message": "Diff preview was truncated; inspect full file diff if needed.",
+                        "details": {"max_output_lines": diff["summary"]["max_output_lines"]},
+                    }
+                )
+
+    ready = len(gate_failures) == 0
+    report_payload = {
+        "ready": ready,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "gates": {
+            "min_score": bounded_min_score,
+            "require_signal_safe": require_signal_safe,
+            "require_in_sync_twin": require_in_sync_twin,
+            "require_extended_checks": require_extended_checks,
+            "extended_check_timeout_seconds": max(1.0, float(extended_check_timeout_seconds)),
+            "require_chaos_gate": require_chaos_gate,
+            "chaos_report_path": str(chaos_report_path or ""),
+            "max_changed_lines": int(max_changed_lines),
+        },
+        "gate_failures": gate_failures,
+        "gate_warnings": gate_warnings,
+        "protocol_v3": protocol_v3,
+        "extended_checks": extended_checks,
+        "chaos_gate": chaos_gate,
+        "qa_audit": qa_audit,
+    }
+    if drift is not None:
+        report_payload["drift"] = drift
+    if diff is not None:
+        report_payload["diff"] = diff
+
+    report_artifact = None
+    if write_report:
+        try:
+            report_artifact = _write_publish_report(report_label, report_payload)
+        except Exception as exc:
+            gate_warnings.append(
+                {
+                    "gate": "report_write",
+                    "message": f"Failed to write readiness report artifact: {exc}",
+                    "details": {},
+                }
+            )
+
+    return {
+        "success": True,
+        "ready": ready,
+        "report": report_payload,
+        "report_artifact": report_artifact,
+    }
+
+
 # ========================================
 # Subpatcher navigation tools:
 
@@ -9227,24 +11355,19 @@ async def create_subpatcher(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "create_subpatcher",
+            "position": position,
+            "varname": varname,
+            "name": name,
+        },
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "create_subpatcher",
-        "position": position,
-        "varname": varname,
-        "name": name,
-    }
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9266,19 +11389,14 @@ async def enter_subpatcher(
     Args:
         varname (str): Variable name of the subpatcher object to enter.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "enter_subpatcher", "varname": varname},
         create_if_missing=False,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "enter_subpatcher", "varname": varname}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9293,19 +11411,14 @@ async def exit_subpatcher(
 
     If already at root level, this has no effect.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "exit_subpatcher"},
         create_if_missing=False,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "exit_subpatcher"}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9322,18 +11435,14 @@ async def get_patcher_context(
     Returns:
         dict: Context info with 'depth', 'path' (list of varnames), and 'is_root'.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "get_patcher_context"},
         create_if_missing=False,
+        use_command=False,
     )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "get_patcher_context"}
-    response = await maxmsp.send_request(payload)
-    return response
 
 
 @mcp.tool()
@@ -9361,25 +11470,20 @@ async def add_subpatcher_io(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "add_subpatcher_io",
+            "position": position,
+            "io_type": io_type,
+            "varname": varname,
+            "comment": comment,
+        },
         create_if_missing=False,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "add_subpatcher_io",
-        "position": position,
-        "io_type": io_type,
-        "varname": varname,
-        "comment": comment,
-    }
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9406,18 +11510,14 @@ async def get_object_connections(
         dict: Contains 'inputs' (connections coming INTO this object) and
               'outputs' (connections going OUT of this object).
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "get_object_connections", "varname": varname},
         create_if_missing=False,
+        use_command=False,
     )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "get_object_connections", "varname": varname}
-    response = await maxmsp.send_request(payload)
-    return response
 
 
 @mcp.tool()
@@ -9449,22 +11549,16 @@ async def recreate_with_args(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "recreate_with_args", "varname": varname, "new_args": new_args},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "recreate_with_args", "varname": varname, "new_args": new_args}
-    response = await maxmsp.send_request(
-        payload,
+        use_command=False,
         timeout=5.0,
-        idempotency_key=idempotency_key or None,
+        idempotency_key=idempotency_key,
     )
-    return response
 
 
 @mcp.tool()
@@ -9490,21 +11584,15 @@ async def move_object(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "move_object", "varname": varname, "x": x, "y": y},
         create_if_missing=True,
+        use_command=False,
+        idempotency_key=idempotency_key,
     )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "move_object", "varname": varname, "x": x, "y": y}
-    response = await maxmsp.send_request(
-        payload,
-        idempotency_key=idempotency_key or None,
-    )
-    return response
 
 
 @mcp.tool()
@@ -9526,19 +11614,14 @@ async def autofit_existing(
     if _is_protected_varname(varname):
         return _protected_varname_error(varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "autofit_existing", "varname": varname},
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "autofit_existing", "varname": varname}
-    return await maxmsp.send_command(
-        payload,
-        idempotency_key=idempotency_key or None,
+        use_command=True,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -9559,18 +11642,15 @@ async def check_signal_safety(
     Returns:
         dict: Contains 'warnings' list and 'safe' boolean.
     """
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={"action": "check_signal_safety"},
         create_if_missing=False,
+        use_command=False,
+        timeout=5.0,
     )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {"action": "check_signal_safety"}
-    response = await maxmsp.send_request(payload, timeout=5.0)
-    return response
 
 
 @mcp.tool()
@@ -9603,28 +11683,33 @@ async def encapsulate(
     if _is_protected_varname(subpatcher_varname):
         return _protected_varname_error(subpatcher_varname)
 
-    _runtime, maxmsp, error = await _activate_workspace_scope(
+    return await _workspace_bridge_call(
         ctx,
         project_id=project_id,
         workspace_id=workspace_id,
+        payload={
+            "action": "encapsulate",
+            "varnames": varnames,
+            "subpatcher_name": subpatcher_name,
+            "subpatcher_varname": subpatcher_varname,
+        },
         create_if_missing=True,
-    )
-    if error:
-        return error
-    assert maxmsp is not None
-    payload = {
-        "action": "encapsulate",
-        "varnames": varnames,
-        "subpatcher_name": subpatcher_name,
-        "subpatcher_varname": subpatcher_varname,
-    }
-    response = await maxmsp.send_request(
-        payload,
+        use_command=False,
         timeout=10.0,
-        idempotency_key=idempotency_key or None,
+        idempotency_key=idempotency_key,
     )
-    return response
+
+
+def _run_server_main() -> int:
+    lock = _ServerInstanceLock(MAXMCP_SERVER_LOCK_PATH)
+    try:
+        with lock:
+            mcp.run()
+    except RuntimeError as exc:
+        logging.error("%s", exc)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    mcp.run()
+    raise SystemExit(_run_server_main())

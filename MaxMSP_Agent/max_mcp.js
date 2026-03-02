@@ -53,13 +53,730 @@ function safe_parse_json(str) {
     }
 }
 
-function split_long_string(inString, maxLength) {
-    // var longString = inString.replace(/\s+/g, "");
-    var result = [];
-    for (var i = 0; i < inString.length; i += maxLength) {
-        result.push(inString.substring(i, i + maxLength));
+var BRIDGE_PROTO = "maxmcp-4";
+var BRIDGE_BUILD_ID = "max_mcp_js_20260302_01";
+var TRANSPORT_DICT_REF = "dict_ref";
+var STREAM_KIND_REQUEST = "request";
+var STREAM_KIND_RESPONSE = "response";
+var RESPONSE_MAX_TOTAL_CHARS = 2000000;
+var ACTION_TRANSPORT_BEGIN = "_maxmcp_transport_begin"; // explicit legacy rejection only
+var ACTION_TRANSPORT_CHUNK = "_maxmcp_transport_chunk"; // explicit legacy rejection only
+var ACTION_TRANSPORT_END = "_maxmcp_transport_end"; // explicit legacy rejection only
+var ACTION_TRANSPORT_DICT_REQUEST = "_maxmcp_transport_dict_request";
+var ACTION_TRANSPORT_DICT_RESPONSE = "_maxmcp_transport_dict_response";
+var ACTION_TRANSPORT_FILE_REQUEST = "_maxmcp_transport_file_request";
+var TRANSPORT_DICT_TTL_MS = 45000;
+var TRANSPORT_DICT_PREFIX = "__maxmcp_transport";
+var TRANSPORT_FILE_DIR_HINT = "/tmp/maxmcp_transport";
+var TRANSPORT_FILE_MAX_TOTAL_CHARS = 2000000;
+var CAPABILITY_ACTIONS = [
+    "get_objects_in_patch", "get_objects_in_selected", "get_object_attributes",
+    "get_avoid_rect_position", "add_object", "add_object_with_preflight", "remove_object",
+    "connect_objects", "disconnect_objects", "set_object_attribute",
+    "set_message_text", "send_message_to_object", "send_bang_to_object",
+    "set_number", "create_subpatcher", "enter_subpatcher", "exit_subpatcher",
+    "get_patcher_context", "add_subpatcher_io", "get_object_connections",
+    "recreate_with_args", "move_object", "autofit_existing", "encapsulate",
+    "check_signal_safety", "bridge_ping", "health_ping", "capabilities",
+    "set_workspace_target", "workspace_status", "apply_topology_snapshot",
+    "apply_topology_snapshot_progressive"
+];
+
+function _capability_flags(actions) {
+    var flags = {};
+    if (!actions || !actions.length) {
+        return flags;
     }
-    return result;
+    for (var i = 0; i < actions.length; i++) {
+        flags[actions[i]] = true;
+    }
+    return flags;
+}
+
+function _transport_health_payload() {
+    var available = _supports_dict_transport();
+    return {
+        dict_api_available: available,
+        dict_ready: available,
+        last_probe_ok: available,
+        last_error: available ? "" : "Dict transport is not available in this Max JS runtime."
+    };
+}
+
+function _transport_request_id(data) {
+    if (data && data.request_id !== undefined && data.request_id !== null) {
+        return String(data.request_id);
+    }
+    return null;
+}
+
+function _supports_dict_transport() {
+    return typeof Dict === "function";
+}
+
+function _sanitize_dict_segment(value) {
+    var raw = String(value || "");
+    return raw.replace(/[^A-Za-z0-9_\-]/g, "_");
+}
+
+function _build_transport_dict_name(kind, requestId, transportId) {
+    return [
+        TRANSPORT_DICT_PREFIX,
+        kind || "payload",
+        _sanitize_dict_segment(requestId || "no_request_id"),
+        _sanitize_dict_segment(transportId || "")
+    ].join("_");
+}
+
+function _read_transport_dict_payload(dictName) {
+    if (!_supports_dict_transport()) {
+        return {
+            success: false,
+            error: "Dict transport is not available in this Max JS runtime."
+        };
+    }
+    try {
+        var dict_obj = new Dict(String(dictName || ""));
+        if (!dict_obj || !dict_obj.name) {
+            return {
+                success: false,
+                error: "Failed to resolve dict transport payload."
+            };
+        }
+        var serialized = "";
+        try {
+            serialized = dict_obj.stringify();
+        } catch (_stringify_error) {
+            serialized = "";
+        }
+        if (!serialized || typeof serialized !== "string") {
+            return {
+                success: false,
+                error: "Dict payload stringification returned empty content."
+            };
+        }
+        var parsed = safe_parse_json(serialized);
+        if (!parsed || typeof parsed !== "object") {
+            return {
+                success: false,
+                error: "Unable to parse dict payload JSON."
+            };
+        }
+        return {
+            success: true,
+            payload: parsed,
+            chars: serialized.length
+        };
+    } catch (e) {
+        return {
+            success: false,
+            error: String(e)
+        };
+    }
+}
+
+function _write_transport_dict_payload(dictName, payload) {
+    if (!_supports_dict_transport()) {
+        return {
+            success: false,
+            error: "Dict transport is not available in this Max JS runtime."
+        };
+    }
+    try {
+        var serialized = JSON.stringify(payload || {});
+        var dict_obj = new Dict(String(dictName || ""));
+        dict_obj.parse(serialized);
+        return {
+            success: true,
+            chars: serialized.length
+        };
+    } catch (e) {
+        return {
+            success: false,
+            error: String(e)
+        };
+    }
+}
+
+function _clear_transport_dict(dictName) {
+    if (!_supports_dict_transport()) {
+        return;
+    }
+    try {
+        var dict_obj = new Dict(String(dictName || ""));
+        if (dict_obj && typeof dict_obj.clear === "function") {
+            dict_obj.clear();
+        }
+    } catch (_clear_error) {
+        // Best effort only.
+    }
+}
+
+function _normalize_path_for_compare(value) {
+    var raw = String(value || "");
+    if (!raw) {
+        return "";
+    }
+    raw = raw.replace(/\\/g, "/");
+    var drive = "";
+    if (/^[A-Za-z]:/.test(raw)) {
+        drive = raw.slice(0, 2);
+        raw = raw.slice(2);
+    }
+    var absolute = raw.indexOf("/") === 0;
+    var segments = raw.split("/");
+    var out = [];
+    for (var i = 0; i < segments.length; i++) {
+        var segment = String(segments[i] || "");
+        if (!segment || segment === ".") {
+            continue;
+        }
+        if (segment === "..") {
+            if (out.length > 0) {
+                out.pop();
+                continue;
+            }
+            if (absolute) {
+                return "";
+            }
+            continue;
+        }
+        out.push(segment);
+    }
+    var normalized = (absolute ? "/" : "") + out.join("/");
+    if (drive) {
+        normalized = drive + normalized;
+    }
+    return normalized || (absolute ? "/" : "");
+}
+
+function _path_within_root(candidatePath, rootPath) {
+    var candidate = _normalize_path_for_compare(candidatePath);
+    var root = _normalize_path_for_compare(rootPath);
+    if (!candidate || !root) {
+        return false;
+    }
+    if (candidate === root) {
+        return true;
+    }
+    if (root.length <= 1) {
+        return candidate.indexOf(root) === 0;
+    }
+    return candidate.indexOf(root + "/") === 0;
+}
+
+function _validate_transport_file_reference(filePath, allowedRootA, allowedRootB) {
+    var pathValue = String(filePath || "");
+    if (!pathValue) {
+        return { success: false, reason: "Missing file transport path." };
+    }
+    if (pathValue.indexOf("\u0000") !== -1) {
+        return { success: false, reason: "File path contains invalid null byte." };
+    }
+    var normalized = _normalize_path_for_compare(pathValue);
+    if (!normalized) {
+        return { success: false, reason: "File path normalization failed." };
+    }
+    var lower = normalized.toLowerCase();
+    if (lower.slice(-5) !== ".json") {
+        return {
+            success: false,
+            reason: "File transport requires .json payload files.",
+            path: normalized
+        };
+    }
+    var roots = [];
+    roots.push(_normalize_path_for_compare(allowedRootA || ""));
+    roots.push(_normalize_path_for_compare(allowedRootB || ""));
+    roots.push(_normalize_path_for_compare(TRANSPORT_FILE_DIR_HINT));
+    var uniqueRoots = [];
+    for (var i = 0; i < roots.length; i++) {
+        var root = roots[i];
+        if (!root) {
+            continue;
+        }
+        if (uniqueRoots.indexOf(root) === -1) {
+            uniqueRoots.push(root);
+        }
+    }
+    var matchedRoot = "";
+    for (var j = 0; j < uniqueRoots.length; j++) {
+        if (_path_within_root(normalized, uniqueRoots[j])) {
+            matchedRoot = uniqueRoots[j];
+            break;
+        }
+    }
+    if (!matchedRoot) {
+        return {
+            success: false,
+            reason: "File transport path is outside allowed roots.",
+            path: normalized,
+            allowed_roots: uniqueRoots
+        };
+    }
+    return {
+        success: true,
+        path: normalized,
+        matched_root: matchedRoot
+    };
+}
+
+function _read_transport_file_payload(filePath) {
+    if (!filePath) {
+        return {
+            success: false,
+            error: "Missing file transport path."
+        };
+    }
+    var handle = null;
+    try {
+        handle = new File(String(filePath), "read");
+        if (!handle || handle.isopen !== 1) {
+            return {
+                success: false,
+                error: "Unable to open request payload file."
+            };
+        }
+        var serialized = "";
+        var chunks = [];
+        while (handle.position < handle.eof) {
+            var line = handle.readline();
+            if (line === undefined || line === null) {
+                break;
+            }
+            chunks.push(String(line));
+        }
+        if (chunks.length > 0) {
+            serialized = chunks.join("\n");
+        } else if (typeof handle.readstring === "function") {
+            // Fallback for runtimes where readline is unavailable.
+            serialized = handle.readstring(handle.eof);
+        }
+        handle.close();
+        handle = null;
+        if (!serialized || typeof serialized !== "string") {
+            return {
+                success: false,
+                error: "Request payload file is empty."
+            };
+        }
+        var parsed = safe_parse_json(serialized);
+        if (!parsed || typeof parsed !== "object") {
+            return {
+                success: false,
+                error: "Unable to parse request payload file JSON."
+            };
+        }
+        return {
+            success: true,
+            payload: parsed,
+            chars: serialized.length
+        };
+    } catch (e) {
+        return {
+            success: false,
+            error: String(e)
+        };
+    } finally {
+        try {
+            if (handle && handle.isopen === 1) {
+                handle.close();
+            }
+        } catch (_close_error) {
+            // Best effort only.
+        }
+    }
+}
+
+function _transport_respond_error(request_id, code, message, details) {
+    respond_error(
+        request_id,
+        code || "TRANSPORT_PROTOCOL_ERROR",
+        message || "Bridge transport protocol failure.",
+        null,
+        true,
+        details || {}
+    );
+}
+
+function _handle_transport_action(data) {
+    if (!data || typeof data !== "object") {
+        return false;
+    }
+    switch (data.action) {
+        case ACTION_TRANSPORT_BEGIN:
+        case ACTION_TRANSPORT_CHUNK:
+        case ACTION_TRANSPORT_END:
+            _transport_respond_error(
+                _transport_request_id(data),
+                "TRANSPORT_LEGACY_DISABLED",
+                "Legacy framed_json request transport is disabled. Use dict_ref transport.",
+                {
+                    action: data.action,
+                    required_transport: TRANSPORT_DICT_REF
+                }
+            );
+            return true;
+        case ACTION_TRANSPORT_DICT_REQUEST:
+            _handle_transport_dict_request_control(
+                data.dict_name || (data.dict_ref && data.dict_ref.name) || "",
+                data.request_id || "",
+                data.transport_id || (data.dict_ref && data.dict_ref.transport_id) || "",
+                data.total_chars || (data.dict_ref && data.dict_ref.size_chars) || "",
+                data.origin_event || "",
+                data.bridge_proto || ""
+            );
+            return true;
+        case ACTION_TRANSPORT_FILE_REQUEST:
+            _handle_transport_file_request_control(
+                data.file_path || (data.file_ref && data.file_ref.path) || "",
+                data.request_id || "",
+                data.transport_id || (data.file_ref && data.file_ref.transport_id) || "",
+                data.total_chars || (data.file_ref && data.file_ref.size_chars) || "",
+                data.origin_event || "",
+                data.bridge_proto || "",
+                data.allowed_root || "",
+                data.project_root || "",
+                data.max_total_chars || ""
+            );
+            return true;
+        default:
+            return false;
+    }
+}
+
+function _handle_transport_dict_request_control(
+    dict_name,
+    request_id,
+    transport_id,
+    total_chars,
+    origin_event,
+    bridge_proto
+) {
+    var requestId = request_id ? String(request_id) : null;
+    var dictName = dict_name ? String(dict_name) : "";
+    var transportId = transport_id ? String(transport_id) : "";
+    var expectedChars = parseInt(total_chars, 10);
+    var proto = bridge_proto ? String(bridge_proto) : BRIDGE_PROTO;
+
+    if (proto !== BRIDGE_PROTO) {
+        respond_error(
+            requestId,
+            "BRIDGE_PROTOCOL_MISMATCH",
+            "Invalid dict request transport metadata.",
+            null,
+            true,
+            {
+                expected_proto: BRIDGE_PROTO,
+                received_proto: proto,
+                dict_name: dictName,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+    if (!dictName) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "Missing dict transport reference in request.",
+            null,
+            true,
+            {
+                dict_name: dictName,
+                transport_id: transportId,
+                origin_event: origin_event || ""
+            }
+        );
+        return;
+    }
+
+    var resolved = _read_transport_dict_payload(dictName);
+    _clear_transport_dict(dictName);
+    if (!resolved.success) {
+        respond_error(
+            requestId,
+            "TRANSPORT_CORRUPT_PAYLOAD",
+            "Unable to resolve dict request payload.",
+            null,
+            true,
+            {
+                dict_name: dictName,
+                transport_id: transportId,
+                origin_event: origin_event || "",
+                reason: resolved.error || "unknown"
+            }
+        );
+        return;
+    }
+
+    if (isFinite(expectedChars) && expectedChars >= 0 && resolved.chars > expectedChars + 1024) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "Dict request payload exceeded expected size.",
+            null,
+            true,
+            {
+                dict_name: dictName,
+                transport_id: transportId,
+                expected_chars: expectedChars,
+                received_chars: resolved.chars
+            }
+        );
+        return;
+    }
+
+    var payload = resolved.payload;
+    if (payload.bridge_proto && payload.bridge_proto !== BRIDGE_PROTO) {
+        respond_error(
+            payload.request_id || requestId,
+            "BRIDGE_PROTOCOL_MISMATCH",
+            "Bridge protocol mismatch in dict request payload.",
+            null,
+            true,
+            {
+                expected_proto: BRIDGE_PROTO,
+                received_proto: payload.bridge_proto,
+                dict_name: dictName,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+    if (requestId && payload.request_id && String(payload.request_id) !== requestId) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "Dict request_id mismatch between control and payload.",
+            null,
+            true,
+            {
+                expected_request_id: requestId,
+                received_request_id: String(payload.request_id),
+                dict_name: dictName,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+
+    payload.transport = TRANSPORT_DICT_REF;
+    payload.dict_ref = {
+        name: dictName,
+        request_id: requestId || payload.request_id || null,
+        kind: STREAM_KIND_REQUEST,
+        transport_id: transportId,
+        expires_ms: Date.now() + TRANSPORT_DICT_TTL_MS,
+        size_chars: resolved.chars
+    };
+    _dispatch_action(payload);
+}
+
+function _handle_transport_file_request_control(
+    file_path,
+    request_id,
+    transport_id,
+    total_chars,
+    origin_event,
+    bridge_proto,
+    allowed_root,
+    project_root,
+    max_total_chars
+) {
+    var requestId = request_id ? String(request_id) : null;
+    var filePath = file_path ? String(file_path) : "";
+    var transportId = transport_id ? String(transport_id) : "";
+    var expectedChars = parseInt(total_chars, 10);
+    var maxChars = parseInt(max_total_chars, 10);
+    if (!isFinite(maxChars) || maxChars <= 0) {
+        maxChars = TRANSPORT_FILE_MAX_TOTAL_CHARS;
+    }
+    var proto = bridge_proto ? String(bridge_proto) : BRIDGE_PROTO;
+
+    if (proto !== BRIDGE_PROTO) {
+        respond_error(
+            requestId,
+            "BRIDGE_PROTOCOL_MISMATCH",
+            "Invalid file request transport metadata.",
+            null,
+            true,
+            {
+                expected_proto: BRIDGE_PROTO,
+                received_proto: proto,
+                file_path: filePath,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+    if (!filePath) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "Missing file transport reference in request.",
+            null,
+            true,
+            {
+                file_path: filePath,
+                transport_id: transportId,
+                origin_event: origin_event || ""
+            }
+        );
+        return;
+    }
+
+    var validated = _validate_transport_file_reference(filePath, allowed_root, project_root);
+    if (!validated.success) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "File request payload path is invalid.",
+            null,
+            true,
+            {
+                file_path: filePath,
+                transport_id: transportId,
+                origin_event: origin_event || "",
+                reason: validated.reason || "unknown",
+                normalized_path: validated.path || "",
+                allowed_roots: validated.allowed_roots || []
+            }
+        );
+        return;
+    }
+
+    var resolved = _read_transport_file_payload(validated.path);
+    if (!resolved.success) {
+        respond_error(
+            requestId,
+            "TRANSPORT_CORRUPT_PAYLOAD",
+            "Unable to resolve file request payload.",
+            null,
+            true,
+            {
+                file_path: validated.path || filePath,
+                transport_id: transportId,
+                origin_event: origin_event || "",
+                reason: resolved.error || "unknown"
+            }
+        );
+        return;
+    }
+
+    if (resolved.chars > maxChars) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PAYLOAD_TOO_LARGE",
+            "File request payload exceeded maximum transport size.",
+            null,
+            true,
+            {
+                file_path: validated.path || filePath,
+                transport_id: transportId,
+                max_chars: maxChars,
+                received_chars: resolved.chars
+            }
+        );
+        return;
+    }
+
+    if (isFinite(expectedChars) && expectedChars >= 0 && resolved.chars > expectedChars + 1024) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "File request payload exceeded expected size.",
+            null,
+            true,
+            {
+                file_path: validated.path || filePath,
+                transport_id: transportId,
+                expected_chars: expectedChars,
+                received_chars: resolved.chars
+            }
+        );
+        return;
+    }
+
+    var payload = resolved.payload;
+    if (payload.bridge_proto && payload.bridge_proto !== BRIDGE_PROTO) {
+        respond_error(
+            payload.request_id || requestId,
+            "BRIDGE_PROTOCOL_MISMATCH",
+            "Bridge protocol mismatch in file request payload.",
+            null,
+            true,
+            {
+                expected_proto: BRIDGE_PROTO,
+                received_proto: payload.bridge_proto,
+                file_path: validated.path || filePath,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+    if (requestId && payload.request_id && String(payload.request_id) !== requestId) {
+        respond_error(
+            requestId,
+            "TRANSPORT_PROTOCOL_ERROR",
+            "File request_id mismatch between control and payload.",
+            null,
+            true,
+            {
+                expected_request_id: requestId,
+                received_request_id: String(payload.request_id),
+                file_path: validated.path || filePath,
+                transport_id: transportId
+            }
+        );
+        return;
+    }
+
+    payload.transport = "file_ref";
+    payload.file_ref = {
+        path: validated.path || filePath,
+        request_id: requestId || payload.request_id || null,
+        kind: STREAM_KIND_REQUEST,
+        transport_id: transportId,
+        expires_ms: Date.now() + TRANSPORT_DICT_TTL_MS,
+        size_chars: resolved.chars
+    };
+    _dispatch_action(payload);
+}
+
+function _maxmcp_transport_dict_request(dict_name, request_id, transport_id, total_chars, origin_event, bridge_proto) {
+    _handle_transport_dict_request_control(
+        dict_name,
+        request_id,
+        transport_id,
+        total_chars,
+        origin_event,
+        bridge_proto
+    );
+}
+
+function _maxmcp_transport_file_request(
+    file_path,
+    request_id,
+    transport_id,
+    total_chars,
+    origin_event,
+    bridge_proto,
+    allowed_root,
+    project_root,
+    max_total_chars
+) {
+    _handle_transport_file_request_control(
+        file_path,
+        request_id,
+        transport_id,
+        total_chars,
+        origin_event,
+        bridge_proto,
+        allowed_root,
+        project_root,
+        max_total_chars
+    );
 }
 
 function count_root_patcher_objects() {
@@ -86,9 +803,120 @@ function check_large_patch_warning() {
     return null;
 }
 
+function _emit_response_payload_via_dict(envelope, serialized_length) {
+    if (!_supports_dict_transport()) {
+        return false;
+    }
+    var requestId = envelope && envelope.request_id ? String(envelope.request_id) : null;
+    var transportId = [
+        requestId || "no-request-id",
+        Date.now(),
+        Math.floor(Math.random() * 1000000)
+    ].join(":");
+    var dictName = _build_transport_dict_name("resp", requestId, transportId);
+    var envelope_copy = {};
+    for (var key in envelope) {
+        if (envelope.hasOwnProperty(key)) {
+            envelope_copy[key] = envelope[key];
+        }
+    }
+    envelope_copy.transport = TRANSPORT_DICT_REF;
+    envelope_copy.dict_ref = {
+        name: dictName,
+        request_id: requestId,
+        kind: STREAM_KIND_RESPONSE,
+        transport_id: transportId,
+        expires_ms: Date.now() + TRANSPORT_DICT_TTL_MS,
+        size_chars: serialized_length
+    };
+    var write_result = _write_transport_dict_payload(dictName, envelope_copy);
+    if (!write_result.success) {
+        return false;
+    }
+    outlet(
+        1,
+        ACTION_TRANSPORT_DICT_RESPONSE,
+        dictName,
+        requestId || "",
+        transportId,
+        serialized_length,
+        BRIDGE_PROTO
+    );
+    return true;
+}
+
+function _emit_response_payload(envelope) {
+    var serialized = "";
+    try {
+        serialized = JSON.stringify(envelope);
+    } catch (serialize_error) {
+        var fallback = {
+            protocol_version: "2.0",
+            bridge_proto: BRIDGE_PROTO,
+            request_id: envelope && envelope.request_id ? envelope.request_id : null,
+            state: "failed",
+            timestamp_ms: Date.now(),
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Unable to serialize bridge response envelope.",
+                recoverable: true,
+                details: {
+                    reason: String(serialize_error)
+                }
+            }
+        };
+        outlet(1, "response", JSON.stringify(fallback));
+        return;
+    }
+
+    if (serialized.length > RESPONSE_MAX_TOTAL_CHARS) {
+        var oversize = {
+            protocol_version: "2.0",
+            bridge_proto: BRIDGE_PROTO,
+            request_id: envelope && envelope.request_id ? envelope.request_id : null,
+            state: "failed",
+            timestamp_ms: Date.now(),
+            error: {
+                code: "TRANSPORT_PAYLOAD_TOO_LARGE",
+                message: "Response payload exceeds bridge transport maximum size.",
+                recoverable: true,
+                details: {
+                    response_chars: serialized.length,
+                    max_chars: RESPONSE_MAX_TOTAL_CHARS
+                }
+            }
+        };
+        outlet(1, "response", JSON.stringify(oversize));
+        return;
+    }
+
+    if (_emit_response_payload_via_dict(envelope, serialized.length)) {
+        return;
+    }
+
+    var dict_failure = {
+        protocol_version: "2.0",
+        bridge_proto: BRIDGE_PROTO,
+        request_id: envelope && envelope.request_id ? envelope.request_id : null,
+        state: "failed",
+        timestamp_ms: Date.now(),
+        error: {
+            code: "TRANSPORT_PROTOCOL_ERROR",
+            message: "Dictionary response transport is required but unavailable in this runtime.",
+            recoverable: true,
+            details: {
+                required_transport: TRANSPORT_DICT_REF,
+                response_chars: serialized.length
+            }
+        }
+    };
+    outlet(1, "response", JSON.stringify(dict_failure));
+}
+
 function emit_response_envelope(request_id, state, results, error, meta) {
     var envelope = {
         protocol_version: "2.0",
+        bridge_proto: BRIDGE_PROTO,
         request_id: request_id || null,
         state: state,
         timestamp_ms: Date.now()
@@ -106,7 +934,7 @@ function emit_response_envelope(request_id, state, results, error, meta) {
     if (meta) {
         envelope.meta = meta;
     }
-    outlet(1, "response", JSON.stringify(envelope));
+    _emit_response_payload(envelope);
 }
 
 function respond_success(request_id, results, meta) {
@@ -131,12 +959,384 @@ function respond_error(request_id, code, message, hint, recoverable, details) {
     emit_response_envelope(request_id, "failed", null, err, null);
 }
 
-// Called when a message arrives at inlet 0 (from [udpreceive] or similar)
-function anything() {
-    var msg = arrayfromargs(messagename, arguments).join(" ");
-    var data = safe_parse_json(msg);
-    if (!data) return;
+var ACTION_HANDLERS = {
+    fetch_test: function(data) {
+        if (data.request_id) {
+            get_objects_in_patch(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for fetch_test");
+        }
+    },
+    get_objects_in_patch: function(data) {
+        if (data.request_id) {
+            get_objects_in_patch(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_patch");
+        }
+    },
+    get_objects_in_selected: function(data) {
+        if (data.request_id) {
+            get_objects_in_selected(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_selected");
+        }
+    },
+    get_object_attributes: function(data) {
+        if (data.request_id && data.varname) {
+            get_object_attributes(data.request_id, data.varname);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_attributes");
+        }
+    },
+    get_avoid_rect_position: function(data) {
+        if (data.request_id) {
+            get_avoid_rect_position(data.request_id);
+        }
+    },
+    add_object: function(data) {
+        if (data.obj_type && data.position && data.varname && data.request_id) {
+            add_object(data.position[0], data.position[1], data.obj_type, data.args, data.varname, data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing obj_type, position, varname, or request_id for add_object");
+        }
+    },
+    add_object_with_preflight: function(data) {
+        if (data.obj_type && data.position && data.varname && data.request_id) {
+            add_object_with_preflight(
+                data.position[0],
+                data.position[1],
+                data.obj_type,
+                data.args,
+                data.varname,
+                data.request_id
+            );
+        } else {
+            respond_error(
+                data.request_id,
+                "VALIDATION_ERROR",
+                "Missing obj_type, position, varname, or request_id for add_object_with_preflight"
+            );
+        }
+    },
+    remove_object: function(data) {
+        if (data.varname && data.request_id) {
+            var rm = remove_object(data.varname);
+            if (rm.success) {
+                respond_success(data.request_id, rm);
+            } else {
+                respond_error(data.request_id, rm.error.code, rm.error.message, rm.error.hint, rm.error.recoverable, rm.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for remove_object");
+        }
+    },
+    connect_objects: function(data) {
+        if (data.src_varname && data.dst_varname && data.request_id) {
+            var con = connect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+            if (con.success) {
+                respond_success(data.request_id, con);
+            } else {
+                respond_error(data.request_id, con.error.code, con.error.message, con.error.hint, con.error.recoverable, con.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for connect_objects");
+        }
+    },
+    disconnect_objects: function(data) {
+        if (data.src_varname && data.dst_varname && data.request_id) {
+            var dis = disconnect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
+            if (dis.success) {
+                respond_success(data.request_id, dis);
+            } else {
+                respond_error(data.request_id, dis.error.code, dis.error.message, dis.error.hint, dis.error.recoverable, dis.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for disconnect_objects");
+        }
+    },
+    set_object_attribute: function(data) {
+        if (data.varname && data.attr_name && data.attr_value && data.request_id) {
+            var attr = set_object_attribute(data.varname, data.attr_name, data.attr_value);
+            if (attr.success) {
+                respond_success(data.request_id, attr);
+            } else {
+                respond_error(data.request_id, attr.error.code, attr.error.message, attr.error.hint, attr.error.recoverable, attr.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, attr_name, attr_value, or request_id");
+        }
+    },
+    set_message_text: function(data) {
+        if (data.varname && data.new_text && data.request_id) {
+            var msg = set_message_text(data.varname, data.new_text);
+            if (msg.success) {
+                respond_success(data.request_id, msg);
+            } else {
+                respond_error(data.request_id, msg.error.code, msg.error.message, msg.error.hint, msg.error.recoverable, msg.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, new_text, or request_id for set_message_text");
+        }
+    },
+    send_message_to_object: function(data) {
+        if (data.varname && data.message && data.request_id) {
+            var sendmsg = send_message_to_object(data.varname, data.message);
+            if (sendmsg.success) {
+                respond_success(data.request_id, sendmsg);
+            } else {
+                respond_error(data.request_id, sendmsg.error.code, sendmsg.error.message, sendmsg.error.hint, sendmsg.error.recoverable, sendmsg.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, message, or request_id for send_message_to_object");
+        }
+    },
+    send_bang_to_object: function(data) {
+        if (data.varname && data.request_id) {
+            var bang = send_bang_to_object(data.varname);
+            if (bang.success) {
+                respond_success(data.request_id, bang);
+            } else {
+                respond_error(data.request_id, bang.error.code, bang.error.message, bang.error.hint, bang.error.recoverable, bang.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for send_bang_to_object");
+        }
+    },
+    set_number: function(data) {
+        if (data.varname && data.num !== undefined && data.request_id) {
+            var num = set_number(data.varname, data.num);
+            if (num.success) {
+                respond_success(data.request_id, num);
+            } else {
+                respond_error(data.request_id, num.error.code, num.error.message, num.error.hint, num.error.recoverable, num.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, num, or request_id for set_number");
+        }
+    },
+    create_subpatcher: function(data) {
+        if (data.position && data.varname && data.request_id) {
+            var created = create_subpatcher(data.position[0], data.position[1], data.name || "subpatch", data.varname);
+            if (created.success) {
+                respond_success(data.request_id, created);
+            } else {
+                respond_error(data.request_id, created.error.code, created.error.message, created.error.hint, created.error.recoverable, created.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing position, varname, or request_id for create_subpatcher");
+        }
+    },
+    enter_subpatcher: function(data) {
+        if (data.varname && data.request_id) {
+            var entered = enter_subpatcher(data.varname);
+            if (entered.success) {
+                respond_success(data.request_id, entered);
+            } else {
+                respond_error(data.request_id, entered.error.code, entered.error.message, entered.error.hint, entered.error.recoverable, entered.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for enter_subpatcher");
+        }
+    },
+    exit_subpatcher: function(data) {
+        if (data.request_id) {
+            var exited = exit_subpatcher();
+            respond_success(data.request_id, exited);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for exit_subpatcher");
+        }
+    },
+    get_patcher_context: function(data) {
+        if (data.request_id) {
+            get_patcher_context(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_patcher_context");
+        }
+    },
+    add_subpatcher_io: function(data) {
+        if (data.io_type && data.position && data.varname && data.request_id) {
+            var io = add_subpatcher_io(data.position[0], data.position[1], data.io_type, data.varname, data.comment || "");
+            if (io.success) {
+                respond_success(data.request_id, io);
+            } else {
+                respond_error(data.request_id, io.error.code, io.error.message, io.error.hint, io.error.recoverable, io.error.details);
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing io_type, position, varname, or request_id for add_subpatcher_io");
+        }
+    },
+    get_object_connections: function(data) {
+        if (data.request_id && data.varname) {
+            get_object_connections(data.request_id, data.varname);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_connections");
+        }
+    },
+    recreate_with_args: function(data) {
+        if (data.request_id && data.varname && data.new_args !== undefined) {
+            recreate_with_args(data.request_id, data.varname, data.new_args);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, or new_args for recreate_with_args");
+        }
+    },
+    move_object: function(data) {
+        if (data.request_id && data.varname && data.x !== undefined && data.y !== undefined) {
+            move_object(data.request_id, data.varname, data.x, data.y);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, x, or y for move_object");
+        }
+    },
+    autofit_existing: function(data) {
+        if (data.varname && data.request_id) {
+            var fit = autofit_existing(data.varname);
+            respond_success(data.request_id, fit);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for autofit_existing");
+        }
+    },
+    encapsulate: function(data) {
+        if (data.request_id && data.varnames && data.subpatcher_name && data.subpatcher_varname) {
+            encapsulate(data.request_id, data.varnames, data.subpatcher_name, data.subpatcher_varname);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varnames, subpatcher_name, or subpatcher_varname for encapsulate");
+        }
+    },
+    check_signal_safety: function(data) {
+        if (data.request_id) {
+            check_signal_safety(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for check_signal_safety");
+        }
+    },
+    bridge_ping: function(data) {
+        if (data.request_id) {
+            bridge_ping(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for bridge_ping");
+        }
+    },
+    health_ping: function(data) {
+        if (data.request_id) {
+            bridge_ping(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for health_ping");
+        }
+    },
+    capabilities: function(data) {
+        if (data.request_id) {
+            send_capabilities(data.request_id);
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for capabilities");
+        }
+    },
+    set_workspace_target: function(data) {
+        if (data.request_id && data.target_id) {
+            var ws = set_workspace_target(
+                data.target_id,
+                data.workspace_varname || "",
+                data.workspace_name || ""
+            );
+            if (ws.success) {
+                respond_success(data.request_id, ws);
+            } else {
+                respond_error(
+                    data.request_id,
+                    ws.error.code,
+                    ws.error.message,
+                    ws.error.hint,
+                    ws.error.recoverable,
+                    ws.error.details
+                );
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or target_id for set_workspace_target");
+        }
+    },
+    workspace_status: function(data) {
+        if (data.request_id) {
+            respond_success(data.request_id, get_workspace_status());
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for workspace_status");
+        }
+    },
+    apply_topology_snapshot: function(data) {
+        if (data.request_id && data.snapshot) {
+            var applied = apply_topology_snapshot(data.snapshot);
+            if (applied.success) {
+                respond_success(data.request_id, applied);
+            } else {
+                respond_error(
+                    data.request_id,
+                    applied.error.code,
+                    applied.error.message,
+                    applied.error.hint,
+                    applied.error.recoverable,
+                    applied.error.details
+                );
+            }
+        } else {
+            respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or snapshot for apply_topology_snapshot");
+        }
+    },
+    apply_topology_snapshot_progressive: function(data) {
+        if (data.request_id && data.snapshot) {
+            var continuation_state = null;
+            if (data.progress_state && typeof data.progress_state === "object") {
+                continuation_state = data.progress_state;
+            } else if (
+                data.payload
+                && typeof data.payload === "object"
+                && data.payload.progress_state
+                && typeof data.payload.progress_state === "object"
+            ) {
+                continuation_state = data.payload.progress_state;
+            } else if (data.state && typeof data.state === "object") {
+                // Legacy compatibility when requests bypass protocol envelope.
+                continuation_state = data.state;
+            }
+            var applied_progressive = apply_topology_snapshot_progressive(
+                data.snapshot,
+                continuation_state,
+                data.chunk_size,
+                !!data.debug_timing
+            );
+            if (applied_progressive.success) {
+                respond_success(data.request_id, applied_progressive);
+            } else {
+                respond_error(
+                    data.request_id,
+                    applied_progressive.error.code,
+                    applied_progressive.error.message,
+                    applied_progressive.error.hint,
+                    applied_progressive.error.recoverable,
+                    applied_progressive.error.details
+                );
+            }
+        } else {
+            respond_error(
+                data.request_id,
+                "VALIDATION_ERROR",
+                "Missing request_id or snapshot for apply_topology_snapshot_progressive"
+            );
+        }
+    }
+};
 
+function _dispatch_action(data) {
+    if (data && data.bridge_proto && data.bridge_proto !== BRIDGE_PROTO) {
+        respond_error(
+            data.request_id,
+            "BRIDGE_PROTOCOL_MISMATCH",
+            "Bridge protocol mismatch in request payload.",
+            null,
+            false,
+            {
+                expected: BRIDGE_PROTO,
+                received: data.bridge_proto
+            }
+        );
+        return;
+    }
     // Support protocol envelopes while preserving legacy flat payload behavior.
     if (data.payload && typeof data.payload === "object") {
         for (var key in data.payload) {
@@ -145,403 +1345,21 @@ function anything() {
             }
         }
     }
-
-    switch (data.action) {
-        case "fetch_test":
-            if (data.request_id) {
-                get_objects_in_patch(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for fetch_test");
-            }
-            break;
-        case "get_objects_in_patch":
-            if (data.request_id) {
-                get_objects_in_patch(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_patch");
-            }
-            break;
-        case "get_objects_in_selected":
-            if (data.request_id) {
-                get_objects_in_selected(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_objects_in_selected");
-            }
-            break;
-        case "get_object_attributes":
-            if (data.request_id && data.varname) {
-                get_object_attributes(data.request_id, data.varname);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_attributes");
-            }
-            break;
-        case "get_avoid_rect_position":
-            if (data.request_id) {
-                get_avoid_rect_position(data.request_id);
-            }
-            break;
-        case "add_object":
-            if (data.obj_type && data.position && data.varname && data.request_id) {
-                add_object(data.position[0], data.position[1], data.obj_type, data.args, data.varname, data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing obj_type, position, varname, or request_id for add_object");
-            }
-            break;
-        case "add_object_with_preflight":
-            if (data.obj_type && data.position && data.varname && data.request_id) {
-                add_object_with_preflight(
-                    data.position[0],
-                    data.position[1],
-                    data.obj_type,
-                    data.args,
-                    data.varname,
-                    data.request_id
-                );
-            } else {
-                respond_error(
-                    data.request_id,
-                    "VALIDATION_ERROR",
-                    "Missing obj_type, position, varname, or request_id for add_object_with_preflight"
-                );
-            }
-            break;
-        case "remove_object":
-            if (data.varname && data.request_id) {
-                var rm = remove_object(data.varname);
-                if (rm.success) {
-                    respond_success(data.request_id, rm);
-                } else {
-                    respond_error(data.request_id, rm.error.code, rm.error.message, rm.error.hint, rm.error.recoverable, rm.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for remove_object");
-            }
-            break;
-        case "connect_objects":
-            if (data.src_varname && data.dst_varname && data.request_id) {
-                var con = connect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
-                if (con.success) {
-                    respond_success(data.request_id, con);
-                } else {
-                    respond_error(data.request_id, con.error.code, con.error.message, con.error.hint, con.error.recoverable, con.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for connect_objects");
-            }
-            break;
-        case "disconnect_objects":
-            if (data.src_varname && data.dst_varname && data.request_id) {
-                var dis = disconnect_objects(data.src_varname, data.outlet_idx || 0, data.dst_varname, data.inlet_idx || 0);
-                if (dis.success) {
-                    respond_success(data.request_id, dis);
-                } else {
-                    respond_error(data.request_id, dis.error.code, dis.error.message, dis.error.hint, dis.error.recoverable, dis.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing src_varname, dst_varname, or request_id for disconnect_objects");
-            }
-            break;
-        case "set_object_attribute":
-            if (data.varname && data.attr_name && data.attr_value && data.request_id) {
-                var attr = set_object_attribute(data.varname, data.attr_name, data.attr_value);
-                if (attr.success) {
-                    respond_success(data.request_id, attr);
-                } else {
-                    respond_error(data.request_id, attr.error.code, attr.error.message, attr.error.hint, attr.error.recoverable, attr.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, attr_name, attr_value, or request_id");
-            }
-            break;
-        case "set_message_text":
-            if (data.varname && data.new_text && data.request_id) {
-                var msg = set_message_text(data.varname, data.new_text);
-                if (msg.success) {
-                    respond_success(data.request_id, msg);
-                } else {
-                    respond_error(data.request_id, msg.error.code, msg.error.message, msg.error.hint, msg.error.recoverable, msg.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, new_text, or request_id for set_message_text");
-            }
-            break;
-        case "send_message_to_object":
-            if (data.varname && data.message && data.request_id) {
-                var sendmsg = send_message_to_object(data.varname, data.message);
-                if (sendmsg.success) {
-                    respond_success(data.request_id, sendmsg);
-                } else {
-                    respond_error(data.request_id, sendmsg.error.code, sendmsg.error.message, sendmsg.error.hint, sendmsg.error.recoverable, sendmsg.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, message, or request_id for send_message_to_object");
-            }
-            break;
-        case "send_bang_to_object":
-            if (data.varname && data.request_id) {
-                var bang = send_bang_to_object(data.varname);
-                if (bang.success) {
-                    respond_success(data.request_id, bang);
-                } else {
-                    respond_error(data.request_id, bang.error.code, bang.error.message, bang.error.hint, bang.error.recoverable, bang.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for send_bang_to_object");
-            }
-            break;
-        case "set_number":
-            if (data.varname && data.num !== undefined && data.request_id) {
-                var num = set_number(data.varname, data.num);
-                if (num.success) {
-                    respond_success(data.request_id, num);
-                } else {
-                    respond_error(data.request_id, num.error.code, num.error.message, num.error.hint, num.error.recoverable, num.error.details);
-                }
-            }
-            else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname, num, or request_id for set_number");
-            }
-            break;
-        case "create_subpatcher":
-            if (data.position && data.varname && data.request_id) {
-                var created = create_subpatcher(data.position[0], data.position[1], data.name || "subpatch", data.varname);
-                if (created.success) {
-                    respond_success(data.request_id, created);
-                } else {
-                    respond_error(data.request_id, created.error.code, created.error.message, created.error.hint, created.error.recoverable, created.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing position, varname, or request_id for create_subpatcher");
-            }
-            break;
-        case "enter_subpatcher":
-            if (data.varname && data.request_id) {
-                var entered = enter_subpatcher(data.varname);
-                if (entered.success) {
-                    respond_success(data.request_id, entered);
-                } else {
-                    respond_error(data.request_id, entered.error.code, entered.error.message, entered.error.hint, entered.error.recoverable, entered.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for enter_subpatcher");
-            }
-            break;
-        case "exit_subpatcher":
-            if (data.request_id) {
-                var exited = exit_subpatcher();
-                respond_success(data.request_id, exited);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for exit_subpatcher");
-            }
-            break;
-        case "get_patcher_context":
-            if (data.request_id) {
-                get_patcher_context(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for get_patcher_context");
-            }
-            break;
-        case "add_subpatcher_io":
-            if (data.io_type && data.position && data.varname && data.request_id) {
-                var io = add_subpatcher_io(data.position[0], data.position[1], data.io_type, data.varname, data.comment || "");
-                if (io.success) {
-                    respond_success(data.request_id, io);
-                } else {
-                    respond_error(data.request_id, io.error.code, io.error.message, io.error.hint, io.error.recoverable, io.error.details);
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing io_type, position, varname, or request_id for add_subpatcher_io");
-            }
-            break;
-        case "get_object_connections":
-            if (data.request_id && data.varname) {
-                get_object_connections(data.request_id, data.varname);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or varname for get_object_connections");
-            }
-            break;
-        case "recreate_with_args":
-            if (data.request_id && data.varname && data.new_args !== undefined) {
-                recreate_with_args(data.request_id, data.varname, data.new_args);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, or new_args for recreate_with_args");
-            }
-            break;
-        case "move_object":
-            if (data.request_id && data.varname && data.x !== undefined && data.y !== undefined) {
-                move_object(data.request_id, data.varname, data.x, data.y);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varname, x, or y for move_object");
-            }
-            break;
-        case "autofit_existing":
-            if (data.varname && data.request_id) {
-                var fit = autofit_existing(data.varname);
-                respond_success(data.request_id, fit);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing varname or request_id for autofit_existing");
-            }
-            break;
-        case "encapsulate":
-            if (data.request_id && data.varnames && data.subpatcher_name && data.subpatcher_varname) {
-                encapsulate(data.request_id, data.varnames, data.subpatcher_name, data.subpatcher_varname);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id, varnames, subpatcher_name, or subpatcher_varname for encapsulate");
-            }
-            break;
-        case "check_signal_safety":
-            if (data.request_id) {
-                check_signal_safety(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for check_signal_safety");
-            }
-            break;
-        case "bridge_ping":
-            if (data.request_id) {
-                bridge_ping(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for bridge_ping");
-            }
-            break;
-        case "health_ping":
-            if (data.request_id) {
-                bridge_ping(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for health_ping");
-            }
-            break;
-        case "capabilities":
-            if (data.request_id) {
-                send_capabilities(data.request_id);
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for capabilities");
-            }
-            break;
-        case "set_workspace_target":
-            if (data.request_id && data.target_id) {
-                var ws = set_workspace_target(
-                    data.target_id,
-                    data.workspace_varname || "",
-                    data.workspace_name || ""
-                );
-                if (ws.success) {
-                    respond_success(data.request_id, ws);
-                } else {
-                    respond_error(
-                        data.request_id,
-                        ws.error.code,
-                        ws.error.message,
-                        ws.error.hint,
-                        ws.error.recoverable,
-                        ws.error.details
-                    );
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or target_id for set_workspace_target");
-            }
-            break;
-        case "workspace_status":
-            if (data.request_id) {
-                respond_success(data.request_id, get_workspace_status());
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id for workspace_status");
-            }
-            break;
-        case "apply_topology_snapshot":
-            if (data.request_id && data.snapshot) {
-                var applied = apply_topology_snapshot(data.snapshot);
-                if (applied.success) {
-                    respond_success(data.request_id, applied);
-                } else {
-                    respond_error(
-                        data.request_id,
-                        applied.error.code,
-                        applied.error.message,
-                        applied.error.hint,
-                        applied.error.recoverable,
-                        applied.error.details
-                    );
-                }
-            } else {
-                respond_error(data.request_id, "VALIDATION_ERROR", "Missing request_id or snapshot for apply_topology_snapshot");
-            }
-            break;
-        case "apply_topology_snapshot_progressive":
-            if (data.request_id && data.snapshot) {
-                var applied_progressive = apply_topology_snapshot_progressive(
-                    data.snapshot,
-                    data.state || null,
-                    data.chunk_size
-                );
-                if (applied_progressive.success) {
-                    respond_success(data.request_id, applied_progressive);
-                } else {
-                    respond_error(
-                        data.request_id,
-                        applied_progressive.error.code,
-                        applied_progressive.error.message,
-                        applied_progressive.error.hint,
-                        applied_progressive.error.recoverable,
-                        applied_progressive.error.details
-                    );
-                }
-            } else {
-                respond_error(
-                    data.request_id,
-                    "VALIDATION_ERROR",
-                    "Missing request_id or snapshot for apply_topology_snapshot_progressive"
-                );
-            }
-            break;
-        case "export_amxd":
-            if (data.request_id && data.output_path) {
-                var exported_amxd = export_amxd(data.output_path, data.device_type || "");
-                if (exported_amxd.success) {
-                    respond_success(data.request_id, exported_amxd);
-                } else {
-                    respond_error(
-                        data.request_id,
-                        exported_amxd.error.code,
-                        exported_amxd.error.message,
-                        exported_amxd.error.hint,
-                        exported_amxd.error.recoverable,
-                        exported_amxd.error.details
-                    );
-                }
-            } else {
-                respond_error(
-                    data.request_id,
-                    "VALIDATION_ERROR",
-                    "Missing request_id or output_path for export_amxd"
-                );
-            }
-            break;
-        case "validate_amxd_open":
-            if (data.request_id && data.path) {
-                var amxd_validation = validate_amxd_open(data.path, !!data.probe_open);
-                if (amxd_validation.success) {
-                    respond_success(data.request_id, amxd_validation);
-                } else {
-                    respond_error(
-                        data.request_id,
-                        amxd_validation.error.code,
-                        amxd_validation.error.message,
-                        amxd_validation.error.hint,
-                        amxd_validation.error.recoverable,
-                        amxd_validation.error.details
-                    );
-                }
-            } else {
-                respond_error(
-                    data.request_id,
-                    "VALIDATION_ERROR",
-                    "Missing request_id or path for validate_amxd_open"
-                );
-            }
-            break;
-        default:
-            respond_error(data.request_id, "UNKNOWN_ACTION", "Unknown action: " + data.action);
+    var handler = ACTION_HANDLERS[data.action];
+    if (typeof handler === "function") {
+        handler(data);
+        return;
     }
+    respond_error(data.request_id, "UNKNOWN_ACTION", "Unknown action: " + data.action);
+}
+
+// Called when a message arrives at inlet 0 (from [udpreceive] or similar)
+function anything() {
+    var msg = arrayfromargs(messagename, arguments).join(" ");
+    var data = safe_parse_json(msg);
+    if (!data) return;
+    if (_handle_transport_action(data)) return;
+    _dispatch_action(data);
 }
 
 // function fetch_test(request_id) {
@@ -943,29 +1761,91 @@ function _resolve_snapshot_ref(state, key) {
     return key;
 }
 
+function _normalize_snapshot_string(value) {
+    if (typeof value !== "string") {
+        return "";
+    }
+    var trimmed = value.replace(/^\s+|\s+$/g, "");
+    return trimmed;
+}
+
+function _snapshot_construction_spec(box) {
+    var maxclass = _normalize_snapshot_string(box.maxclass);
+    var boxtext = _normalize_snapshot_string(box.boxtext);
+    var text = _normalize_snapshot_string(box.text);
+
+    if (maxclass === "newobj") {
+        if (boxtext) {
+            return { ok: true, maxclass: maxclass, spec: boxtext };
+        }
+        if (text) {
+            return { ok: true, maxclass: maxclass, spec: text };
+        }
+        return { ok: false, maxclass: maxclass, reason: "newobj_missing_text" };
+    }
+
+    if (maxclass) {
+        return { ok: true, maxclass: maxclass, spec: maxclass };
+    }
+
+    return { ok: false, maxclass: maxclass, reason: "missing_maxclass" };
+}
+
+function _apply_snapshot_box_text_content(obj, box, maxclass) {
+    var text = typeof box.text === "string" ? box.text : "";
+    if (!text) {
+        return;
+    }
+    try {
+        if (maxclass === "message" || maxclass === "comment") {
+            obj.message("set", text);
+        } else if (maxclass === "live.text") {
+            obj.setattr("text", text);
+        }
+    } catch (_text_error) {
+        // Best effort for content restoration.
+    }
+}
+
 function _apply_snapshot_box_at(snapshot, state, box_index) {
     var box = _snapshot_box_row(snapshot, box_index);
     if (!box || typeof box !== "object") {
         state.stats.skipped_boxes++;
-        return;
+        return null;
     }
 
     var rect = box.patching_rect || [100, 100, 160, 122];
     var x = rect[0];
     var y = rect[1];
-    var boxtext = box.boxtext || box.text;
-    var maxclass = box.maxclass;
+    var maxclass = _normalize_snapshot_string(box.maxclass);
     var varname = box.varname;
+    var spec_info = _snapshot_construction_spec(box);
+
+    if (!spec_info.ok) {
+        state.stats.skipped_boxes++;
+        return null;
+    }
 
     var new_obj = null;
     try {
-        if (boxtext && typeof boxtext === "string") {
-            new_obj = current_patcher.newdefault(x, y, boxtext);
-        } else if (maxclass && typeof maxclass === "string") {
-            new_obj = current_patcher.newdefault(x, y, maxclass);
-        } else {
+        new_obj = current_patcher.newdefault(x, y, spec_info.spec);
+        if (new_obj && new_obj.maxclass === "jbogus") {
+            try {
+                current_patcher.remove(new_obj);
+            } catch (_remove_jbogus_error) {
+                // Best effort cleanup.
+            }
             state.stats.skipped_boxes++;
-            return;
+            return _snapshot_validation_error(
+                "Snapshot box resolved to jbogus during topology apply.",
+                {
+                    box_index: box_index,
+                    box_id: typeof box.id === "string" ? box.id : "",
+                    source_varname: typeof varname === "string" ? varname : "",
+                    maxclass: spec_info.maxclass,
+                    constructor_spec: spec_info.spec,
+                }
+            );
         }
 
         var resolved_varname = "";
@@ -975,12 +1855,16 @@ function _apply_snapshot_box_at(snapshot, state, box_index) {
             resolved_varname = "restored_" + (box_index + 1);
         }
         new_obj.varname = resolved_varname;
-        _register_snapshot_ref(state, resolved_varname, resolved_varname);
+        var actual_varname = _normalize_snapshot_string(new_obj.varname);
+        if (!actual_varname) {
+            actual_varname = resolved_varname;
+        }
+        _register_snapshot_ref(state, actual_varname, actual_varname);
         if (typeof varname === "string" && varname) {
-            _register_snapshot_ref(state, varname, resolved_varname);
+            _register_snapshot_ref(state, varname, actual_varname);
         }
         if (typeof box.id === "string" && box.id) {
-            _register_snapshot_ref(state, box.id, resolved_varname);
+            _register_snapshot_ref(state, box.id, actual_varname);
         }
 
         if (rect && rect.length >= 4) {
@@ -992,12 +1876,41 @@ function _apply_snapshot_box_at(snapshot, state, box_index) {
             }
         }
 
+        if (typeof box.presentation !== "undefined") {
+            try {
+                new_obj.setattr("presentation", box.presentation);
+            } catch (_presentation_error) {
+                // Best effort for presentation state.
+            }
+        }
+        if (box.presentation_rect && box.presentation_rect.length >= 4) {
+            try {
+                new_obj.setattr("presentation_rect", box.presentation_rect);
+            } catch (_presentation_rect_error) {
+                // Best effort for presentation rect state.
+            }
+        }
+
+        _apply_snapshot_box_text_content(new_obj, box, spec_info.maxclass);
+
         var attr_result = apply_snapshot_attributes(new_obj, box.attributes);
         state.stats.attributes_applied += attr_result.applied;
         state.stats.attributes_skipped += attr_result.skipped;
         state.stats.restored_boxes++;
+        return null;
     } catch (_box_error) {
         state.stats.skipped_boxes++;
+        return _snapshot_validation_error(
+            "Failed to instantiate snapshot box during topology apply.",
+            {
+                box_index: box_index,
+                box_id: typeof box.id === "string" ? box.id : "",
+                source_varname: typeof varname === "string" ? varname : "",
+                maxclass: spec_info.maxclass,
+                constructor_spec: spec_info.spec,
+                error: String(_box_error),
+            }
+        );
     }
 }
 
@@ -1056,7 +1969,7 @@ function _progress_payload(snapshot, state) {
     };
 }
 
-function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
+function apply_topology_snapshot_progressive(snapshot, state, chunk_size, debug_timing) {
     if (!snapshot || !Array.isArray(snapshot.boxes) || !Array.isArray(snapshot.lines)) {
         return _snapshot_validation_error(
             "Snapshot must include boxes and lines arrays.",
@@ -1064,7 +1977,12 @@ function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
         );
     }
 
+    var chunk_started_ms = Date.now();
     var normalized_state = _normalize_snapshot_state(state);
+    var phase_before = normalized_state.phase;
+    var box_index_before = normalized_state.box_index;
+    var line_index_before = normalized_state.line_index;
+    var operations_this_chunk = 0;
     var chunk = _coerce_chunk_size(chunk_size);
 
     if (!normalized_state.reset_done) {
@@ -1083,8 +2001,34 @@ function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
             normalized_state.phase = "lines";
             break;
         }
-        _apply_snapshot_box_at(snapshot, normalized_state, normalized_state.box_index);
+        var box_apply_error = _apply_snapshot_box_at(snapshot, normalized_state, normalized_state.box_index);
+        if (box_apply_error) {
+            if (
+                box_apply_error.error
+                && box_apply_error.error.details
+                && typeof box_apply_error.error.details === "object"
+            ) {
+                box_apply_error.error.details.phase_before = phase_before;
+                box_apply_error.error.details.box_index_before = box_index_before;
+                box_apply_error.error.details.line_index_before = line_index_before;
+                box_apply_error.error.details.operations_this_chunk = operations_this_chunk;
+                box_apply_error.error.details.chunk_size = chunk;
+                box_apply_error.error.details.chunk_elapsed_ms = Date.now() - chunk_started_ms;
+            }
+            if (debug_timing) {
+                post(
+                    "[maxmcp] progressive_error phase=" + phase_before
+                    + " box_index=" + box_index_before
+                    + " line_index=" + line_index_before
+                    + " ops=" + operations_this_chunk
+                    + " elapsed_ms=" + (Date.now() - chunk_started_ms)
+                    + "\n"
+                );
+            }
+            return box_apply_error;
+        }
         normalized_state.box_index++;
+        operations_this_chunk++;
         remaining--;
     }
 
@@ -1095,12 +2039,28 @@ function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
         }
         _apply_snapshot_line_at(snapshot, normalized_state, normalized_state.line_index);
         normalized_state.line_index++;
+        operations_this_chunk++;
         remaining--;
     }
 
     var done = normalized_state.phase === "done";
     if (done) {
         avoid_rect_called = false;
+    }
+    var chunk_finished_ms = Date.now();
+    var chunk_elapsed_ms = chunk_finished_ms - chunk_started_ms;
+
+    if (debug_timing) {
+        post(
+            "[maxmcp] progressive_chunk phase_before=" + phase_before
+            + " phase_after=" + normalized_state.phase
+            + " box=" + box_index_before + "->" + normalized_state.box_index
+            + " line=" + line_index_before + "->" + normalized_state.line_index
+            + " ops=" + operations_this_chunk
+            + " elapsed_ms=" + chunk_elapsed_ms
+            + " done=" + done
+            + "\n"
+        );
     }
 
     return {
@@ -1115,7 +2075,21 @@ function apply_topology_snapshot_progressive(snapshot, state, chunk_size) {
         skipped_lines: normalized_state.stats.skipped_lines,
         restored_rects: normalized_state.stats.restored_rects,
         attributes_applied: normalized_state.stats.attributes_applied,
-        attributes_skipped: normalized_state.stats.attributes_skipped
+        attributes_skipped: normalized_state.stats.attributes_skipped,
+        operations_this_chunk: operations_this_chunk,
+        cursor: {
+            phase_before: phase_before,
+            phase_after: normalized_state.phase,
+            box_index_before: box_index_before,
+            box_index_after: normalized_state.box_index,
+            line_index_before: line_index_before,
+            line_index_after: normalized_state.line_index
+        },
+        timing: {
+            chunk_started_ms: chunk_started_ms,
+            chunk_finished_ms: chunk_finished_ms,
+            chunk_elapsed_ms: chunk_elapsed_ms
+        }
     };
 }
 
@@ -1144,182 +2118,26 @@ function apply_topology_snapshot(snapshot) {
     };
 }
 
-function _file_info(path) {
-    var info = {
-        exists: false,
-        size: 0
-    };
-    if (!path || typeof path !== "string") {
-        return info;
-    }
-    try {
-        var f = new File(path, "read");
-        if (f && f.isopen) {
-            info.exists = true;
-            info.size = f.eof || 0;
-            f.close();
-        }
-    } catch (_file_error) {
-        // leave defaults
-    }
-    return info;
-}
-
-function _invoke_patcher_action(target_patcher, action, args) {
-    var attempt = {
-        action: action,
-        success: false,
-        method: null,
-        error: null
-    };
-    if (!target_patcher || typeof action !== "string" || !action) {
-        attempt.error = "Invalid patcher action invocation.";
-        return attempt;
-    }
-    if (!Array.isArray(args)) {
-        args = [];
-    }
-    try {
-        if (typeof target_patcher[action] === "function") {
-            target_patcher[action].apply(target_patcher, args);
-            attempt.success = true;
-            attempt.method = "direct";
-            return attempt;
-        }
-    } catch (direct_error) {
-        attempt.error = String(direct_error);
-        attempt.method = "direct";
-    }
-
-    try {
-        if (typeof target_patcher.message === "function") {
-            var message_args = [action];
-            for (var i = 0; i < args.length; i++) {
-                message_args.push(args[i]);
-            }
-            target_patcher.message.apply(target_patcher, message_args);
-            attempt.success = true;
-            attempt.method = "message";
-            return attempt;
-        }
-    } catch (message_error) {
-        var msg_err = String(message_error);
-        if (attempt.error) {
-            attempt.error += " | " + msg_err;
-        } else {
-            attempt.error = msg_err;
-        }
-        attempt.method = attempt.method ? (attempt.method + "+message") : "message";
-    }
-    return attempt;
-}
-
-function export_amxd(output_path, device_type) {
-    if (!output_path || typeof output_path !== "string") {
-        return _snapshot_validation_error("output_path must be a non-empty string.", {});
-    }
-
-    var before = _file_info(output_path);
-    var attempts = [];
-    var normalized_type = "";
-    if (typeof device_type === "string" && device_type) {
-        normalized_type = device_type;
-        attempts.push(_invoke_patcher_action(current_patcher, "setamxdtype", [normalized_type]));
-    }
-
-    attempts.push(_invoke_patcher_action(current_patcher, "exportamxd", [output_path]));
-    var after = _file_info(output_path);
-    if (!after.exists || after.size <= 0) {
-        attempts.push(_invoke_patcher_action(current_patcher, "makeamxd", [output_path]));
-        after = _file_info(output_path);
-    }
-
-    if (!after.exists || after.size <= 0) {
-        return {
-            success: false,
-            error: {
-                code: "INTERNAL_ERROR",
-                message: "Failed to export .amxd file from current patcher.",
-                hint: "Ensure patch is valid for Max for Live and retry.",
-                recoverable: true,
-                details: {
-                    output_path: output_path,
-                    device_type: normalized_type,
-                    file_before: before,
-                    file_after: after,
-                    attempts: attempts
-                }
-            }
-        };
-    }
-
-    return {
-        success: true,
-        output_path: output_path,
-        device_type: normalized_type,
-        file_before: before,
-        file_after: after,
-        attempts: attempts
-    };
-}
-
-function validate_amxd_open(path, probe_open) {
-    if (!path || typeof path !== "string") {
-        return _snapshot_validation_error("path must be a non-empty string.", {});
-    }
-    var file_info = _file_info(path);
-    if (!file_info.exists) {
-        return {
-            success: false,
-            error: {
-                code: "OBJECT_NOT_FOUND",
-                message: "AMXD file not found: " + path,
-                recoverable: true,
-                details: { path: path }
-            }
-        };
-    }
-    var probe_result = null;
-    if (probe_open) {
-        probe_result = _invoke_patcher_action(current_patcher, "openamxd", [path]);
-    }
-    return {
-        success: true,
-        path: path,
-        file: file_info,
-        probe_open_requested: !!probe_open,
-        probe_open_result: probe_result
-    };
-}
-
 function send_capabilities(request_id) {
-    respond_success(request_id, {
+    var capability_flags = _capability_flags(CAPABILITY_ACTIONS);
+    var payload = {
         protocol_version: "2.0",
-        health_ping: true,
-        bridge_ping: true,
-        capabilities: true,
-        set_workspace_target: true,
-        workspace_status: true,
-        apply_topology_snapshot: true,
-        apply_topology_snapshot_progressive: true,
-        export_amxd: true,
-        validate_amxd_open: true,
-        supported_actions: [
-            "get_objects_in_patch", "get_objects_in_selected", "get_object_attributes",
-            "get_avoid_rect_position", "add_object", "add_object_with_preflight", "remove_object",
-            "connect_objects", "disconnect_objects", "set_object_attribute",
-            "set_message_text", "send_message_to_object", "send_bang_to_object",
-            "set_number", "create_subpatcher", "enter_subpatcher", "exit_subpatcher",
-            "get_patcher_context", "add_subpatcher_io", "get_object_connections",
-            "recreate_with_args", "move_object", "autofit_existing", "encapsulate",
-            "check_signal_safety", "bridge_ping", "health_ping", "capabilities",
-            "set_workspace_target", "workspace_status", "apply_topology_snapshot",
-            "apply_topology_snapshot_progressive", "export_amxd", "validate_amxd_open"
-        ],
+        bridge_proto: BRIDGE_PROTO,
+        bridge_build_id: BRIDGE_BUILD_ID,
+        supported_transports: [TRANSPORT_DICT_REF],
+        preferred_transport: TRANSPORT_DICT_REF,
+        supported_actions: CAPABILITY_ACTIONS.slice(0),
+        transport_health: _transport_health_payload(),
         supports_auth: true,
         supports_idempotency: true,
-        notes: "Envelope and legacy request payloads are accepted."
-    });
+        notes: "Bridge transport protocol maxmcp-4 uses dict_ref request/response transport."
+    };
+    for (var key in capability_flags) {
+        if (capability_flags.hasOwnProperty(key)) {
+            payload[key] = true;
+        }
+    }
+    respond_success(request_id, payload);
 }
 
 // Objects that need float formatting to avoid integer truncation
@@ -1930,13 +2748,7 @@ function get_objects_in_patch(request_id) {
     var patcher_dict = {};
     patcher_dict["boxes"] = boxes;
     patcher_dict["lines"] = lines;
-
-    // use these if no v8:
-    // var results = {"request_id": request_id, "results": patcher_dict}
-    // outlet(1, "response", split_long_string(JSON.stringify(results, null, 2), 2000));
-
-    // use this if has v8:
-    outlet(2, "add_boxtext", request_id, JSON.stringify(patcher_dict, null, 0));
+    respond_success(request_id, patcher_dict);
 }
 
 function get_objects_in_selected(request_id) {
@@ -1950,13 +2762,7 @@ function get_objects_in_selected(request_id) {
     var patcher_dict = {};
     patcher_dict["boxes"] = boxes;
     patcher_dict["lines"] = lines;
-
-    // use these if no v8:
-    // var results = {"request_id": request_id, "results": patcher_dict}
-    // outlet(1, "response", split_long_string(JSON.stringify(results, null, 2), 2000));
-
-    // use this if has v8:
-    outlet(2, "add_boxtext", request_id, JSON.stringify(patcher_dict, null, 0));
+    respond_success(request_id, patcher_dict);
 }
 
 function collect_objects(obj) {
@@ -1993,6 +2799,7 @@ function collect_objects(obj) {
         patching_rect: obj.rect,
         numinlets: obj.patchcords && obj.patchcords.inputs ? obj.patchcords.inputs.length : 0,
         numoutlets: obj.patchcords && obj.patchcords.outputs ? obj.patchcords.outputs.length : 0,
+        text: boxtext,
         boxtext: boxtext,
         attributes: attr,
     }})
@@ -2013,11 +2820,6 @@ function get_object_attributes(request_id, var_name) {
     }
     var attributes = collect_serializable_attributes(obj);
 
-    // use these if no v8:
-    // var results = {"request_id": request_id, "results": patcher_dict}
-    // outlet(1, "response", split_long_string(JSON.stringify(results, null, 2), 2000));
-
-    // use this if has v8:
     respond_success(request_id, attributes);
 }
 
@@ -2025,7 +2827,6 @@ function get_window_rect() {
     var w = this.patcher.wind;
     var title = w.title;
     var size = w.size;
-    // outlet(1, "response", split_long_string(JSON.stringify(results, null, 0), 2500));
 }
 
 function _compute_avoid_rect_position() {

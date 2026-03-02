@@ -2,6 +2,7 @@
 autowatch = 1; // 1
 inlets = 1; // Receive network messages here
 outlets = 2; // For status, responses, etc.
+var BRIDGE_PROTO = "maxmcp-4";
 
 function safe_parse_json(str) {
     try {
@@ -24,6 +25,7 @@ function split_long_string(inString, maxLength) {
 function emit_response_envelope(request_id, state, results, error, meta) {
     var envelope = {
         protocol_version: "2.0",
+        bridge_proto: BRIDGE_PROTO,
         request_id: request_id || null,
         state: state,
         timestamp_ms: Date.now()
