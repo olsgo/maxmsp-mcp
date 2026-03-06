@@ -67,8 +67,6 @@ var ACTION_TRANSPORT_DICT_RESPONSE = "_maxmcp_transport_dict_response";
 var ACTION_TRANSPORT_FILE_REQUEST = "_maxmcp_transport_file_request";
 var TRANSPORT_DICT_TTL_MS = 45000;
 var TRANSPORT_DICT_PREFIX = "__maxmcp_transport";
-var TRANSPORT_FILE_DIR_HINT = "/tmp/maxmcp_transport";
-var TRANSPORT_FILE_MAX_TOTAL_CHARS = 2000000;
 var CAPABILITY_ACTIONS = [
     "get_objects_in_patch", "get_objects_in_selected", "get_object_attributes",
     "get_avoid_rect_position", "add_object", "add_object_with_preflight", "remove_object",
@@ -212,182 +210,6 @@ function _clear_transport_dict(dictName) {
     }
 }
 
-function _normalize_path_for_compare(value) {
-    var raw = String(value || "");
-    if (!raw) {
-        return "";
-    }
-    raw = raw.replace(/\\/g, "/");
-    var drive = "";
-    if (/^[A-Za-z]:/.test(raw)) {
-        drive = raw.slice(0, 2);
-        raw = raw.slice(2);
-    }
-    var absolute = raw.indexOf("/") === 0;
-    var segments = raw.split("/");
-    var out = [];
-    for (var i = 0; i < segments.length; i++) {
-        var segment = String(segments[i] || "");
-        if (!segment || segment === ".") {
-            continue;
-        }
-        if (segment === "..") {
-            if (out.length > 0) {
-                out.pop();
-                continue;
-            }
-            if (absolute) {
-                return "";
-            }
-            continue;
-        }
-        out.push(segment);
-    }
-    var normalized = (absolute ? "/" : "") + out.join("/");
-    if (drive) {
-        normalized = drive + normalized;
-    }
-    return normalized || (absolute ? "/" : "");
-}
-
-function _path_within_root(candidatePath, rootPath) {
-    var candidate = _normalize_path_for_compare(candidatePath);
-    var root = _normalize_path_for_compare(rootPath);
-    if (!candidate || !root) {
-        return false;
-    }
-    if (candidate === root) {
-        return true;
-    }
-    if (root.length <= 1) {
-        return candidate.indexOf(root) === 0;
-    }
-    return candidate.indexOf(root + "/") === 0;
-}
-
-function _validate_transport_file_reference(filePath, allowedRootA, allowedRootB) {
-    var pathValue = String(filePath || "");
-    if (!pathValue) {
-        return { success: false, reason: "Missing file transport path." };
-    }
-    if (pathValue.indexOf("\u0000") !== -1) {
-        return { success: false, reason: "File path contains invalid null byte." };
-    }
-    var normalized = _normalize_path_for_compare(pathValue);
-    if (!normalized) {
-        return { success: false, reason: "File path normalization failed." };
-    }
-    var lower = normalized.toLowerCase();
-    if (lower.slice(-5) !== ".json") {
-        return {
-            success: false,
-            reason: "File transport requires .json payload files.",
-            path: normalized
-        };
-    }
-    var roots = [];
-    roots.push(_normalize_path_for_compare(allowedRootA || ""));
-    roots.push(_normalize_path_for_compare(allowedRootB || ""));
-    roots.push(_normalize_path_for_compare(TRANSPORT_FILE_DIR_HINT));
-    var uniqueRoots = [];
-    for (var i = 0; i < roots.length; i++) {
-        var root = roots[i];
-        if (!root) {
-            continue;
-        }
-        if (uniqueRoots.indexOf(root) === -1) {
-            uniqueRoots.push(root);
-        }
-    }
-    var matchedRoot = "";
-    for (var j = 0; j < uniqueRoots.length; j++) {
-        if (_path_within_root(normalized, uniqueRoots[j])) {
-            matchedRoot = uniqueRoots[j];
-            break;
-        }
-    }
-    if (!matchedRoot) {
-        return {
-            success: false,
-            reason: "File transport path is outside allowed roots.",
-            path: normalized,
-            allowed_roots: uniqueRoots
-        };
-    }
-    return {
-        success: true,
-        path: normalized,
-        matched_root: matchedRoot
-    };
-}
-
-function _read_transport_file_payload(filePath) {
-    if (!filePath) {
-        return {
-            success: false,
-            error: "Missing file transport path."
-        };
-    }
-    var handle = null;
-    try {
-        handle = new File(String(filePath), "read");
-        if (!handle || handle.isopen !== 1) {
-            return {
-                success: false,
-                error: "Unable to open request payload file."
-            };
-        }
-        var serialized = "";
-        var chunks = [];
-        while (handle.position < handle.eof) {
-            var line = handle.readline();
-            if (line === undefined || line === null) {
-                break;
-            }
-            chunks.push(String(line));
-        }
-        if (chunks.length > 0) {
-            serialized = chunks.join("\n");
-        } else if (typeof handle.readstring === "function") {
-            // Fallback for runtimes where readline is unavailable.
-            serialized = handle.readstring(handle.eof);
-        }
-        handle.close();
-        handle = null;
-        if (!serialized || typeof serialized !== "string") {
-            return {
-                success: false,
-                error: "Request payload file is empty."
-            };
-        }
-        var parsed = safe_parse_json(serialized);
-        if (!parsed || typeof parsed !== "object") {
-            return {
-                success: false,
-                error: "Unable to parse request payload file JSON."
-            };
-        }
-        return {
-            success: true,
-            payload: parsed,
-            chars: serialized.length
-        };
-    } catch (e) {
-        return {
-            success: false,
-            error: String(e)
-        };
-    } finally {
-        try {
-            if (handle && handle.isopen === 1) {
-                handle.close();
-            }
-        } catch (_close_error) {
-            // Best effort only.
-        }
-    }
-}
-
 function _transport_respond_error(request_id, code, message, details) {
     respond_error(
         request_id,
@@ -428,16 +250,14 @@ function _handle_transport_action(data) {
             );
             return true;
         case ACTION_TRANSPORT_FILE_REQUEST:
-            _handle_transport_file_request_control(
-                data.file_path || (data.file_ref && data.file_ref.path) || "",
-                data.request_id || "",
-                data.transport_id || (data.file_ref && data.file_ref.transport_id) || "",
-                data.total_chars || (data.file_ref && data.file_ref.size_chars) || "",
-                data.origin_event || "",
-                data.bridge_proto || "",
-                data.allowed_root || "",
-                data.project_root || "",
-                data.max_total_chars || ""
+            _transport_respond_error(
+                _transport_request_id(data),
+                "TRANSPORT_LEGACY_DISABLED",
+                "File request transport is disabled. Use dict_ref transport.",
+                {
+                    action: data.action,
+                    required_transport: TRANSPORT_DICT_REF
+                }
             );
             return true;
         default:
@@ -573,177 +393,6 @@ function _handle_transport_dict_request_control(
     _dispatch_action(payload);
 }
 
-function _handle_transport_file_request_control(
-    file_path,
-    request_id,
-    transport_id,
-    total_chars,
-    origin_event,
-    bridge_proto,
-    allowed_root,
-    project_root,
-    max_total_chars
-) {
-    var requestId = request_id ? String(request_id) : null;
-    var filePath = file_path ? String(file_path) : "";
-    var transportId = transport_id ? String(transport_id) : "";
-    var expectedChars = parseInt(total_chars, 10);
-    var maxChars = parseInt(max_total_chars, 10);
-    if (!isFinite(maxChars) || maxChars <= 0) {
-        maxChars = TRANSPORT_FILE_MAX_TOTAL_CHARS;
-    }
-    var proto = bridge_proto ? String(bridge_proto) : BRIDGE_PROTO;
-
-    if (proto !== BRIDGE_PROTO) {
-        respond_error(
-            requestId,
-            "BRIDGE_PROTOCOL_MISMATCH",
-            "Invalid file request transport metadata.",
-            null,
-            true,
-            {
-                expected_proto: BRIDGE_PROTO,
-                received_proto: proto,
-                file_path: filePath,
-                transport_id: transportId
-            }
-        );
-        return;
-    }
-    if (!filePath) {
-        respond_error(
-            requestId,
-            "TRANSPORT_PROTOCOL_ERROR",
-            "Missing file transport reference in request.",
-            null,
-            true,
-            {
-                file_path: filePath,
-                transport_id: transportId,
-                origin_event: origin_event || ""
-            }
-        );
-        return;
-    }
-
-    var validated = _validate_transport_file_reference(filePath, allowed_root, project_root);
-    if (!validated.success) {
-        respond_error(
-            requestId,
-            "TRANSPORT_PROTOCOL_ERROR",
-            "File request payload path is invalid.",
-            null,
-            true,
-            {
-                file_path: filePath,
-                transport_id: transportId,
-                origin_event: origin_event || "",
-                reason: validated.reason || "unknown",
-                normalized_path: validated.path || "",
-                allowed_roots: validated.allowed_roots || []
-            }
-        );
-        return;
-    }
-
-    var resolved = _read_transport_file_payload(validated.path);
-    if (!resolved.success) {
-        respond_error(
-            requestId,
-            "TRANSPORT_CORRUPT_PAYLOAD",
-            "Unable to resolve file request payload.",
-            null,
-            true,
-            {
-                file_path: validated.path || filePath,
-                transport_id: transportId,
-                origin_event: origin_event || "",
-                reason: resolved.error || "unknown"
-            }
-        );
-        return;
-    }
-
-    if (resolved.chars > maxChars) {
-        respond_error(
-            requestId,
-            "TRANSPORT_PAYLOAD_TOO_LARGE",
-            "File request payload exceeded maximum transport size.",
-            null,
-            true,
-            {
-                file_path: validated.path || filePath,
-                transport_id: transportId,
-                max_chars: maxChars,
-                received_chars: resolved.chars
-            }
-        );
-        return;
-    }
-
-    if (isFinite(expectedChars) && expectedChars >= 0 && resolved.chars > expectedChars + 1024) {
-        respond_error(
-            requestId,
-            "TRANSPORT_PROTOCOL_ERROR",
-            "File request payload exceeded expected size.",
-            null,
-            true,
-            {
-                file_path: validated.path || filePath,
-                transport_id: transportId,
-                expected_chars: expectedChars,
-                received_chars: resolved.chars
-            }
-        );
-        return;
-    }
-
-    var payload = resolved.payload;
-    if (payload.bridge_proto && payload.bridge_proto !== BRIDGE_PROTO) {
-        respond_error(
-            payload.request_id || requestId,
-            "BRIDGE_PROTOCOL_MISMATCH",
-            "Bridge protocol mismatch in file request payload.",
-            null,
-            true,
-            {
-                expected_proto: BRIDGE_PROTO,
-                received_proto: payload.bridge_proto,
-                file_path: validated.path || filePath,
-                transport_id: transportId
-            }
-        );
-        return;
-    }
-    if (requestId && payload.request_id && String(payload.request_id) !== requestId) {
-        respond_error(
-            requestId,
-            "TRANSPORT_PROTOCOL_ERROR",
-            "File request_id mismatch between control and payload.",
-            null,
-            true,
-            {
-                expected_request_id: requestId,
-                received_request_id: String(payload.request_id),
-                file_path: validated.path || filePath,
-                transport_id: transportId
-            }
-        );
-        return;
-    }
-
-    payload.transport = "file_ref";
-    payload.file_ref = {
-        path: validated.path || filePath,
-        request_id: requestId || payload.request_id || null,
-        kind: STREAM_KIND_REQUEST,
-        transport_id: transportId,
-        expires_ms: Date.now() + TRANSPORT_DICT_TTL_MS,
-        size_chars: resolved.chars
-    };
-    _dispatch_action(payload);
-}
-
 function _maxmcp_transport_dict_request(dict_name, request_id, transport_id, total_chars, origin_event, bridge_proto) {
     _handle_transport_dict_request_control(
         dict_name,
@@ -764,18 +413,17 @@ function _maxmcp_transport_file_request(
     bridge_proto,
     allowed_root,
     project_root,
-    max_total_chars
+    max_total_chars,
+    action
 ) {
-    _handle_transport_file_request_control(
-        file_path,
+    _transport_respond_error(
         request_id,
-        transport_id,
-        total_chars,
-        origin_event,
-        bridge_proto,
-        allowed_root,
-        project_root,
-        max_total_chars
+        "TRANSPORT_LEGACY_DISABLED",
+        "File request transport is disabled. Use dict_ref transport.",
+        {
+            action: action || ACTION_TRANSPORT_FILE_REQUEST,
+            required_transport: TRANSPORT_DICT_REF
+        }
     );
 }
 

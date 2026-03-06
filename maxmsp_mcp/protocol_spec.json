@@ -1,0 +1,39 @@
+{
+  "protocol_version": "2.0",
+  "bridge_proto": "maxmcp-4",
+  "transports": {
+    "dict_ref": "dict_ref"
+  },
+  "stream_kinds": {
+    "request": "request",
+    "response": "response",
+    "hello": "hello"
+  },
+  "events": {
+    "bridge_node_hello": "bridge_node_hello"
+  },
+  "actions": {
+    "transport_dict_request": "_maxmcp_transport_dict_request",
+    "transport_dict_response": "_maxmcp_transport_dict_response"
+  },
+  "error_codes": {
+    "bridge_unavailable": "BRIDGE_UNAVAILABLE",
+    "bridge_timeout": "BRIDGE_TIMEOUT",
+    "validation": "VALIDATION_ERROR",
+    "internal": "INTERNAL_ERROR",
+    "object_not_found": "OBJECT_NOT_FOUND",
+    "protected_object": "PROTECTED_OBJECT",
+    "unknown_action": "UNKNOWN_ACTION",
+    "precondition": "PRECONDITION_FAILED",
+    "overloaded": "OVERLOADED",
+    "unauthorized": "UNAUTHORIZED",
+    "proto_v3_missing_field": "PROTO_V3_MISSING_FIELD",
+    "proto_v3_invalid_type": "PROTO_V3_INVALID_TYPE",
+    "proto_v3_unsupported_version": "PROTO_V3_UNSUPPORTED_VERSION"
+  },
+  "transport_handoff_failure_markers": [
+    "failed to hand off request through dictionary transport",
+    "dictionary request transport is currently unhealthy",
+    "dictionary request transport is required but unavailable"
+  ]
+}

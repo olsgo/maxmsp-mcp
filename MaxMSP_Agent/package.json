@@ -1,13 +1,12 @@
 {
-  "name": "temp",
+  "name": "maxmsp-mcp-bridge",
   "version": "1.0.0",
-  "description": "",
-  "main": "boxtext.js",
-  "directories": {
-    "test": "test"
-  },
+  "private": true,
+  "description": "Node bridge helpers and validation scripts for maxmsp-mcp.",
+  "main": "max_mcp_node.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "check": "node --check max_mcp.js && node --check max_mcp_v8_add_on.js && node --check max_mcp_node.js && node --check bridge_runtime.cjs && node --check protocol.generated.cjs",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

@@ -4,88 +4,41 @@ const Max = require("max-api");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
 const fs = require("fs");
-const os = require("os");
-const path = require("path");
+const { buildBridgeConfig } = require("./bridge_runtime.cjs");
+
+const BRIDGE_RUNTIME = buildBridgeConfig(process.env);
+const PROTOCOL = BRIDGE_RUNTIME.protocol;
 
 // Configuration
 var PORT = 5002;
-const NAMESPACE = "/mcp";
-const BRIDGE_PROTO = String(process.env.MAXMCP_BRIDGE_PROTO || "maxmcp-4");
+const NAMESPACE = BRIDGE_RUNTIME.namespace;
+const BRIDGE_PROTO = BRIDGE_RUNTIME.bridgeProto;
 const NODE_BRIDGE_BUILD_ID = String(
   process.env.MAXMCP_NODE_BRIDGE_BUILD_ID || "max_mcp_node_js_20260302_02"
 );
-const TRANSPORT_DICT_REF = "dict_ref";
-const STREAM_KIND_REQUEST = "request";
-const STREAM_KIND_HELLO = "hello";
-const MAXMCP_ALLOW_REMOTE =
-  ["1", "true", "yes", "on"].indexOf(
-    String(process.env.MAXMCP_ALLOW_REMOTE || "").toLowerCase()
-  ) !== -1;
-const MAXMCP_AUTH_TOKEN_FILE = String(process.env.MAXMCP_AUTH_TOKEN_FILE || "").trim();
-const MAXMCP_REQUIRE_HANDSHAKE_AUTH =
-  ["1", "true", "yes", "on"].indexOf(
-    String(process.env.MAXMCP_REQUIRE_HANDSHAKE_AUTH || "true").toLowerCase()
-  ) !== -1;
-const TRANSPORT_INLINE_MAX_CHARS = Math.max(
-  1024,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_INLINE_MAX_CHARS || "24000"), 10) || 24000
-);
-const TRANSPORT_MAX_TOTAL_CHARS = Math.max(
-  TRANSPORT_INLINE_MAX_CHARS,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_MAX_TOTAL_CHARS || "2000000"), 10) || 2000000
-);
-const TRANSPORT_DICT_TTL_MS = Math.max(
-  1000,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_DICT_TTL_MS || "45000"), 10) || 45000
-);
-const TRANSPORT_MAX_INFLIGHT = Math.max(
-  1,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_MAX_INFLIGHT || "48"), 10) || 48
-);
-const TRANSPORT_INFLIGHT_TTL_MS = Math.max(
-  1000,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_INFLIGHT_TTL_MS || "45000"), 10) || 45000
-);
-const TRANSPORT_INFLIGHT_SWEEP_MS = Math.max(
-  250,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_INFLIGHT_SWEEP_MS || "2000"), 10) || 2000
-);
-const TRANSPORT_HEALTH_PROBE_INTERVAL_MS = Math.max(
-  250,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_HEALTH_PROBE_INTERVAL_MS || "1500"), 10) || 1500
-);
-const TRANSPORT_FAILURE_COOLDOWN_MS = Math.max(
-  TRANSPORT_HEALTH_PROBE_INTERVAL_MS,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_FAILURE_COOLDOWN_MS || "5000"), 10) || 5000
-);
-const TRANSPORT_FAILURE_THRESHOLD = Math.max(
-  1,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_FAILURE_THRESHOLD || "3"), 10) || 3
-);
-const TRANSPORT_REQUEST_RETRY_ATTEMPTS = Math.max(
-  1,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_REQUEST_RETRY_ATTEMPTS || "2"), 10) || 2
-);
-const TRANSPORT_REQUEST_RETRY_DELAY_MS = Math.max(
-  0,
-  parseInt(String(process.env.MAXMCP_TRANSPORT_REQUEST_RETRY_DELAY_MS || "120"), 10) || 120
-);
-const TRANSPORT_DICT_PREFIX = String(
-  process.env.MAXMCP_TRANSPORT_DICT_PREFIX || "__maxmcp_transport"
-).trim() || "__maxmcp_transport";
-const TRANSPORT_FILE_DIR = String(
-  process.env.MAXMCP_TRANSPORT_FILE_DIR || path.join(os.tmpdir(), "maxmcp_transport")
-).trim() || path.join(os.tmpdir(), "maxmcp_transport");
-const PROJECT_ROOT_DIR = process.cwd();
-const TRANSPORT_REQUEST_FILE_FALLBACK =
-  ["1", "true", "yes", "on"].indexOf(
-    String(process.env.MAXMCP_TRANSPORT_REQUEST_FILE_FALLBACK || "true").toLowerCase()
-  ) !== -1;
+const TRANSPORT_DICT_REF = PROTOCOL.transport_dict_ref;
+const STREAM_KIND_REQUEST = PROTOCOL.stream_kind_request;
+const STREAM_KIND_HELLO = PROTOCOL.stream_kind_hello;
+const MAXMCP_ALLOW_REMOTE = BRIDGE_RUNTIME.allowRemote;
+const MAXMCP_AUTH_TOKEN_FILE = BRIDGE_RUNTIME.authTokenFile;
+const MAXMCP_REQUIRE_HANDSHAKE_AUTH = BRIDGE_RUNTIME.requireHandshakeAuth;
+const TRANSPORT_INLINE_MAX_CHARS = BRIDGE_RUNTIME.transportInlineMaxChars;
+const TRANSPORT_MAX_TOTAL_CHARS = BRIDGE_RUNTIME.transportMaxTotalChars;
+const TRANSPORT_DICT_TTL_MS = BRIDGE_RUNTIME.transportDictTtlMs;
+const TRANSPORT_MAX_INFLIGHT = BRIDGE_RUNTIME.transportMaxInflight;
+const TRANSPORT_INFLIGHT_TTL_MS = BRIDGE_RUNTIME.transportInflightTtlMs;
+const TRANSPORT_INFLIGHT_SWEEP_MS = BRIDGE_RUNTIME.transportInflightSweepMs;
+const TRANSPORT_HEALTH_PROBE_INTERVAL_MS = BRIDGE_RUNTIME.transportHealthProbeIntervalMs;
+const TRANSPORT_FAILURE_COOLDOWN_MS = BRIDGE_RUNTIME.transportFailureCooldownMs;
+const TRANSPORT_FAILURE_THRESHOLD = BRIDGE_RUNTIME.transportFailureThreshold;
+const TRANSPORT_REQUEST_RETRY_ATTEMPTS = BRIDGE_RUNTIME.transportRequestRetryAttempts;
+const TRANSPORT_REQUEST_RETRY_DELAY_MS = BRIDGE_RUNTIME.transportRequestRetryDelayMs;
+const TRANSPORT_DICT_PREFIX = BRIDGE_RUNTIME.transportDictPrefix;
 
-const ACTION_TRANSPORT_DICT_REQUEST = "_maxmcp_transport_dict_request";
-const ACTION_TRANSPORT_DICT_RESPONSE = "_maxmcp_transport_dict_response";
-const ACTION_TRANSPORT_FILE_REQUEST = "_maxmcp_transport_file_request";
-const BRIDGE_NODE_HELLO_EVENT = "bridge_node_hello";
+const ACTION_TRANSPORT_DICT_REQUEST = PROTOCOL.action_transport_dict_request;
+const ACTION_TRANSPORT_DICT_RESPONSE = PROTOCOL.action_transport_dict_response;
+const BRIDGE_NODE_HELLO_EVENT = PROTOCOL.bridge_node_hello_event;
+const ERROR_CODES = PROTOCOL.error_codes;
 
 const transportHealthState = {
   dict_api_available: false,
@@ -100,9 +53,6 @@ const transportHealthState = {
     dict_attempts: 0,
     dict_successes: 0,
     dict_failures: 0,
-    file_fallback_attempts: 0,
-    file_fallback_successes: 0,
-    file_fallback_failures: 0,
     last_handoff_mode: ""
   }
 };
@@ -210,7 +160,7 @@ function build_unauthorized_response(data, message) {
     state: "failed",
     timestamp_ms: Date.now(),
     error: {
-      code: "UNAUTHORIZED",
+      code: ERROR_CODES.unauthorized,
       message: message || "Authentication token missing or invalid.",
       recoverable: true,
       details: {}
@@ -240,7 +190,7 @@ function build_failed_response(data, code, message, recoverable, details) {
     state: "failed",
     timestamp_ms: Date.now(),
     error: {
-      code: code || "INTERNAL_ERROR",
+      code: code || ERROR_CODES.internal,
       message: message || "Bridge transport failure.",
       recoverable: recoverable !== false,
       details: normalizedDetails
@@ -355,9 +305,6 @@ function _handoff_stats_mutable() {
       dict_attempts: 0,
       dict_successes: 0,
       dict_failures: 0,
-      file_fallback_attempts: 0,
-      file_fallback_successes: 0,
-      file_fallback_failures: 0,
       last_handoff_mode: ""
     };
   }
@@ -367,18 +314,11 @@ function _handoff_stats_mutable() {
 function transport_handoff_snapshot() {
   const stats = _handoff_stats_mutable();
   const dictSuccesses = Math.max(0, Number(stats.dict_successes || 0));
-  const fileSuccesses = Math.max(0, Number(stats.file_fallback_successes || 0));
-  const totalSuccesses = dictSuccesses + fileSuccesses;
-  const fallbackRatio = totalSuccesses > 0 ? fileSuccesses / totalSuccesses : 0.0;
   return {
     dict_attempts: Math.max(0, Number(stats.dict_attempts || 0)),
     dict_successes: dictSuccesses,
     dict_failures: Math.max(0, Number(stats.dict_failures || 0)),
-    file_fallback_attempts: Math.max(0, Number(stats.file_fallback_attempts || 0)),
-    file_fallback_successes: fileSuccesses,
-    file_fallback_failures: Math.max(0, Number(stats.file_fallback_failures || 0)),
-    total_successes: totalSuccesses,
-    file_fallback_ratio: Number(fallbackRatio.toFixed(6)),
+    total_successes: dictSuccesses,
     last_handoff_mode: String(stats.last_handoff_mode || "")
   };
 }
@@ -489,9 +429,6 @@ function cleanup_inflight_entry(entry) {
   if (entry.dict_name) {
     clear_transport_dict_safe(entry.dict_name);
   }
-  if (entry.file_path) {
-    clear_transport_file_safe(entry.file_path);
-  }
 }
 
 function emit_payload_to_origin(requestId, payload) {
@@ -543,7 +480,7 @@ function register_inflight_request(socket, outbound, meta) {
   if (inflightRequests.size >= TRANSPORT_MAX_INFLIGHT) {
     return {
       ok: false,
-      code: "OVERLOADED",
+      code: ERROR_CODES.overloaded,
       message: "Node bridge in-flight request limit reached.",
       details: {
         request_id: requestId,
@@ -559,7 +496,6 @@ function register_inflight_request(socket, outbound, meta) {
     event_name: meta && meta.event_name ? String(meta.event_name) : "",
     requested_at_ms: now_ms(),
     dict_name: meta && meta.dict_name ? String(meta.dict_name) : "",
-    file_path: meta && meta.file_path ? String(meta.file_path) : "",
     transport_id: meta && meta.transport_id ? String(meta.transport_id) : "",
     request_chars: meta && meta.request_chars ? Number(meta.request_chars) : 0
   });
@@ -597,7 +533,7 @@ function sweep_stale_inflight_requests() {
       "response",
       build_failed_response(
         { request_id: requestId },
-        "BRIDGE_TIMEOUT",
+        ERROR_CODES.bridge_timeout,
         "Node bridge dropped stale in-flight request before Max response.",
         true,
         {
@@ -609,37 +545,6 @@ function sweep_stale_inflight_requests() {
         }
       )
     );
-  }
-}
-
-function sweep_stale_transport_files() {
-  let entries = [];
-  try {
-    entries = fs.readdirSync(TRANSPORT_FILE_DIR, { withFileTypes: true });
-  } catch (_read_error) {
-    return;
-  }
-  const now = now_ms();
-  const staleThresholdMs = Math.max(TRANSPORT_INFLIGHT_TTL_MS, TRANSPORT_DICT_TTL_MS) * 4;
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (!entry || !entry.isFile || !entry.isFile()) {
-      continue;
-    }
-    const filename = String(entry.name || "");
-    if (!filename.endsWith(".json")) {
-      continue;
-    }
-    const fullPath = path.join(TRANSPORT_FILE_DIR, filename);
-    try {
-      const st = fs.statSync(fullPath);
-      const ageMs = now - Number(st.mtimeMs || 0);
-      if (isFinite(ageMs) && ageMs >= staleThresholdMs) {
-        fs.unlinkSync(fullPath);
-      }
-    } catch (_stat_error) {
-      // Best effort only.
-    }
   }
 }
 
@@ -704,107 +609,6 @@ function build_transport_dict_name(kind, requestId, transportId) {
     sanitize_dict_segment(requestId || "no_request_id"),
     sanitize_dict_segment(transportId || build_transport_id(requestId))
   ].join("_");
-}
-
-function ensure_transport_file_dir() {
-  fs.mkdirSync(TRANSPORT_FILE_DIR, { recursive: true });
-}
-
-function build_transport_file_path(kind, requestId, transportId) {
-  const filename = [
-    kind || "payload",
-    sanitize_dict_segment(requestId || "no_request_id"),
-    sanitize_dict_segment(transportId || build_transport_id(requestId))
-  ].join("_") + ".json";
-  return path.join(TRANSPORT_FILE_DIR, filename);
-}
-
-function is_path_within_root(candidatePath, rootPath) {
-  if (!candidatePath || !rootPath) {
-    return false;
-  }
-  const candidate = path.resolve(String(candidatePath));
-  const root = path.resolve(String(rootPath));
-  if (candidate === root) {
-    return true;
-  }
-  const rel = path.relative(root, candidate);
-  return !!rel && !rel.startsWith("..") && !path.isAbsolute(rel);
-}
-
-function clear_transport_file_safe(filePath) {
-  if (!filePath) {
-    return;
-  }
-  try {
-    fs.unlinkSync(String(filePath));
-  } catch (_unlink_error) {
-    // Best effort only.
-  }
-}
-
-function select_request_transport(_outbound, allowDictTransport) {
-  return allowDictTransport ? TRANSPORT_DICT_REF : "";
-}
-
-async function forward_file_request(eventName, outbound) {
-  const requestId = outbound && outbound.request_id ? String(outbound.request_id) : null;
-  const transportId = build_transport_id(requestId);
-  let filePath = "";
-  let filePayload = "";
-  let fileChars = 0;
-  let allowedRoot = "";
-  let projectRoot = "";
-  try {
-    ensure_transport_file_dir();
-    allowedRoot = fs.realpathSync(TRANSPORT_FILE_DIR);
-    projectRoot = fs.realpathSync(PROJECT_ROOT_DIR);
-    filePath = build_transport_file_path("req", requestId, transportId);
-    filePayload = JSON.stringify(outbound || {}, null, 2);
-    fileChars = filePayload.length;
-    fs.writeFileSync(filePath, filePayload, "utf8");
-    filePath = fs.realpathSync(filePath);
-    if (!is_path_within_root(filePath, allowedRoot)) {
-      throw new Error("request file path escaped transport root");
-    }
-  } catch (e) {
-    const reason = describe_error(e);
-    clear_transport_file_safe(filePath);
-    mark_transport_failure("Request file handoff failed: " + reason);
-    return {
-      ok: false,
-      reason: reason,
-      file_path: filePath,
-      request_id: requestId,
-      transport_id: transportId,
-      probe_id: transportHealthState.last_probe_id || "",
-      file_chars: fileChars,
-    };
-  }
-
-  Max.outlet(
-    "command",
-    ACTION_TRANSPORT_FILE_REQUEST,
-    filePath,
-    requestId || "",
-    transportId,
-    fileChars,
-    eventName || "",
-    BRIDGE_PROTO,
-    allowedRoot || TRANSPORT_FILE_DIR,
-    projectRoot || PROJECT_ROOT_DIR,
-    TRANSPORT_MAX_TOTAL_CHARS
-  );
-  mark_transport_success(transportHealthState.last_probe_id || build_transport_id(requestId));
-  return {
-    ok: true,
-    reason: "",
-    file_path: filePath,
-    request_id: requestId,
-    transport_id: transportId,
-    probe_id: transportHealthState.last_probe_id || "",
-    file_chars: fileChars,
-  };
 }
 
 async function forward_dict_request(socket, eventName, outbound, rawLength) {
@@ -955,7 +759,7 @@ async function forward_bridge_request(socket, eventName, data) {
       "response",
       build_failed_response(
         outbound,
-        "OVERLOADED",
+        ERROR_CODES.overloaded,
         "Node bridge in-flight request limit reached.",
         true,
         {
@@ -968,28 +772,7 @@ async function forward_bridge_request(socket, eventName, data) {
     );
     return;
   }
-
-  const selected = select_request_transport(outbound, supports_dict_api());
   const transportHealth = await probe_dict_transport(false);
-  if (selected !== TRANSPORT_DICT_REF) {
-    socket.emit(
-      "response",
-      build_failed_response(
-        outbound,
-        "TRANSPORT_PROTOCOL_ERROR",
-        "Dictionary request transport is required but unavailable in Node-for-Max runtime.",
-        true,
-        {
-          event: eventName,
-          required_transport: TRANSPORT_DICT_REF,
-          transport_health: transport_health_snapshot(),
-          inflight_requests: inflightRequests.size,
-          max_inflight_requests: TRANSPORT_MAX_INFLIGHT
-        }
-      )
-    );
-    return;
-  }
   if (!transportHealth.dict_api_available) {
     socket.emit(
       "response",
@@ -1015,7 +798,6 @@ async function forward_bridge_request(socket, eventName, data) {
   }
 
   let sent = null;
-  let handoffTransport = TRANSPORT_DICT_REF;
   const retryAttempts = Math.max(1, TRANSPORT_REQUEST_RETRY_ATTEMPTS);
   for (let attempt = 1; attempt <= retryAttempts; attempt++) {
     record_handoff_stat("dict_attempts");
@@ -1034,19 +816,6 @@ async function forward_bridge_request(socket, eventName, data) {
       await sleep_ms(TRANSPORT_REQUEST_RETRY_DELAY_MS);
     }
   }
-  if ((!sent || !sent.ok) && TRANSPORT_REQUEST_FILE_FALLBACK) {
-    record_handoff_stat("file_fallback_attempts");
-    const fileSent = await forward_file_request(eventName, outbound);
-    if (fileSent && fileSent.ok) {
-      record_handoff_stat("file_fallback_successes");
-      sent = fileSent;
-      handoffTransport = "file_ref";
-      record_handoff_mode(handoffTransport);
-    } else if (fileSent) {
-      record_handoff_stat("file_fallback_failures");
-      sent = fileSent;
-    }
-  }
   if (!sent || !sent.ok) {
     socket.emit(
       "response",
@@ -1059,15 +828,12 @@ async function forward_bridge_request(socket, eventName, data) {
           event: eventName,
           request_chars: rawLength,
           required_transport: TRANSPORT_DICT_REF,
-          dict_name: sent.dict_name || "",
-          file_path: sent.file_path || "",
-          file_chars: sent.file_chars || 0,
+          dict_name: sent && sent.dict_name ? sent.dict_name : "",
           dict_api_available: supports_dict_api(),
-          dict_write_error: sent.reason || "",
+          dict_write_error: sent && sent.reason ? sent.reason : "",
           handoff_attempts: retryAttempts,
           retry_delay_ms: TRANSPORT_REQUEST_RETRY_DELAY_MS,
-          file_fallback_enabled: TRANSPORT_REQUEST_FILE_FALLBACK,
-          transport_probe_id: sent.probe_id || "",
+          transport_probe_id: sent && sent.probe_id ? sent.probe_id : "",
           transport_health: transport_health_snapshot(),
           inflight_requests: inflightRequests.size,
           max_inflight_requests: TRANSPORT_MAX_INFLIGHT
@@ -1080,7 +846,6 @@ async function forward_bridge_request(socket, eventName, data) {
   const registered = register_inflight_request(socket, outbound, {
     event_name: eventName,
     dict_name: sent.dict_name || "",
-    file_path: sent.file_path || "",
     transport_id: sent.transport_id || "",
     request_chars: rawLength
   });
@@ -1097,8 +862,7 @@ async function forward_bridge_request(socket, eventName, data) {
           event: eventName,
           request_chars: rawLength,
           dict_name: sent.dict_name || "",
-          file_path: sent.file_path || "",
-          handoff_transport: handoffTransport,
+          handoff_transport: TRANSPORT_DICT_REF,
           inflight_requests: inflightRequests.size,
           max_inflight_requests: TRANSPORT_MAX_INFLIGHT,
           ...(registered.details || {})
@@ -1118,7 +882,6 @@ Max.outlet("port", `Server listening on port ${PORT}`);
 const inflightSweepHandle = setInterval(() => {
   try {
     sweep_stale_inflight_requests();
-    sweep_stale_transport_files();
   } catch (e) {
     Max.post(
       "[maxmcp] inflight_sweep_error " + String(e && e.message ? e.message : e)
