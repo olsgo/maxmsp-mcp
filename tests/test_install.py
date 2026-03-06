@@ -15,6 +15,10 @@ class InstallConfigTests(unittest.TestCase):
         self.assertEqual(env["MAXMCP_HYGIENE_STALE_SECONDS"], "1800")
         self.assertEqual(env["MAXMCP_HYGIENE_STARTUP_SWEEP"], "1")
         self.assertEqual(env["MAXMCP_HYGIENE_MAX_KILLS_PER_SWEEP"], "50")
+        self.assertEqual(env["MAXMCP_SERVER_LOCK_WAIT_SECONDS"], "15")
+        self.assertEqual(env["MAXMCP_SERVER_LOCK_RETRY_INTERVAL_SECONDS"], "0.2")
+        self.assertEqual(env["MAXMCP_SERVER_LOCK_TAKEOVER_MODE"], "safe")
+        self.assertEqual(env["MAXMCP_SERVER_LOCK_TAKEOVER_GRACE_SECONDS"], "3.0")
 
     def test_resolve_auth_token_preserves_existing(self):
         self.assertEqual(install.resolve_auth_token("existing-token"), "existing-token")
@@ -56,6 +60,7 @@ MAXMCP_AUTH_TOKEN = "persist-token"
                 re.MULTILINE,
             )
             self.assertEqual(len(auth_token_lines), 1)
+            self.assertIn("startup_timeout_sec = 30.0", updated)
             self.assertIn("MAXMCP_AUTH_TOKEN_FILE", updated)
             self.assertIn("[mcp_servers.maxmsp]", updated)
             self.assertIn("[mcp_servers.maxmsp.env]", updated)
@@ -71,6 +76,7 @@ MAXMCP_AUTH_TOKEN = "persist-token"
             token = install.extract_codex_auth_token(updated)
             self.assertTrue(token)
             self.assertGreaterEqual(len(token), 24)
+            self.assertIn("startup_timeout_sec = 30.0", updated)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import server
+from maxmsp_mcp.json_utils import compact_json_size
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -197,9 +198,9 @@ class LiveBridgeE2ETests(unittest.IsolatedAsyncioTestCase):
             switch_result = await self.conn.send_request(
                 {
                     "action": "set_workspace_target",
-                    "target_id": "scratch",
+                    "target_id": "live:import",
                     "workspace_varname": workspace_varname,
-                    "workspace_name": "live import scratch",
+                    "workspace_name": "live import workspace",
                 },
                 timeout=8.0,
             )
@@ -291,7 +292,7 @@ class LiveBridgeE2ETests(unittest.IsolatedAsyncioTestCase):
                     "chunk_size": 1,
                 }
             )
-            envelope_chars = len(json.dumps(envelope_probe, separators=(",", ":")))
+            envelope_chars = compact_json_size(envelope_probe)
             if envelope_chars > 34000:
                 break
         snapshot = {"boxes": boxes, "lines": []}
@@ -303,9 +304,9 @@ class LiveBridgeE2ETests(unittest.IsolatedAsyncioTestCase):
             switch_result = await self.conn.send_request(
                 {
                     "action": "set_workspace_target",
-                    "target_id": "scratch",
+                    "target_id": "live:oversize",
                     "workspace_varname": workspace_varname,
-                    "workspace_name": "live oversize import scratch",
+                    "workspace_name": "live oversize workspace",
                 },
                 timeout=8.0,
             )

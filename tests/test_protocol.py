@@ -23,10 +23,13 @@ from server import (
     MaxMSPConnection,
     MaxHygieneManager,
     MaxRuntimeManager,
+    ServerLockConflictError,
     _normalize_add_object_spec,
     _normalize_avoid_rect_payload,
     _build_transaction_bridge_request,
     _ServerInstanceLock,
+    _attempt_safe_lock_takeover,
+    _run_server_main,
     _resolve_auth_token_from_sources,
     add_max_object,
     get_avoid_rect_position,
@@ -66,6 +69,9 @@ TEST_SCOPE = f"{TEST_PROJECT_ID}:{TEST_WORKSPACE_ID}"
 
 
 class _ScopedRuntimeStub:
+    def __init__(self):
+        self._workspace_lock = asyncio.Lock()
+
     async def activate_workspace(
         self,
         *,
@@ -80,6 +86,19 @@ class _ScopedRuntimeStub:
             "workspace_id": workspace_id,
             "target_id": f"{project_id}:{workspace_id}",
         }
+
+    async def _activate_workspace_locked(
+        self,
+        *,
+        project_id: str,
+        workspace_id: str,
+        create_if_missing: bool = True,
+    ) -> dict:
+        return await self.activate_workspace(
+            project_id=project_id,
+            workspace_id=workspace_id,
+            create_if_missing=create_if_missing,
+        )
 
 
 def _make_scoped_ctx(maxmsp, runtime=None):
@@ -249,22 +268,6 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_request_rejects_legacy_response_shape_when_strict(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
-
-        async def handler(_event, payload, _namespace):
-            req_id = payload["request_id"]
-            fut = conn._pending[req_id]
-            fut.set_result(
-                conn._normalize_response({"request_id": req_id, "results": {"legacy": True}})
-            )
-
-        conn.sio = FakeSocketClient(handler=handler)
-        with self.assertRaises(MaxMCPError) as ctx:
-            await conn.send_request({"action": "health_ping"}, timeout=1.0)
-        self.assertEqual(ctx.exception.code, ERROR_PROTO_V3_MISSING_FIELD)
-
-    async def test_send_request_rejects_legacy_response_when_legacy_flag_disabled(self):
-        conn = MaxMSPConnection("http://127.0.0.1", "5002")
-        conn.strict_v2_enforcement = False
 
         async def handler(_event, payload, _namespace):
             req_id = payload["request_id"]
@@ -558,6 +561,32 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             await conn.ensure_connected(retries=0)
         self.assertEqual(ctx.exception.code, ERROR_PRECONDITION)
 
+    async def test_ensure_connected_uses_attach_path_for_managed_runtime(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.auth_token = "token"
+        conn.sio = FakeSocketClient(handler=None)
+        conn.sio.connected = False
+
+        class RuntimeStub:
+            managed_mode = True
+
+            def __init__(self):
+                self.attach_calls = 0
+
+            async def ensure_runtime_attached(self):
+                self.attach_calls += 1
+                return {"attach_ready": True}
+
+            async def ensure_runtime_ready(self, force=False):
+                _ = force
+                raise AssertionError("ensure_connected should not call strict readiness")
+
+        runtime = RuntimeStub()
+        conn.runtime_manager = runtime
+
+        await conn.ensure_connected(retries=0)
+        self.assertEqual(runtime.attach_calls, 1)
+
     def test_resolve_auth_token_prefers_env_then_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             token_file = Path(tmp) / "auth_token"
@@ -618,42 +647,22 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(conn.last_metrics_log_emit_at)
         self.assertIn("metrics", payload)
 
-    def test_metrics_snapshot_alerts_on_sustained_file_fallback_ratio(self):
+    def test_metrics_snapshot_reports_dict_only_transport_handoff(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         conn.transport_health = {
             "handoff_stats": {
                 "dict_attempts": 30,
                 "dict_successes": 20,
                 "dict_failures": 10,
-                "file_fallback_attempts": 12,
-                "file_fallback_successes": 10,
-                "file_fallback_failures": 2,
-                "last_handoff_mode": "file_ref",
+                "last_handoff_mode": "dict_ref",
             }
         }
         metrics = conn.metrics_snapshot()
-        alerts = {item.get("code") for item in metrics.get("alerts", [])}
-        self.assertIn("ALERT_TRANSPORT_FILE_FALLBACK", alerts)
-        rolling = metrics.get("rolling_windows", {})
-        self.assertEqual(rolling.get("transport_total_handoff_successes"), 30)
-        self.assertAlmostEqual(
-            float(rolling.get("transport_file_fallback_ratio", 0.0)),
-            10.0 / 30.0,
-            places=6,
-        )
-
-    def test_metrics_snapshot_no_file_fallback_alert_before_min_successes(self):
-        conn = MaxMSPConnection("http://127.0.0.1", "5002")
-        conn.transport_health = {
-            "handoff_stats": {
-                "dict_successes": 2,
-                "file_fallback_successes": 3,
-            }
-        }
-        metrics = conn.metrics_snapshot()
-        alerts = {item.get("code") for item in metrics.get("alerts", [])}
-        self.assertNotIn("ALERT_TRANSPORT_FILE_FALLBACK", alerts)
-        self.assertEqual(metrics["transport_handoff"]["total_successes"], 5)
+        self.assertEqual(metrics["transport_handoff"]["dict_attempts"], 30)
+        self.assertEqual(metrics["transport_handoff"]["dict_successes"], 20)
+        self.assertEqual(metrics["transport_handoff"]["dict_failures"], 10)
+        self.assertEqual(metrics["transport_handoff"]["total_successes"], 20)
+        self.assertEqual(metrics["transport_handoff"]["last_handoff_mode"], "dict_ref")
 
 
 class ServerLockTests(unittest.TestCase):
@@ -695,6 +704,207 @@ class ServerLockTests(unittest.TestCase):
                         lock.acquire()
 
             self.assertIn("already running", str(ctx.exception))
+
+    def test_server_instance_lock_retries_then_acquires_before_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "server.lock"
+            lock = _ServerInstanceLock(
+                lock_path,
+                wait_seconds=0.5,
+                retry_interval_seconds=0.01,
+            )
+            attempt_counter = {"count": 0}
+
+            def _flock_with_transient_conflict(_fd, _flags):
+                attempt_counter["count"] += 1
+                if attempt_counter["count"] < 3:
+                    raise BlockingIOError("synthetic transient conflict")
+
+            fake_fcntl = SimpleNamespace(
+                LOCK_EX=1,
+                LOCK_NB=2,
+                LOCK_UN=8,
+                flock=_flock_with_transient_conflict,
+            )
+
+            with patch.object(server_module, "fcntl", fake_fcntl):
+                lock.acquire()
+                lock.release()
+
+            self.assertGreaterEqual(attempt_counter["count"], 3)
+            self.assertFalse(lock_path.exists())
+
+    def test_server_instance_lock_times_out_with_waited_duration_and_holder_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "server.lock"
+            lock_path.write_text(json.dumps({"pid": 43210}), encoding="utf-8")
+            lock = _ServerInstanceLock(
+                lock_path,
+                wait_seconds=0.03,
+                retry_interval_seconds=0.01,
+            )
+
+            def _raise_blocking(_fd, _flags):
+                raise BlockingIOError("synthetic lock conflict")
+
+            fake_fcntl = SimpleNamespace(
+                LOCK_EX=1,
+                LOCK_NB=2,
+                LOCK_UN=8,
+                flock=_raise_blocking,
+            )
+
+            with patch.object(server_module, "fcntl", fake_fcntl):
+                with patch.object(_ServerInstanceLock, "_pid_alive", return_value=True):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        lock.acquire()
+
+            message = str(ctx.exception)
+            self.assertIn("already running", message)
+            self.assertIn("pid=43210", message)
+            self.assertIn("after waiting", message)
+
+    def test_attempt_safe_lock_takeover_skips_when_mode_off(self):
+        err = ServerLockConflictError(
+            "synthetic conflict",
+            holder_pid=12345,
+            lock_path=Path("/tmp/server.lock"),
+            waited_seconds=0.1,
+        )
+        with patch.object(server_module, "MAXMCP_SERVER_LOCK_TAKEOVER_MODE", "off"):
+            result = _attempt_safe_lock_takeover(err)
+        self.assertFalse(result["attempted"])
+        self.assertEqual(result["reason"], "takeover_disabled")
+
+    def test_attempt_safe_lock_takeover_terminates_eligible_holder(self):
+        err = ServerLockConflictError(
+            "synthetic conflict",
+            holder_pid=12345,
+            lock_path=Path("/tmp/server.lock"),
+            waited_seconds=0.1,
+        )
+        with patch.object(server_module, "MAXMCP_SERVER_LOCK_TAKEOVER_MODE", "safe"):
+            with patch.object(
+                server_module,
+                "_is_safe_takeover_candidate",
+                return_value=(True, {"reason": "eligible"}),
+            ) as eligibility_mock:
+                with patch.object(
+                    server_module,
+                    "_terminate_pid_for_lock_takeover",
+                    return_value={"terminated": True, "signal": "SIGTERM"},
+                ) as terminate_mock:
+                    result = _attempt_safe_lock_takeover(err)
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["terminated"])
+        eligibility_mock.assert_called_once_with(12345)
+        terminate_mock.assert_called_once()
+
+    def test_run_server_main_retries_after_safe_takeover(self):
+        class FakeLock:
+            enter_calls = 0
+
+            def __init__(self, _lock_path, **_kwargs):
+                pass
+
+            def __enter__(self):
+                FakeLock.enter_calls += 1
+                if FakeLock.enter_calls == 1:
+                    raise ServerLockConflictError(
+                        "synthetic conflict",
+                        holder_pid=99999,
+                        lock_path=Path("/tmp/server.lock"),
+                        waited_seconds=0.1,
+                    )
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                _ = exc_type, exc, tb
+                return False
+
+        run_mock = unittest.mock.MagicMock()
+        with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", "single"):
+            with patch.object(server_module, "_ServerInstanceLock", FakeLock):
+                with patch.object(server_module, "_attempt_safe_lock_takeover") as takeover_mock:
+                    takeover_mock.return_value = {"attempted": True, "terminated": True}
+                    with patch.object(server_module.mcp, "run", run_mock):
+                        rc = _run_server_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(FakeLock.enter_calls, 2)
+        self.assertEqual(run_mock.call_count, 1)
+        takeover_mock.assert_called_once()
+
+    def test_run_server_main_fails_when_takeover_does_not_terminate_holder(self):
+        class FakeLock:
+            def __init__(self, _lock_path, **_kwargs):
+                pass
+
+            def __enter__(self):
+                raise ServerLockConflictError(
+                    "synthetic conflict",
+                    holder_pid=99999,
+                    lock_path=Path("/tmp/server.lock"),
+                    waited_seconds=0.1,
+                )
+
+            def __exit__(self, exc_type, exc, tb):
+                _ = exc_type, exc, tb
+                return False
+
+        with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", "single"):
+            with patch.object(server_module, "_ServerInstanceLock", FakeLock):
+                with patch.object(server_module, "_attempt_safe_lock_takeover") as takeover_mock:
+                    takeover_mock.return_value = {
+                        "attempted": True,
+                        "terminated": False,
+                        "reason": "termination_failed",
+                    }
+                    rc = _run_server_main()
+
+        self.assertEqual(rc, 1)
+        takeover_mock.assert_called_once()
+
+    def test_run_server_main_proxies_to_existing_shared_daemon(self):
+        daemon_info = {"share_url": "http://127.0.0.1:8765/sse"}
+        with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", server_module.SHARED_DAEMON_MODE):
+            with patch.object(server_module, "MAXMCP_SERVER_ROLE", server_module.SERVER_ROLE_CLIENT):
+                with patch.object(server_module, "_read_shared_daemon_info", return_value=daemon_info):
+                    with patch.object(server_module.anyio, "run", return_value=daemon_info) as anyio_run:
+                        with patch.object(server_module, "_launch_shared_daemon") as launch_mock:
+                            with patch.object(server_module, "_run_stdio_proxy_main", return_value=0) as proxy_mock:
+                                rc = _run_server_main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(anyio_run.call_count, 1)
+        launch_mock.assert_not_called()
+        proxy_mock.assert_called_once_with(daemon_info["share_url"])
+
+    def test_run_server_main_launches_shared_daemon_when_missing(self):
+        daemon_info = {"share_url": "http://127.0.0.1:8765/sse"}
+        with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", server_module.SHARED_DAEMON_MODE):
+            with patch.object(server_module, "MAXMCP_SERVER_ROLE", server_module.SERVER_ROLE_CLIENT):
+                with patch.object(server_module, "_read_shared_daemon_info", return_value=None):
+                    with patch.object(server_module, "_launch_shared_daemon", return_value=daemon_info) as launch_mock:
+                        with patch.object(server_module, "_run_stdio_proxy_main", return_value=0) as proxy_mock:
+                            rc = _run_server_main()
+
+        self.assertEqual(rc, 0)
+        launch_mock.assert_called_once()
+        proxy_mock.assert_called_once_with(daemon_info["share_url"])
+
+    def test_run_server_main_daemon_uses_sse_transport(self):
+        with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", server_module.SHARED_DAEMON_MODE):
+            with patch.object(server_module, "MAXMCP_SERVER_ROLE", server_module.SERVER_ROLE_DAEMON):
+                with patch.object(server_module, "_run_locked_mcp_server", return_value=0) as run_mock:
+                    rc = _run_server_main()
+
+        self.assertEqual(rc, 0)
+        kwargs = run_mock.call_args.kwargs
+        self.assertEqual(kwargs["transport"], "sse")
+        self.assertEqual(kwargs["lock_metadata"]["server_role"], server_module.SERVER_ROLE_DAEMON)
 
 
 class BridgeSLOTests(unittest.TestCase):
@@ -853,7 +1063,7 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["valid"])
         self.assertTrue(any(warn.get("code") == ERROR_UNKNOWN_ACTION for warn in result["warnings"]))
 
-    async def test_dry_run_accepts_legacy_string_steps_with_warning(self):
+    async def test_dry_run_rejects_legacy_string_steps(self):
         fake_conn = SimpleNamespace()
 
         async def fake_send_request(_payload, timeout=2.0):
@@ -867,22 +1077,34 @@ class DryRunTests(unittest.IsolatedAsyncioTestCase):
             TEST_WORKSPACE_ID,
             steps=["check_signal_safety", "exit_subpatcher"],
         )
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["ending_virtual_depth"], 0)
+        self.assertFalse(result["valid"])
+        self.assertEqual(len(result["errors"]), 2)
         self.assertTrue(
-            any("Legacy string step format is deprecated" in warn.get("message", "") for warn in result["warnings"])
+            all(
+                "Legacy string step format is no longer accepted" in error.get("message", "")
+                for error in result["errors"]
+            )
         )
 
 
 class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
-    def test_normalize_add_object_spec_newobj_rewrite(self):
-        obj_type, args, rewrite, err = _normalize_add_object_spec("newobj", ["prepend", "set"])
-        self.assertIsNone(err)
-        self.assertEqual(obj_type, "prepend")
-        self.assertEqual(args, ["set"])
-        self.assertTrue(rewrite["applied"])
+    def test_removed_legacy_patch_file_apis_are_absent(self):
+        self.assertFalse(hasattr(server_module, "load_patch_from_path"))
+        self.assertFalse(hasattr(server_module, "save_patch_to_path"))
+        self.assertFalse(hasattr(server_module, "list_patch_targets"))
+        self.assertFalse(hasattr(MaxRuntimeManager, "load_patch_from_path"))
+        self.assertFalse(hasattr(MaxRuntimeManager, "save_patch_to_path"))
+        self.assertFalse(hasattr(MaxRuntimeManager, "list_patch_targets"))
 
-    def test_normalize_add_object_spec_newobj_invalid_without_args(self):
+    def test_normalize_add_object_spec_rejects_newobj(self):
+        obj_type, args, rewrite, err = _normalize_add_object_spec("newobj", ["prepend", "set"])
+        self.assertEqual(obj_type, "newobj")
+        self.assertEqual(args, ["prepend", "set"])
+        self.assertIsNone(rewrite)
+        self.assertIsNotNone(err)
+        self.assertEqual(err["error"]["code"], "VALIDATION_ERROR")
+
+    def test_normalize_add_object_spec_rejects_newobj_without_args(self):
         _obj_type, _args, _rewrite, err = _normalize_add_object_spec("newobj", [])
         self.assertIsNotNone(err)
         self.assertFalse(err["success"])
@@ -893,7 +1115,7 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
         self.assertFalse(valid)
 
-    async def test_add_max_object_auto_preflight_and_newobj_shim(self):
+    async def test_add_max_object_rejects_newobj_before_bridge_call(self):
         actions = []
 
         class FakeBridge:
@@ -901,7 +1123,6 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
                 self.preflight_auto_calls = 0
                 self.preflight_cache_hits = 0
                 self.preflight_invalid_rects = 0
-                self.newobj_compat_rewrites = 0
                 self._preflight_last_at = 0.0
 
             async def send_request(self, payload, timeout=2.0, idempotency_key=None):
@@ -929,14 +1150,9 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
         finally:
             server_module.MAXMCP_PREFLIGHT_MODE = original_mode
 
-        self.assertTrue(result["success"])
-        self.assertEqual(actions[0][0], "get_avoid_rect_position")
-        self.assertEqual(actions[1][0], "add_object")
-        self.assertEqual(actions[1][1]["obj_type"], "prepend")
-        self.assertEqual(actions[1][1]["args"], ["set_folderPath"])
-        self.assertIn("meta", result)
-        self.assertEqual(result["meta"]["newobj_compat"]["resolved_obj_type"], "prepend")
-        self.assertTrue(result["meta"]["preflight"]["performed"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"]["code"], ERROR_VALIDATION)
+        self.assertEqual(actions, [])
 
     async def test_get_avoid_rect_position_sanitizes_bridge_payload(self):
         class FakeBridge:
@@ -959,6 +1175,33 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rect, [0.0, 0.0, 0.0, 0.0])
         self.assertEqual(bridge.preflight_invalid_rects, 1)
 
+    async def test_get_avoid_rect_position_holds_workspace_lock_during_bridge_call(self):
+        runtime = _ScopedRuntimeStub()
+        lock_states = []
+
+        class FakeBridge:
+            def __init__(self):
+                self._preflight_last_at = 0.0
+                self.preflight_invalid_rects = 0
+
+            async def send_request(self, payload, timeout=2.0, idempotency_key=None):
+                _ = timeout, idempotency_key
+                lock_states.append(runtime._workspace_lock.locked())
+                if payload.get("action") == "get_avoid_rect_position":
+                    return [1, 2, 3, 4]
+                return {}
+
+        bridge = FakeBridge()
+        ctx = _make_scoped_ctx(bridge, runtime=runtime)
+        rect = await get_avoid_rect_position(
+            ctx,
+            project_id=TEST_PROJECT_ID,
+            workspace_id=TEST_WORKSPACE_ID,
+        )
+        self.assertEqual(rect, [1, 2, 3, 4])
+        self.assertEqual(lock_states, [True])
+        self.assertFalse(runtime._workspace_lock.locked())
+
     async def test_add_max_object_prefers_atomic_preflight_when_supported(self):
         actions = []
 
@@ -970,7 +1213,6 @@ class ToolCompatTests(unittest.IsolatedAsyncioTestCase):
                 self.preflight_auto_calls = 0
                 self.preflight_cache_hits = 0
                 self.preflight_invalid_rects = 0
-                self.newobj_compat_rewrites = 0
                 self._preflight_last_at = 0.0
 
             async def send_request(self, payload, timeout=2.0, idempotency_key=None):
@@ -1180,7 +1422,7 @@ class PublishReadinessToolTests(unittest.IsolatedAsyncioTestCase):
         ctx = _make_scoped_ctx(FakeBridge())
         with patch.object(
             server_module,
-            "_run_maxpylang_check_extended_from_topology",
+            "shared_run_maxpylang_check_extended_from_topology",
             return_value={
                 "enabled": True,
                 "available": True,
@@ -1413,8 +1655,45 @@ class HygieneInventoryTests(unittest.TestCase):
         self.assertEqual(inventory["window_scan"]["failure_kind"], "timeout")
         self.assertEqual(inventory["summary"]["process_inventory_confidence"], "low")
 
+    def test_discover_bridge_listener_pid_parses_lsof_output(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        runtime = MaxRuntimeManager(conn)
+        hygiene = MaxHygieneManager(runtime, conn)
+        with patch.object(
+            server_module,
+            "run_command",
+            return_value=SimpleNamespace(returncode=0, stdout="43210\n", stderr=""),
+        ) as run_mock:
+            pid = hygiene._discover_bridge_listener_pid_sync()
+
+        self.assertEqual(pid, 43210)
+        run_mock.assert_called_once()
+
 
 class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
+    def test_ensure_node_dependencies_sync_reports_command_failure(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        runtime = MaxRuntimeManager(conn)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime.npm_auto_install = True
+            runtime.npm_project_dir = Path(tmp)
+            runtime.npm_sentinel = Path(tmp) / "node_modules" / ".package-lock.json"
+            with patch.object(
+                server_module,
+                "run_command",
+                return_value=SimpleNamespace(
+                    returncode=1,
+                    stdout="npm install failed",
+                    stderr="",
+                ),
+            ) as run_mock:
+                result = runtime._ensure_node_dependencies_sync()
+
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["attempted"])
+        self.assertIn("npm install failed", result["error"])
+        run_mock.assert_called_once()
+
     async def test_collect_status_applies_backoff_after_transport_failure(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         conn.sio = SimpleNamespace(connected=True)
@@ -1485,7 +1764,210 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["ready"])
         self.assertIn("dictionary transport", status["error"].lower())
 
-    async def test_runtime_target_switch_without_bridge_connection(self):
+    async def test_ensure_runtime_attached_fast_attach_starts_background_warmup(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        conn.connection_epoch = 1
+        conn.node_hello_seen = True
+        runtime = MaxRuntimeManager(conn)
+        runtime.startup_mode = server_module.FAST_ATTACH
+        runtime._resolve_host_patch = lambda: Path(__file__)
+        runtime._ensure_node_dependencies_sync = lambda: {"ready": True}
+        runtime._write_state = lambda _status: None
+        gate = asyncio.Event()
+        calls = {"strict": 0, "apply_target": 0, "twin": 0, "cleanup": 0}
+
+        async def fake_start_server():
+            return True
+
+        conn.start_server = fake_start_server  # type: ignore[method-assign]
+        conn.refresh_capabilities = lambda: asyncio.sleep(0, result={"supported_actions": []})  # type: ignore[method-assign]
+
+        async def fake_collect_status(check_bridge=False):
+            if check_bridge:
+                calls["strict"] += 1
+                await gate.wait()
+                return {"bridge_connected": True, "bridge_healthy": True}
+            return {"bridge_connected": True}
+
+        async def fake_apply_target():
+            calls["apply_target"] += 1
+            return {"success": True}
+
+        async def fake_sync(reason="manual"):
+            calls["twin"] += 1
+            return {"success": True, "reason": reason}
+
+        class HygieneStub:
+            async def run_startup_cleanup_once(self_inner):
+                calls["cleanup"] += 1
+                return {"success": True}
+
+        runtime.collect_status = fake_collect_status  # type: ignore[method-assign]
+        runtime._apply_target_to_bridge = fake_apply_target  # type: ignore[method-assign]
+        runtime.sync_patch_twin = fake_sync  # type: ignore[method-assign]
+        runtime.hygiene_manager = HygieneStub()
+
+        status = await runtime.ensure_runtime_attached()
+        self.assertTrue(status["attach_ready"])
+        self.assertTrue(status["warmup_in_progress"])
+        self.assertFalse(status["ready"])
+        self.assertIsNotNone(runtime._warmup_task)
+        self.assertFalse(runtime._warmup_task.done())
+        self.assertEqual(calls["strict"], 0)
+        self.assertEqual(calls["twin"], 0)
+
+        gate.set()
+        await runtime._warmup_task
+        self.assertEqual(calls["strict"], 1)
+        self.assertEqual(calls["apply_target"], 1)
+        self.assertEqual(calls["twin"], 1)
+        self.assertEqual(calls["cleanup"], 1)
+        self.assertTrue(runtime._warmup_ready)
+
+    async def test_ensure_runtime_attached_strict_ready_waits_for_warmup(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        conn.connection_epoch = 1
+        conn.node_hello_seen = True
+        runtime = MaxRuntimeManager(conn)
+        runtime.startup_mode = server_module.STRICT_READY
+        runtime._resolve_host_patch = lambda: Path(__file__)
+        runtime._ensure_node_dependencies_sync = lambda: {"ready": True}
+        runtime._write_state = lambda _status: None
+        gate = asyncio.Event()
+        calls = {"strict": 0, "twin": 0}
+
+        async def fake_start_server():
+            return True
+
+        conn.start_server = fake_start_server  # type: ignore[method-assign]
+        conn.refresh_capabilities = lambda: asyncio.sleep(0, result={"supported_actions": []})  # type: ignore[method-assign]
+
+        async def fake_collect_status(check_bridge=False):
+            if check_bridge:
+                calls["strict"] += 1
+                await gate.wait()
+                return {"bridge_connected": True, "bridge_healthy": True}
+            return {"bridge_connected": True}
+
+        async def fake_sync(reason="manual"):
+            calls["twin"] += 1
+            return {"success": True, "reason": reason}
+
+        runtime.collect_status = fake_collect_status  # type: ignore[method-assign]
+        runtime._apply_target_to_bridge = lambda: asyncio.sleep(0, result={"success": True})  # type: ignore[method-assign]
+        runtime.sync_patch_twin = fake_sync  # type: ignore[method-assign]
+        runtime.hygiene_manager = SimpleNamespace(
+            run_startup_cleanup_once=lambda: asyncio.sleep(0, result={"success": True})
+        )
+
+        task = asyncio.create_task(runtime.ensure_runtime_attached())
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        gate.set()
+        status = await task
+        self.assertTrue(status["attach_ready"])
+        self.assertTrue(status["ready"])
+        self.assertTrue(status["warmup_ready"])
+        self.assertEqual(calls["strict"], 1)
+        self.assertEqual(calls["twin"], 1)
+
+    async def test_ensure_runtime_ready_reuses_completed_warmup(self):
+        conn = MaxMSPConnection("http://127.0.0.1", "5002")
+        conn.sio = SimpleNamespace(connected=True)
+        conn.connection_epoch = 1
+        conn.node_hello_seen = True
+        runtime = MaxRuntimeManager(conn)
+        runtime.startup_mode = server_module.FAST_ATTACH
+        runtime._resolve_host_patch = lambda: Path(__file__)
+        runtime._ensure_node_dependencies_sync = lambda: {"ready": True}
+        runtime._write_state = lambda _status: None
+        gate = asyncio.Event()
+        calls = {"strict": 0, "twin": 0, "cleanup": 0}
+
+        async def fake_start_server():
+            return True
+
+        conn.start_server = fake_start_server  # type: ignore[method-assign]
+        conn.refresh_capabilities = lambda: asyncio.sleep(0, result={"supported_actions": []})  # type: ignore[method-assign]
+
+        async def fake_collect_status(check_bridge=False):
+            if check_bridge:
+                calls["strict"] += 1
+                await gate.wait()
+                return {"bridge_connected": True, "bridge_healthy": True}
+            return {"bridge_connected": True}
+
+        async def fake_sync(reason="manual"):
+            calls["twin"] += 1
+            return {"success": True, "reason": reason}
+
+        class HygieneStub:
+            async def run_startup_cleanup_once(self_inner):
+                calls["cleanup"] += 1
+                return {"success": True}
+
+        runtime.collect_status = fake_collect_status  # type: ignore[method-assign]
+        runtime._apply_target_to_bridge = lambda: asyncio.sleep(0, result={"success": True})  # type: ignore[method-assign]
+        runtime.sync_patch_twin = fake_sync  # type: ignore[method-assign]
+        runtime.hygiene_manager = HygieneStub()
+
+        attach_status = await runtime.ensure_runtime_attached()
+        self.assertTrue(attach_status["warmup_in_progress"])
+
+        ready_task = asyncio.create_task(runtime.ensure_runtime_ready())
+        await asyncio.sleep(0)
+        self.assertFalse(ready_task.done())
+        gate.set()
+        ready_status = await ready_task
+        self.assertTrue(ready_status["ready"])
+        self.assertTrue(ready_status["warmup_ready"])
+        self.assertEqual(calls["strict"], 1)
+        self.assertEqual(calls["twin"], 1)
+        self.assertEqual(calls["cleanup"], 1)
+
+        ready_again = await runtime.ensure_runtime_ready()
+        self.assertTrue(ready_again["ready"])
+        self.assertEqual(calls["strict"], 1)
+        self.assertEqual(calls["twin"], 1)
+        self.assertEqual(calls["cleanup"], 1)
+
+    async def test_server_lifespan_reuses_shared_context_in_daemon_mode(self):
+        original_context = server_module._SHARED_LIFESPAN_CONTEXT
+        original_lock = server_module._SHARED_LIFESPAN_LOCK
+        original_refcount = server_module._SHARED_LIFESPAN_REFCOUNT
+        server_module._SHARED_LIFESPAN_CONTEXT = None
+        server_module._SHARED_LIFESPAN_LOCK = None
+        server_module._SHARED_LIFESPAN_REFCOUNT = 0
+        calls = {"build": 0}
+        shared = {
+            "maxmsp": object(),
+            "runtime": object(),
+            "hygiene": object(),
+        }
+
+        async def fake_build():
+            calls["build"] += 1
+            return dict(shared)
+
+        try:
+            with patch.object(server_module, "MAXMCP_MULTI_CLIENT_MODE", server_module.SHARED_DAEMON_MODE):
+                with patch.object(server_module, "MAXMCP_SERVER_ROLE", server_module.SERVER_ROLE_DAEMON):
+                    with patch.object(server_module, "_build_lifespan_context", side_effect=fake_build):
+                        async with server_module.server_lifespan(server_module.mcp) as ctx_one:
+                            async with server_module.server_lifespan(server_module.mcp) as ctx_two:
+                                self.assertIs(ctx_one["runtime"], shared["runtime"])
+                                self.assertIs(ctx_two["runtime"], shared["runtime"])
+                                self.assertEqual(calls["build"], 1)
+                                self.assertEqual(server_module._SHARED_LIFESPAN_REFCOUNT, 2)
+                        self.assertEqual(server_module._SHARED_LIFESPAN_REFCOUNT, 0)
+        finally:
+            server_module._SHARED_LIFESPAN_CONTEXT = original_context
+            server_module._SHARED_LIFESPAN_LOCK = original_lock
+            server_module._SHARED_LIFESPAN_REFCOUNT = original_refcount
+
+    async def test_runtime_target_switch_rejects_legacy_identifier(self):
         conn = MaxMSPConnection("http://127.0.0.1", "5002")
         runtime = MaxRuntimeManager(conn)
         result = await runtime.set_active_target("scratch")
@@ -1656,7 +2138,7 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(checkpoints), 1)
             self.assertEqual(checkpoints[0]["checkpoint_id"], created["checkpoint_id"])
 
-    async def test_persist_workspace_target_retries_after_timeout(self):
+    async def test_capture_live_topology_retries_after_timeout(self):
         class FlakyBridge:
             def __init__(self):
                 self.sio = SimpleNamespace(connected=True)
@@ -1694,10 +2176,10 @@ class RuntimeManagerTests(unittest.IsolatedAsyncioTestCase):
             runtime.checkpoints_file = tmp_path / "checkpoints.json"
             runtime._ensure_session_patches_sync()
 
-            result = await runtime.persist_workspace_target(target="active", reason="retry-test")
-            self.assertTrue(result["persisted"])
-            self.assertEqual(result["capture"]["attempts"], 3)
-            self.assertEqual(result["capture"]["retry_attempts"], 2)
+            topology, capture = await runtime._capture_live_topology(include_meta=True)
+            self.assertEqual(topology, {"boxes": [], "lines": []})
+            self.assertEqual(capture["attempts"], 3)
+            self.assertEqual(capture["retry_attempts"], 2)
             self.assertEqual(bridge.workspace_capture_timeouts, 2)
             self.assertEqual(bridge.workspace_capture_retries, 2)
 
@@ -1706,7 +2188,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
     class FakeBridge:
         def __init__(self):
             self.sio = SimpleNamespace(connected=True)
-            self.current_target = "active"
+            self.current_target = TEST_SCOPE
             self.progressive_calls = 0
             self.strict_capability_gating = False
             self.capabilities = {
@@ -1733,7 +2215,7 @@ class PatchFileFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             action = payload.get("action")
             if action == "set_workspace_target":
-                self.current_target = payload.get("target_id", "active")
+                self.current_target = payload.get("target_id", TEST_SCOPE)
                 return {"success": True, "target_id": self.current_target}
             if action == "capabilities":
                 return self.capabilities
@@ -2349,19 +2831,19 @@ class TransactionBuilderTests(unittest.TestCase):
         self.assertEqual(payload["obj_type"], "scale")
         self.assertEqual(timeout, 8.0)
 
-    def test_transaction_builder_maps_newobj_shorthand(self):
-        payload, _timeout = _build_transaction_bridge_request(
-            1,
-            "add_max_object",
-            {
-                "position": [10, 10],
-                "obj_type": "newobj",
-                "varname": "v1",
-                "args": ["prepend", "set"],
-            },
-        )
-        self.assertEqual(payload["obj_type"], "prepend")
-        self.assertEqual(payload["args"], ["set"])
+    def test_transaction_builder_rejects_newobj_shorthand(self):
+        with self.assertRaises(MaxMCPError) as ctx:
+            _build_transaction_bridge_request(
+                1,
+                "add_max_object",
+                {
+                    "position": [10, 10],
+                    "obj_type": "newobj",
+                    "varname": "v1",
+                    "args": ["prepend", "set"],
+                },
+            )
+        self.assertEqual(ctx.exception.code, ERROR_VALIDATION)
 
     def test_transaction_builder_rejects_unknown_action(self):
         with self.assertRaises(MaxMCPError):
@@ -2369,6 +2851,60 @@ class TransactionBuilderTests(unittest.TestCase):
 
 
 class TransactionExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transaction_holds_workspace_lock_for_bridge_steps(self):
+        lock_states = []
+
+        class FakeBridge:
+            def __init__(self):
+                self.sio = SimpleNamespace(connected=True)
+
+            async def send_request(
+                self,
+                payload,
+                timeout=2.0,
+                idempotency_key=None,
+                include_envelope=False,
+            ):
+                _ = timeout, idempotency_key, include_envelope
+                lock_states.append(runtime._workspace_lock.locked())
+                action = payload.get("action")
+                if action == "get_patcher_context":
+                    return {"depth": 0, "path": [], "is_root": True}
+                if action == "get_objects_in_patch":
+                    return {"boxes": [], "lines": []}
+                if action == "add_object":
+                    return {"success": True}
+                return {"success": True}
+
+        bridge = FakeBridge()
+        runtime = MaxRuntimeManager(bridge)
+        _seed_workspace(runtime)
+        ctx = _make_scoped_ctx(bridge, runtime=runtime)
+        steps = [
+            {
+                "action": "add_max_object",
+                "params": {
+                    "position": [10, 10],
+                    "obj_type": "button",
+                    "varname": "tx_obj",
+                    "args": [],
+                },
+            }
+        ]
+        result = await run_patch_transaction(
+            ctx,
+            TEST_PROJECT_ID,
+            TEST_WORKSPACE_ID,
+            steps=steps,
+            dry_run_engine="maxpy",
+            rollback_on_error=True,
+            checkpoint_label="tx-lock",
+        )
+        self.assertTrue(result["success"])
+        self.assertTrue(lock_states)
+        self.assertTrue(all(lock_states))
+        self.assertFalse(runtime._workspace_lock.locked())
+
     async def test_transaction_rolls_back_on_failure(self):
         class FakeBridge:
             def __init__(self):
