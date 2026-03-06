@@ -106,6 +106,10 @@ def build_common_env(
         "MAXMCP_WORKSPACE_CAPTURE_TIMEOUT_SECONDS": "8",
         "MAXMCP_WORKSPACE_CAPTURE_RETRIES": "2",
         "MAXMCP_WORKSPACE_CAPTURE_BACKOFF_SECONDS": "0.5",
+        "MAXMCP_SERVER_LOCK_WAIT_SECONDS": "15",
+        "MAXMCP_SERVER_LOCK_RETRY_INTERVAL_SECONDS": "0.2",
+        "MAXMCP_SERVER_LOCK_TAKEOVER_MODE": "safe",
+        "MAXMCP_SERVER_LOCK_TAKEOVER_GRACE_SECONDS": "3.0",
         "MAXMCP_REQUIRE_HANDSHAKE_AUTH": "1",
         "MAXMCP_ALLOW_REMOTE": "0",
         "MAXMCP_ENFORCE_PATCH_ROOTS": "0",
@@ -146,7 +150,8 @@ def install_codex_config(
         'command = "uv"\n'
         "args = [\n"
         f'  "--directory",\n  "{server_dir}",\n  "run",\n  "server.py",\n'
-        "]\n\n"
+        "]\n"
+        "startup_timeout_sec = 30.0\n\n"
         "[mcp_servers.maxmsp.env]\n"
         f"{env_lines}"
     )

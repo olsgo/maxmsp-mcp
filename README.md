@@ -124,6 +124,7 @@ python install.py --client codex
 
 Codex writes to `~/.codex/config.toml` under `[mcp_servers.maxmsp]`.
 The installer auto-generates `MAXMCP_AUTH_TOKEN` on first run and preserves it on later runs.
+Installer-generated Codex config sets `startup_timeout_sec = 30.0` for `maxmsp`.
 Token resolution precedence at runtime is: `MAXMCP_AUTH_TOKEN` (env) → `MAXMCP_AUTH_TOKEN_FILE` → unset.
 
 ### Managed Mode (No Manual Max Setup)
@@ -168,6 +169,10 @@ Reliability/security knobs:
 - `MAXMCP_MUTATION_MAX_INFLIGHT=2` / `MAXMCP_MUTATION_MAX_QUEUE=32` mutation concurrency + queue backpressure
 - `MAXMCP_MUTATION_QUEUE_WAIT_TIMEOUT_SECONDS=15` max wait to acquire mutation slot
 - `MAXMCP_SERVER_LOCK_PATH=target/maxmcp/server.lock` single-instance lock file path (prevents dual MCP server processes)
+- `MAXMCP_SERVER_LOCK_WAIT_SECONDS=15` wait budget before failing lock acquisition when another server is active
+- `MAXMCP_SERVER_LOCK_RETRY_INTERVAL_SECONDS=0.2` polling interval while waiting on lock acquisition
+- `MAXMCP_SERVER_LOCK_TAKEOVER_MODE=safe` lock conflict policy (`safe` to terminate stale/owned holder, `off` to disable takeover)
+- `MAXMCP_SERVER_LOCK_TAKEOVER_GRACE_SECONDS=3.0` grace period before terminating eligible holder PID during safe takeover
 - `MAXMCP_MAXPYLANG_CHECK_EXTENDED_TIMEOUT_SECONDS=25` timeout for extended MaxPyLang readiness checks
 - `MAXMCP_MAXPYLANG_CHECK_EXTENDED_CMD="maxpylang --json --strict check --in {input_path}"` override command used for extended checks
 - `MAXMCP_PREFLIGHT_MODE=auto` object-placement preflight mode (`auto`, `session`, `manual`)
@@ -239,6 +244,14 @@ Import compatibility notes:
 If root enforcement is enabled and no allowlist is provided, defaults are:
 - repository root
 - session workspace directory (`target/maxmcp/sessions/<session-id>/`)
+
+Startup lock contention troubleshooting:
+- If Codex reports `MCP client for maxmsp timed out after 10 seconds`, add `startup_timeout_sec = 30.0` under `[mcp_servers.maxmsp]` in `~/.codex/config.toml`.
+- If startup logs `MCP startup incomplete (failed: maxmsp)` with a failed initialize handshake, check lock ownership in `target/maxmcp/server.lock`.
+- Inspect the holder process with `ps -p <pid> -o pid,etime,command`.
+- Default startup uses safe takeover for eligible same-user maxmsp server holders. Disable with `MAXMCP_SERVER_LOCK_TAKEOVER_MODE=off`.
+- Increase `MAXMCP_SERVER_LOCK_WAIT_SECONDS` when overlapping client sessions race on startup.
+- Set `MAXMCP_SERVER_LOCK_WAIT_SECONDS=0` to restore immediate fail-fast lock behavior.
 
 ### One-Command Smoke Test
 

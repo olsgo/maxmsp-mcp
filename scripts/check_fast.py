@@ -12,7 +12,29 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+DEFAULT_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+
+
+def _python_executable() -> str:
+    if DEFAULT_PYTHON.exists():
+        return str(DEFAULT_PYTHON)
+    return sys.executable
+
+
+PYTHON = _python_executable()
+
+
+def _relative_files(*roots: Path, pattern: str) -> list[str]:
+    discovered: list[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        discovered.extend(
+            str(path.relative_to(REPO_ROOT))
+            for path in root.rglob(pattern)
+            if path.is_file()
+        )
+    return sorted(set(discovered))
 
 
 def _run_stage(name: str, cmd: list[str], timeout: int) -> dict:
@@ -53,49 +75,47 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    py_files = sorted(str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "scripts").glob("*.py"))
-    test_files = sorted(str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "tests").glob("test_*.py"))
+    py_files = _relative_files(
+        REPO_ROOT / "scripts",
+        REPO_ROOT / "tests",
+        REPO_ROOT / "maxmsp_mcp",
+        pattern="*.py",
+    )
+    node_check_files = [
+        "MaxMSP_Agent/max_mcp.js",
+        "MaxMSP_Agent/max_mcp_v8_add_on.js",
+        "MaxMSP_Agent/max_mcp_node.js",
+        *_relative_files(REPO_ROOT / "MaxMSP_Agent", pattern="*.cjs"),
+    ]
 
     stages = [
         (
             "python_compile",
-            [str(PYTHON), "-m", "py_compile", "server.py", "install.py", *py_files, *test_files],
+            [PYTHON, "-m", "py_compile", "server.py", "install.py", *py_files],
         ),
+        *[
+            (
+                f"node_check_{Path(file_path).stem.replace('.', '_')}",
+                ["node", "--check", file_path],
+            )
+            for file_path in node_check_files
+        ],
         (
-            "node_check",
-            [
-                "node",
-                "--check",
-                "MaxMSP_Agent/max_mcp.js",
-            ],
-        ),
-        (
-            "node_check_v8",
-            [
-                "node",
-                "--check",
-                "MaxMSP_Agent/max_mcp_v8_add_on.js",
-            ],
-        ),
-        (
-            "node_check_bridge",
-            [
-                "node",
-                "--check",
-                "MaxMSP_Agent/max_mcp_node.js",
-            ],
+            "node_tests",
+            ["npm", "--prefix", "MaxMSP_Agent", "test"],
         ),
         (
             "unit_tests",
             [
-                str(PYTHON),
+                PYTHON,
                 "-m",
                 "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_*.py",
                 "-v",
-                "tests/test_install.py",
-                "tests/test_protocol.py",
-                "tests/test_rotate_auth_token.py",
-                "tests/test_soak_queue.py",
             ],
         ),
     ]
